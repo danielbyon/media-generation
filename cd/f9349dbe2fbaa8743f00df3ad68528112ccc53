@@ -1,0 +1,100 @@
+src/media_generation/service.py
+  s_9d341248da4bfa::t_3d56bea87fdddf 67-68,90-97,126
+  s_9d341248da4bfa::t_52e8863e4c235c 64-66,69-70,78-82,84-88
+  s_9d341248da4bfa::t_4b32f72a98d464 83
+  s_9d341248da4bfa::t_dd940105e301c0 1-63,71-77,89,98-125,127-145,147-262
+  s_9d341248da4bfa::t_6477e02dcd8996 146
+evidence/t01/reference_job.json
+  s_9d341248da4bfa::t_ce1ad60e3a2dde 1
+src/media_generation/store.py
+  s_9d341248da4bfa::t_92841554b4283d 1-21,23,25-175,177-178,180-181,184-190,211-235,242-374,390-450,471-473,476-486,488-526
+  s_9d341248da4bfa::t_1478396f70000f 22,24,176,179,183,199-210,236-241
+  s_9d341248da4bfa::t_5fd35bc0d19865 375-389,451-470,474-475,487
+  s_9d341248da4bfa::t_b370f6bb3998b9 182,191-198
+evidence/t01/reference_provenance.json
+  s_9d341248da4bfa::t_ce1ad60e3a2dde 1
+tests/test_cli_contract.py
+  s_9d341248da4bfa::t_4df00fc31cfa5a 45-69,181-294,304-324,333-337
+  s_9d341248da4bfa::t_6a38e37e6e69c8 159-166,170-171,173-174
+  s_9d341248da4bfa::t_5653c2a28f5868 295-303,325-332,338
+  s_9d341248da4bfa::t_afdba21f61fda4 1-44,70-158,167-169,172,175-180
+src/media_generation/errors.py
+  s_9d341248da4bfa::t_ce8416cea2c424 1-33
+pyproject.toml
+  s_9d341248da4bfa::t_8beb95fedd7700 13
+  s_9d341248da4bfa::t_03379b49bcd562 1-12,14-24
+evidence/t01/reference_request.json
+  s_9d341248da4bfa::t_ce1ad60e3a2dde 1
+evidence/t01/validation-commands.txt
+  s_9d341248da4bfa::t_7fd5e0e8927e80 5
+  s_9d341248da4bfa::t_37d39c75d5a120 1
+  s_9d341248da4bfa::t_34097f85a69066 2-4,6
+evidence/t01/validator-result.json
+  s_9d341248da4bfa::t_71aaf4c0e6bcc0 3,8-9,17-18
+  s_9d341248da4bfa::t_7fd5e0e8927e80 2,27
+  s_9d341248da4bfa::t_b60ff6eb05b6cc 1,4-5,10-13,19-22,25-26,28
+  s_9d341248da4bfa::t_e822aa6cdce912 6-7,14-16,23-24
+evidence/t01/job.json
+  s_9d341248da4bfa::t_dfd07d37547798 1
+tests/test_generation_invariants.py
+  s_9d341248da4bfa::t_f2543d80f22e0f 12,14,18-40,56-121
+  s_9d341248da4bfa::t_5a39a830c985b2 5,8,122-123,147-208
+  s_9d341248da4bfa::t_3c79e672e49f88 1-4,6-7,9-11,13,15-17,41-55,209-210,248-262,266-269,275-306,308,311-313,315-318,321-324
+  s_9d341248da4bfa::t_7e960b382d21ea 265,270-272,307
+  s_9d341248da4bfa::t_d0efbb77f0d686 124-146
+  s_9d341248da4bfa::t_4d26477dd2c48f 211-247
+  s_9d341248da4bfa::t_5653c2a28f5868 263-264,273-274,309-310,314,319-320
+src/media_generation/__init__.py
+  s_9d341248da4bfa::t_03379b49bcd562 1
+README.md
+  s_9d341248da4bfa::t_ae6f517c92a905 39-42,53-56
+  s_9d341248da4bfa::t_f320e85b11f074 1-38,43-52,57-81
+src/media_generation/cli.py
+  s_9d341248da4bfa::t_c1f5e2036f740d 1-129
+evidence/t01/request.json
+  s_9d341248da4bfa::t_dfd07d37547798 1
+.gitignore
+  s_9d341248da4bfa::t_5d1ace964a4245 7-8
+  s_9d341248da4bfa::t_f320e85b11f074 3-6
+src/media_generation/domain.py
+  s_9d341248da4bfa::t_ce8416cea2c424 1-237
+src/media_generation/__main__.py
+  s_9d341248da4bfa::t_c1f5e2036f740d 1-6
+evidence/t01/validation-transcript.txt
+  s_9d341248da4bfa::t_71aaf4c0e6bcc0 2-3,8,12,18,20-21,23
+  s_9d341248da4bfa::t_7fd5e0e8927e80 7,9
+  s_9d341248da4bfa::t_37d39c75d5a120 6,10-11,13-17,19,22
+  s_9d341248da4bfa::t_cf25b5d68fab17 1,4-5
+evidence/t01/generation-transcript.txt
+  s_9d341248da4bfa::t_4687b96f3dfa06 1-15
+  s_9d341248da4bfa::t_1d3c87104af1a2 16-27
+evidence/t01/reference_artifact.json
+  s_9d341248da4bfa::t_ce1ad60e3a2dde 1
+evidence/t01/provenance.json
+  s_9d341248da4bfa::t_dfd07d37547798 1
+src/media_generation/adapters.py
+  s_9d341248da4bfa::t_be95fa6b8fc23a 1-118
+evidence/t01/artifact.json
+  s_9d341248da4bfa::t_dfd07d37547798 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cdf9349dbe2fbaa8743f00df3ad68528112ccc53",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_9d341248da4bfa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15f9a-7aa8-7d10-a648-c55867c0b7cb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
