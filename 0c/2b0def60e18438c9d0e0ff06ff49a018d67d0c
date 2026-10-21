@@ -1,0 +1,86 @@
+tests/test_evidence_relocation.py
+  s_9d341248da4bfa::t_d2b485046d1019 260,291-293,308,310-313,383-386,388-390,402-403,469-470,513-557
+  s_9d341248da4bfa::t_e247acef3dfc3d 242-253,255-259,262-270,277-285,288-290,314-352,361-379,387,391-392,404-425,559-596
+  s_9d341248da4bfa::t_74f8eb24f8d686 6,14,298-301,305-307,646-943,945-948
+  s_9d341248da4bfa::t_951ca4c5c812a9 8,13,17-23,63-70,82-107,121-122,190-241
+  s_9d341248da4bfa::t_4df90d7a1a4b0f 261,271-276,286-287,353-358,360,393-395,401
+  s_9d341248da4bfa::t_5c132910c1e3f5 294-297,302-304,309,359,380,396-400,426-468
+  s_9d341248da4bfa::t_39b07bc4ac7375 558
+  s_9d341248da4bfa::t_ea2b55f29b8366 71-76,79-81
+  s_9d341248da4bfa::t_cd439fd37206a1 254,597-645
+  s_9d341248da4bfa::t_21a23efd0c2a17 381-382
+  s_9d341248da4bfa::t_3387066297d555 471-512
+  s_9d341248da4bfa::t_5cea5fa77438e8 944
+evidence/t01/validation-final-second-round.md
+  s_9d341248da4bfa::t_2055fe4f448a6b 39,50-51
+  s_9d341248da4bfa::t_fc46234a51c9b0 57
+  s_9d341248da4bfa::t_33eb34eed1d79f 1-26,28,40,42,52-55,58-59
+  s_9d341248da4bfa::t_279167a50a3918 41,43-44
+  s_9d341248da4bfa::t_1bf4fdbed0a302 27,29-36,38,56
+  s_9d341248da4bfa::t_8e42cd96cff33a 37
+  s_9d341248da4bfa::t_9b7308bca88265 45-49
+evidence/t01/cubic-review-final-second-round-transcript.txt
+  s_9d341248da4bfa::t_2055fe4f448a6b 1-2,15,17,21
+  s_9d341248da4bfa::t_279167a50a3918 3-14,16,18-20
+evidence/t01/cubic-review-second-round.txt
+  s_9d341248da4bfa::t_6aab0597aa0200 3-4,6
+  s_9d341248da4bfa::t_3f6c00ec61a0bb 1-2,5,7-12
+evidence/t01/validation-final-second-round-result.json
+  s_9d341248da4bfa::t_5ab5c649388d4c 1-28
+evidence/t01/full-suite-second-round-transcript.txt
+  s_9d341248da4bfa::t_e0d6a096066b68 1-2,4-14
+  s_9d341248da4bfa::t_4a5ab790c6672f 3
+evidence/t01/validation-followup.md
+  s_9d341248da4bfa::t_2a35f0e75bf035 18
+evidence/t01/validation-second-round.md
+  s_9d341248da4bfa::t_ac48a930ee0781 1-33,35-36
+  s_9d341248da4bfa::t_fc46234a51c9b0 34
+evidence/t01/relocate.py
+  s_9d341248da4bfa::t_a62edeee652c38 257-258,308,312-315,318-412,503-509,568-569,577-579,673-675,695-698
+  s_9d341248da4bfa::t_77c52e13b1e8f6 473-477,482-485,510-517,542,546-548,550-555,580,592-595,601-607,616-621
+  s_9d341248da4bfa::t_bf811039c088e2 51,165-170,172-176,830-849
+  s_9d341248da4bfa::t_41f10dba95ea54 706,711,715,720-727,729-730
+  s_9d341248da4bfa::t_ae6919d28d7852 889-894,913
+  s_9d341248da4bfa::t_625544044bcaf7 736,742,745,750
+  s_9d341248da4bfa::t_571ac6bb2e32c1 773,782,784,793-794
+  s_9d341248da4bfa::t_d810b79188176f 259-307,309-311,316-317,413-414,434-458,486,501-502,519-541,543-545,549,556,565,581,583-584,587-591,614-615,622-623,671-672,681-685,694,699,704,707-710,716,739-740,774,787-791
+  s_9d341248da4bfa::t_4e645fdaae7539 596-600,608-613
+  s_9d341248da4bfa::t_9e21b043d7f85d 895,947,949-951
+  s_9d341248da4bfa::t_67c49a110e895c 23,34,36,52-64,66-154
+  s_9d341248da4bfa::t_522dfe261e2a33 7-17,65,240,640,758,797
+  s_9d341248da4bfa::t_feab03807f4857 637
+  s_9d341248da4bfa::t_d5bd0f59d69862 676-680,686-693
+  s_9d341248da4bfa::t_df65bfbed2a94d 29,241-256,415-433,459-472,478-481,487-500,518,557-564,566-567,570-576,582,585-586,624-636,638-639,641-670,700-703,705,712-714,717-719,728,731-735,737-738,741,743-744,746-749,751-757,759-772,775-781,783,785-786,792
+  s_9d341248da4bfa::t_fd98f88e9ce99b 795-796
+evidence/t01/cubic-review-after-nested-config-fix-transcript.txt
+  s_9d341248da4bfa::t_9533127b3ebcf8 10-16,18
+evidence/t01/cubic-review-post-fix-transcript.txt
+  s_9d341248da4bfa::t_21b4c566f3d9aa 4-11,13-20,22-29
+evidence/t01/cubic-review-transcript.txt
+  s_9d341248da4bfa::t_704aefa4ab8dd5 4-21,23-24
+evidence/t01/full-suite-after-nested-config-fix.txt
+  s_9d341248da4bfa::t_573dbf93221b9e 3
+evidence/t01/full-suite-transcript.txt
+  s_9d341248da4bfa::t_7bcd85921ad248 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "0c2b0def60e18438c9d0e0ff06ff49a018d67d0c",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_9d341248da4bfa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15f9a-7aa8-7d10-a648-c55867c0b7cb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
