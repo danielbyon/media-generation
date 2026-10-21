@@ -15,4 +15,4 @@ The validator tied this run to base SHA `cdf9349dbe2fbaa8743f00df3ad68528112ccc5
 
 The historical `validator-result.json` was preserved byte-for-byte. Its SHA-256 before and after evidence relocation was `c108c065e67e7d19c2ef28a7c5078dcb2668188487d1820a7ae39f90b0292bdd`.
 
-The exact approved validator result is in `validation-followup.json`. The complete local pytest output is in `full-suite-transcript.txt`.
+The exact approved validator result is in `validation-followup.json`; its captured pytest output records 26 tests. The separate `full-suite-transcript.txt` records 27 tests and is associated with `validation-post-cubic-fix.md`. The later `full-suite-after-nested-config-fix.txt` records 29 tests.

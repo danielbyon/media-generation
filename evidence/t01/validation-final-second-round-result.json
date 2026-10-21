@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "validation_id": "validation-2026-10-21T23-00-44-907Z-bc0f0891",
+  "repo_id": "media-generation",
+  "profile": "test",
+  "status": "passed",
+  "head_sha": "26218cdaa55988a562c53e22c0194593545d4751",
+  "worktree_fingerprint": "754953efaec21a5f013dc9e00adf1d2c2893e0b8f07b434af6c564e5bb8cee04",
+  "timestamp": "2026-10-21T23:00:44.944Z",
+  "commands": [
+    {
+      "profile": "test",
+      "script": "pytest",
+      "command": ".venv/bin/python -m pytest",
+      "status": "passed",
+      "exit_code": 0,
+      "duration_ms": 17531,
+      "stdout_tail": "============================= test session starts ==============================\nplatform darwin -- Python 3.14.4, pytest-9.1.1, pluggy-1.7.0\nrootdir: [REDACTED_PATH]\nconfigfile: pyproject.toml\ntestpaths: tests\ncollected 56 items\n\ntests/test_cli_contract.py ..........                                    [ 17%]\ntests/test_evidence_relocation.py .............................          [ 69%]\ntests/test_generation_invariants.py .................                    [100%]\n\n============================= 56 passed in 17.24s =============================="
+    }
+  ],
+  "counts": {
+    "total": 1,
+    "passed": 1,
+    "failed": 0,
+    "skipped": 0
+  },
+  "warnings": []
+}
