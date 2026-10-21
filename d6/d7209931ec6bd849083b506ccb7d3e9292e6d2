@@ -1,0 +1,26 @@
+GLOSSARY.md
+  s_537f13372bbf30::t_bb5c5822913b75 1-33
+docs/research/2026-10-20-spec-research-review.md
+  s_537f13372bbf30::t_fa8dda4647eca4 1-326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "d6d7209931ec6bd849083b506ccb7d3e9292e6d2",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_537f13372bbf30": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15836-9c35-71e2-891b-d288adcbda2a",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
