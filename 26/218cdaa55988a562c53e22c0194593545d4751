@@ -1,0 +1,130 @@
+src/media_generation/service.py
+  s_9d341248da4bfa::t_53eb99dd01c839 13-19,197-199
+  s_9d341248da4bfa::t_5fac5543e2b12c 154,180-183,196,200-211
+  s_9d341248da4bfa::t_2b87e1c6d30fd8 89-91
+  s_737b0d55f7b9f8::t_36b17e8cef3b7c 212
+evidence/t01/nested-config-regression-transcript.txt
+  s_9d341248da4bfa::t_ce2ed577f061fa 1-2
+tests/test_cli_contract.py
+  s_9d341248da4bfa::t_e023f56ed640e9 10,14,21-26,29-31,34,344-407
+  s_9d341248da4bfa::t_57b9bc861d3271 9,18,27,33
+  s_537f13372bbf30::t_73f3eae7673eaf 15
+evidence/t01/cubic-review-post-fix-exit-code.txt
+  s_9d341248da4bfa::t_d075942d5ed6ce 1
+.github/workflows/python-tests.yml
+  s_9d341248da4bfa::t_53eb99dd01c839 1-30
+evidence/t01/artifact.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/job.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/full-suite-transcript.txt
+  s_9d341248da4bfa::t_ad25700aed95b3 1-5,7,10-11
+  s_9d341248da4bfa::t_5d5249d00164b9 6,8-9,12
+README.md
+  s_9d341248da4bfa::t_20a5137c78ca55 50-61
+  s_9d341248da4bfa::t_53eb99dd01c839 87-112
+evidence/t01/relocation-command.txt
+  s_9d341248da4bfa::t_b0de36a33f7043 1-8
+evidence/t01/request.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/relocation-proof-transcript.txt
+  s_9d341248da4bfa::t_a768510e18c3cc 1-2
+evidence/t01/validation-post-cubic-fix.md
+  s_9d341248da4bfa::t_46e08d3145252a 1-17
+tests/test_evidence_relocation.py
+  s_9d341248da4bfa::t_17030363288ed1 1-85
+  s_9d341248da4bfa::t_755d0f96f3b06d 86-134
+src/media_generation/domain.py
+  s_9d341248da4bfa::t_5fac5543e2b12c 21-38,173-174,183,189
+evidence/t01/cubic-review-after-nested-config-fix-exit-code.txt
+  s_9d341248da4bfa::t_02c3c77942cd85 1
+evidence/t01/cubic-review-after-nested-config-fix-transcript.txt
+  s_9d341248da4bfa::t_02c3c77942cd85 1-21
+src/media_generation/cli.py
+  s_9d341248da4bfa::t_5fac5543e2b12c 23-33,36,134
+evidence/t01/reference_provenance.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/provenance.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/validation-followup-command.txt
+  s_9d341248da4bfa::t_3047e2a3e90761 1-13
+evidence/t01/validation-followup.md
+  s_9d341248da4bfa::t_0ba6aa95f7f6fa 1,3,14
+  s_9d341248da4bfa::t_f9172a8ce8755a 2,4-13,15-18
+evidence/t01/cubic-review-post-fix-transcript.txt
+  s_9d341248da4bfa::t_d075942d5ed6ce 1-31
+evidence/t01/full-suite-after-nested-config-fix.txt
+  s_9d341248da4bfa::t_e5313fdf4cf2c8 1-12
+evidence/t01/validation-after-nested-config-fix.json
+  s_9d341248da4bfa::t_46c5b39d8c0904 1-28
+src/media_generation/store.py
+  s_9d341248da4bfa::t_5fac5543e2b12c 105-106,122-124,302-314,335-337,340-342,345,348-352
+  s_9d341248da4bfa::t_2b87e1c6d30fd8 458,466,472
+evidence/t01/reference_job.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/validation-after-nested-config-fix.md
+  s_9d341248da4bfa::t_5e9af3beb657bd 1-16
+tests/test_generation_invariants.py
+  s_9d341248da4bfa::t_70976cbda30e2c 5,86-95
+  s_9d341248da4bfa::t_9ebe593ce1a469 14-19,64-85,96,137-189,411-421,468-532
+  s_9d341248da4bfa::t_eb661aee60e39e 97-136
+evidence/t01/validation-followup.json
+  s_9d341248da4bfa::t_f9d6fc017ef2d5 1
+  s_9d341248da4bfa::t_f9172a8ce8755a 2-28
+evidence/t01/relocation-transcript.txt
+  s_9d341248da4bfa::t_e08e9f5756b0cb 1
+evidence/t01/reference_artifact.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/validation-post-cubic-fix.json
+  s_9d341248da4bfa::t_ab95d9a34969e4 1-28
+evidence/t01/reference_request.json
+  s_9d341248da4bfa::t_a9472398f25c19 1
+evidence/t01/relocation-exit-code.txt
+  s_9d341248da4bfa::t_e08e9f5756b0cb 1
+evidence/t01/relocate.py
+  s_9d341248da4bfa::t_5958a5f7948b97 1-14,16-19,21-23,25,27-110,178-180,182-184,187-194,210,241,266,271-292
+  s_9d341248da4bfa::t_2ad651df929d39 15,20,113-118,152,162-163,181,185-186,195-209,211-240,242-265
+  s_9d341248da4bfa::t_9a59cdfc8c7d2a 149,164
+  s_9d341248da4bfa::t_a48afed4d8daf8 24,26,111-112,119-148,150-151,153-161,165-177,267-270
+evidence/t01/cubic-review-exit-code.txt
+  s_9d341248da4bfa::t_6f53ba14934b4f 1
+evidence/t01/cubic-review-transcript.txt
+  s_9d341248da4bfa::t_ded2650606efe0 1-31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "26218cdaa55988a562c53e22c0194593545d4751",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_537f13372bbf30": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15836-9c35-71e2-891b-d288adcbda2a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_737b0d55f7b9f8": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1585f-45dd-7750-bbf6-436b0bac36a7",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_9d341248da4bfa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15f9a-7aa8-7d10-a648-c55867c0b7cb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
