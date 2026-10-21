@@ -1,0 +1,27 @@
+Evidence database: evidence/t01/t01.sqlite3
+
+Submit command (one independent CLI process):
+PYTHONPATH=src python3 -m media_generation submit --db evidence/t01/t01.sqlite3 --output-dir evidence/t01/artifacts --idempotency-key t01-evidence-2026-10-21 --request-json '{"prompt":"A small observatory under a clear midnight sky","seed":20261021,"width":96,"height":64,"reference_ids":[],"output_slot":"evidence"}'
+
+Submit output:
+{"artifact_id":"art_339fce097fa04b828bc02e4829694f69","job_id":"job_ffb6969e2ed549fe955cb5a8ba66b7bb","output_slot_id":"slot_18023d72d9774f77b63fa4eb4382b01c","request_id":"req_852e89dec72945d9a4fb1947f66049b0","status":"succeeded"}
+
+Each retrieval below ran in a separate CLI process against the same SQLite file:
+PYTHONPATH=src python3 -m media_generation request --db evidence/t01/t01.sqlite3 --id req_852e89dec72945d9a4fb1947f66049b0
+PYTHONPATH=src python3 -m media_generation job --db evidence/t01/t01.sqlite3 --id job_ffb6969e2ed549fe955cb5a8ba66b7bb
+PYTHONPATH=src python3 -m media_generation artifact --db evidence/t01/t01.sqlite3 --id art_339fce097fa04b828bc02e4829694f69
+PYTHONPATH=src python3 -m media_generation provenance --db evidence/t01/t01.sqlite3 --job-id job_ffb6969e2ed549fe955cb5a8ba66b7bb
+
+The JSON responses from those four retrievals are saved in request.json, job.json, artifact.json, and provenance.json respectively.
+
+Reference submission (one independent CLI process) uses the first persisted
+logical artifact ID as a reference:
+PYTHONPATH=src python3 -m media_generation submit --db evidence/t01/t01.sqlite3 --output-dir evidence/t01/artifacts --idempotency-key t01-reference-evidence-2026-10-21 --request-json '{"prompt":"A smaller observatory reflected in the reference image","seed":20261022,"width":48,"height":32,"reference_ids":["art_339fce097fa04b828bc02e4829694f69"],"output_slot":"reference-study"}'
+
+Reference submission output:
+{"artifact_id":"art_828b60986dad4c8a812dda982d70df6b","job_id":"job_a9978569462b49e689e289733310c6be","output_slot_id":"slot_03ad992c31c1470e82513173e5362e21","request_id":"req_d388ca9fd78e4580875b2f7ea0337af3","status":"succeeded"}
+
+The reference request, job, artifact, and provenance were then retrieved in
+four more independent CLI processes. Their JSON responses are saved as
+reference_request.json, reference_job.json, reference_artifact.json, and
+reference_provenance.json.
