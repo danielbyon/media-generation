@@ -1,0 +1,49 @@
+docs/agents/triage-labels.md
+  s_2614167b3ba64e::t_76ce6e85a58120 1-15
+docs/agents/issue-tracker.md
+  s_2614167b3ba64e::t_76ce6e85a58120 1-45
+AGENTS.md
+  h_fe6a8a30e51ecc 1-2
+  s_2614167b3ba64e::t_76ce6e85a58120 3-15
+docs/agents/domain.md
+  s_2614167b3ba64e::t_76ce6e85a58120 1-51
+.gitignore
+  h_fe6a8a30e51ecc 1
+.codegraph/.gitignore
+  s_f2942942c3caab::t_d64b744b8bc32a 1-5
+.serena/.gitignore
+  s_f2942942c3caab::t_23948a39f68027 1-2
+.serena/project.yml
+  s_f2942942c3caab::t_d6576bdebc53ed 1-186
+.serena/memories/memory_maintenance.md
+  s_2614167b3ba64e::t_00e53de02ceb48 1-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "846e1ab37d9c6f22fd9157526defc8f2fdae3db9",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_2614167b3ba64e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15d1c-1a4d-7432-b701-a1d4c1ed697d",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_f2942942c3caab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15855-1bcd-7d92-b495-2b4e1d2b21cb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
