@@ -102,7 +102,8 @@ class SQLiteStore:
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
                     error_message TEXT,
-                    UNIQUE (job_id, attempt_number)
+                    UNIQUE (job_id, attempt_number),
+                    UNIQUE (job_id, attempt_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS generation_artifacts (
@@ -118,7 +119,9 @@ class SQLiteStore:
                     file_size INTEGER NOT NULL,
                     sha256 TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    UNIQUE (job_id, output_slot_id)
+                    UNIQUE (job_id, output_slot_id),
+                    FOREIGN KEY (job_id, attempt_id)
+                        REFERENCES generation_attempts(job_id, attempt_id)
                 );
 
                 CREATE INDEX IF NOT EXISTS generation_artifacts_job_idx
@@ -296,6 +299,19 @@ class SQLiteStore:
                 raise RecordNotFoundError(f"job not found: {artifact.job_id}")
             if row["status"] != "running":
                 raise RuntimeError(f"job {artifact.job_id} is not running")
+            attempt = connection.execute(
+                """SELECT status FROM generation_attempts
+                   WHERE job_id = ? AND attempt_id = ?""",
+                (artifact.job_id, artifact.attempt_id),
+            ).fetchone()
+            if attempt is None:
+                raise RuntimeError(
+                    f"attempt {artifact.attempt_id} does not belong to job {artifact.job_id}"
+                )
+            if attempt["status"] != "running":
+                raise RuntimeError(
+                    f"attempt {artifact.attempt_id} for job {artifact.job_id} is not running"
+                )
             connection.execute(
                 """INSERT INTO generation_artifacts (
                     artifact_id, job_id, attempt_id, output_slot_id, path, media_type,
@@ -316,16 +332,24 @@ class SQLiteStore:
                     artifact.created_at,
                 ),
             )
-            connection.execute(
-                "UPDATE generation_jobs SET status = 'succeeded', updated_at = ? WHERE job_id = ?",
+            updated_job = connection.execute(
+                """UPDATE generation_jobs SET status = 'succeeded', updated_at = ?
+                   WHERE job_id = ? AND status = 'running'""",
                 (timestamp, artifact.job_id),
             )
-            connection.execute(
+            if updated_job.rowcount != 1:
+                raise RuntimeError(f"job {artifact.job_id} could not be marked succeeded")
+            updated_attempt = connection.execute(
                 """UPDATE generation_attempts
                    SET status = 'succeeded', finished_at = ?, error_message = NULL
-                   WHERE attempt_id = ? AND job_id = ?""",
+                   WHERE attempt_id = ? AND job_id = ? AND status = 'running'""",
                 (timestamp, artifact.attempt_id, artifact.job_id),
             )
+            if updated_attempt.rowcount != 1:
+                raise RuntimeError(
+                    f"attempt {artifact.attempt_id} for job {artifact.job_id} "
+                    "could not be marked succeeded"
+                )
 
     def fail_execution(self, job_id: str, attempt_id: str, message: str, timestamp: str) -> None:
         """Record adapter failure without creating an artifact record."""
@@ -431,6 +455,7 @@ class SQLiteStore:
             created_at=str(request_row["created_at"]),
         )
         job = self._job_from_row(job_row)
+        job_payload = job.to_dict()
         attempt = self._attempt_from_row(attempt_row)
         artifact = None if artifact_row is None else self._artifact_from_row(artifact_row)
         return {
@@ -438,13 +463,13 @@ class SQLiteStore:
             "request": request.to_dict(),
             "status": job.status,
             "adapter_id": job.adapter_id,
-            "adapter_configuration": dict(job.adapter_configuration),
+            "adapter_configuration": job_payload["adapter_configuration"],
             "resolved_prompt": job.resolved_prompt,
             "resolved_seed": job.resolved_seed,
             "validated_reference_ids": list(job.validated_reference_ids),
             "output_slot": job.output_slot,
             "output_slot_id": job.output_slot_id,
-            "effective_parameters": dict(job.effective_parameters),
+            "effective_parameters": job_payload["effective_parameters"],
             "attempt": attempt.to_dict(),
             "artifact": None if artifact is None else artifact.to_dict(),
         }

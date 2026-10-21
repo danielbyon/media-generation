@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapters import DeterministicCpuAdapter, GenerationAdapter
-from .domain import GenerationArtifact, GenerationJob, GenerationPlan, GenerationRequest
+from .domain import (
+    GenerationArtifact,
+    GenerationJob,
+    GenerationPlan,
+    GenerationRequest,
+    ResolvedReference,
+)
 from .errors import (
     GenerationExecutionError,
     IdempotencyConflictError,
@@ -80,7 +86,9 @@ class GenerationService:
             existing_job = self._store.get_job(existing[0])
             if (
                 existing_job.adapter_id != self.adapter.adapter_id
-                or _canonical_json(dict(existing_job.adapter_configuration))
+                or _canonical_json(
+                    existing_job.to_dict()["adapter_configuration"]
+                )
                 != _canonical_json(self.adapter.configuration)
             ):
                 raise IdempotencyConflictError(
@@ -143,6 +151,7 @@ class GenerationService:
         artifact_id = _new_id("art")
         destination = self.output_directory / f"{artifact_id}.png"
         try:
+            self._validate_reference_artifacts(pending.references)
             self.output_directory.mkdir(parents=True, exist_ok=True)
             metadata = self.adapter.generate(plan, destination)
             if not destination.is_file():
@@ -168,7 +177,10 @@ class GenerationService:
             )
             self._store.complete_execution(artifact, _now())
         except Exception as error:
-            destination.unlink(missing_ok=True)
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
             message = f"adapter {self.adapter.adapter_id!r} failed: {error}"
             self._store.fail_execution(pending.job_id, pending.attempt_id, message, _now())
             raise GenerationExecutionError(pending.job_id, message) from error
@@ -180,6 +192,23 @@ class GenerationService:
             output_slot_id=pending.output_slot_id,
             artifact_id=artifact_id,
         )
+
+    @staticmethod
+    def _validate_reference_artifacts(
+        references: tuple[ResolvedReference, ...],
+    ) -> None:
+        """Reject reference files that are missing or differ from their saved hash."""
+        for reference in references:
+            try:
+                actual_sha256 = _sha256_file(reference.path)
+            except OSError as error:
+                raise RuntimeError(
+                    f"reference artifact {reference.artifact_id!r} is missing or unreadable"
+                ) from error
+            if actual_sha256 != reference.content_sha256:
+                raise RuntimeError(
+                    f"reference artifact {reference.artifact_id!r} failed SHA-256 validation"
+                )
 
     def get_request(self, request_id: str) -> dict[str, object]:
         """Retrieve one immutable request snapshot by ID."""

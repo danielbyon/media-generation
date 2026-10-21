@@ -6,27 +6,32 @@ import json
 import os
 import struct
 import subprocess
-import sys
+import sysconfig
+import tempfile
 import zlib
 from pathlib import Path
 
+import pytest
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+CLI_ENTRY_POINT = Path(sysconfig.get_path("scripts")) / "media-generation"
 
 
-def _run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
-    """Run one independent CLI process against the source checkout."""
+def _run_cli(
+    *arguments: str,
+    cwd: Path | None = None,
+    environment_overrides: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run the installed console command outside the source checkout."""
+    assert CLI_ENTRY_POINT.is_file(), "install the project with pip install -e '.[test]'"
     environment = os.environ.copy()
-    source_root = str(REPOSITORY_ROOT / "src")
-    current_pythonpath = environment.get("PYTHONPATH")
-    environment["PYTHONPATH"] = (
-        source_root
-        if not current_pythonpath
-        else os.pathsep.join((source_root, current_pythonpath))
-    )
+    environment.pop("PYTHONPATH", None)
+    if environment_overrides:
+        environment.update(environment_overrides)
     return subprocess.run(
-        [sys.executable, "-m", "media_generation", *arguments],
-        cwd=REPOSITORY_ROOT,
+        [str(CLI_ENTRY_POINT), *arguments],
+        cwd=cwd or Path(tempfile.gettempdir()),
         env=environment,
         capture_output=True,
         text=True,
@@ -336,3 +341,67 @@ def test_unsupported_dimensions_and_invalid_requests_do_not_bind_idempotency_key
     assert invalid["error"]["code"] == "validation_error"  # type: ignore[index]
     assert valid_after_rejection["status"] == "succeeded"
     assert valid_after_unsupported["status"] == "succeeded"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("submit",),
+        ("job", "--db", "unused.sqlite3", "--id", "job_example", "--unknown"),
+        ("not-a-command",),
+    ],
+    ids=("missing-required-arguments", "invalid-option", "unknown-command"),
+)
+def test_argument_syntax_errors_use_structured_json(
+    arguments: tuple[str, ...],
+) -> None:
+    """Invalid command syntax is machine-readable on stderr with a failure code."""
+    process = _run_cli(*arguments)
+
+    assert process.returncode != 0
+    assert process.stdout == ""
+    error = _json_error(process)
+    assert error["error"]["code"] == "argument_error"  # type: ignore[index]
+    assert isinstance(error["error"]["message"], str)  # type: ignore[index]
+
+
+def test_help_keeps_conventional_argparse_output() -> None:
+    """The structured syntax-error contract does not replace normal help."""
+    process = _run_cli("--help")
+
+    assert process.returncode == 0
+    assert process.stdout.startswith("usage: media-generation")
+    assert process.stderr == ""
+
+
+def test_installed_entry_point_round_trips_unicode_with_ascii_stdout(
+    tmp_path: Path,
+) -> None:
+    """Installed CLI JSON remains valid when Python stdout is configured as ASCII."""
+    prompt = "星空 café"
+    database = tmp_path / "unicode.sqlite3"
+    output_directory = tmp_path / "artifacts"
+    environment = {"PYTHONIOENCODING": "ascii", "PYTHONUTF8": "0"}
+    submitted = _run_cli(
+        "submit",
+        "--db",
+        str(database),
+        "--output-dir",
+        str(output_directory),
+        "--idempotency-key",
+        "unicode-prompt",
+        "--request-json",
+        json.dumps({"prompt": prompt, "seed": 42}, ensure_ascii=False),
+        environment_overrides=environment,
+    )
+    result = _json_output(submitted)
+    retrieved = _run_cli(
+        "request",
+        "--db",
+        str(database),
+        "--id",
+        str(result["request_id"]),
+        environment_overrides=environment,
+    )
+
+    assert _json_output(retrieved)["prompt"] == prompt

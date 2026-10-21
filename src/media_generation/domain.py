@@ -18,6 +18,24 @@ _ARTIFACT_ID = re.compile(r"^art_[0-9a-f]{32}$")
 _OUTPUT_SLOT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
+def _freeze(value: object) -> object:
+    """Copy nested JSON-like values into recursively immutable containers."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(item) for item in value)
+    return value
+
+
+def _thaw(value: object) -> object:
+    """Return detached JSON-compatible containers from immutable values."""
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
 @dataclass(frozen=True, slots=True)
 class GenerationRequest:
     """Canonical engine-neutral image intent supplied to the service.
@@ -152,8 +170,8 @@ class GenerationJob:
     artifact_id: str | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "adapter_configuration", MappingProxyType(dict(self.adapter_configuration)))
-        object.__setattr__(self, "effective_parameters", MappingProxyType(dict(self.effective_parameters)))
+        object.__setattr__(self, "adapter_configuration", _freeze(self.adapter_configuration))
+        object.__setattr__(self, "effective_parameters", _freeze(self.effective_parameters))
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-compatible snapshot of the durable job."""
@@ -162,13 +180,13 @@ class GenerationJob:
             "request_id": self.request_id,
             "status": self.status,
             "adapter_id": self.adapter_id,
-            "adapter_configuration": dict(self.adapter_configuration),
+            "adapter_configuration": _thaw(self.adapter_configuration),
             "resolved_prompt": self.resolved_prompt,
             "resolved_seed": self.resolved_seed,
             "validated_reference_ids": list(self.validated_reference_ids),
             "output_slot": self.output_slot,
             "output_slot_id": self.output_slot_id,
-            "effective_parameters": dict(self.effective_parameters),
+            "effective_parameters": _thaw(self.effective_parameters),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "artifact_id": self.artifact_id,

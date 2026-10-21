@@ -1,0 +1,31 @@
+Reviewing without cubic context for danielbyon/media-generation: You do not have access to this repository
+Reviewing uncommitted changes...
+· Read full patch for tracked changes
+· Read /Users/daniel/Projects/media-generation/.github/workflows/python-tests.yml
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocate.py
+· Read /Users/daniel/Projects/media-generation/tests/test_evidence_relocation.py
+· Read /Users/daniel/Projects/media-generation/src/media_generation/domain.py
+· Read /Users/daniel/Projects/media-generation/src/media_generation/service.py
+· Read /Users/daniel/Projects/media-generation/src/media_generation/store.py
+· Read /Users/daniel/Projects/media-generation/src/media_generation/cli.py
+· Read /Users/daniel/Projects/media-generation/AGENTS.local.md
+· Find evidence/t01/*
+· Read /Users/daniel/Projects/media-generation/tests/test_cli_contract.py
+· Read /Users/daniel/Projects/media-generation/tests/test_generation_invariants.py
+· Read /Users/daniel/Projects/media-generation/src/media_generation/store.py
+· Read /Users/daniel/Projects/media-generation/evidence/t01/cubic-review-transcript.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/validation-followup.md
+· Read /Users/daniel/Projects/media-generation/evidence/t01/validation-post-cubic-fix.md
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocation-command.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/validation-followup-command.txt
+· Design quality and maintainability review
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocation-proof-transcript.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocation-transcript.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/full-suite-transcript.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/validation-post-cubic-fix.json
+· Read /Users/daniel/Projects/media-generation/evidence/t01/validation-followup.json
+· Read /Users/daniel/Projects/media-generation/evidence/t01/cubic-review-exit-code.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocation-exit-code.txt
+· Read /Users/daniel/Projects/media-generation/evidence/t01/validation-followup-command.txt
+Review complete - no issues found
+No issues found.

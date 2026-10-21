@@ -1,0 +1,21 @@
+Reviewing without cubic context for danielbyon/media-generation: You do not have access to this repository
+Reviewing uncommitted changes...
+· Use todowrite
+· Read README patch
+· Read source implementation patches
+· Read test patches
+· Read changed evidence JSON patches
+· Find **/*
+· Find evidence/t01/*
+· Read /Users/daniel/Projects/media-generation/tests/test_evidence_relocation.py
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocate.py
+· Read /Users/daniel/Projects/media-generation/.github/workflows/python-tests.yml
+· Read /Users/daniel/Projects/media-generation/src/media_generation/service.py
+· Read /Users/daniel/Projects/media-generation/src/media_generation/store.py
+· Read /Users/daniel/Projects/media-generation/AGENTS.local.md
+· Read /Users/daniel/Projects/media-generation/evidence/t01/relocation-command.txt
+· Design quality and maintainability review
+· Read /Users/daniel/Projects/media-generation/pyproject.toml
+· Use todowrite
+Review complete - no issues found
+No issues found.

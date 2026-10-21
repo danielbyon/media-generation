@@ -1,0 +1,13 @@
+Approved repository validation:
+
+  repo_validate(repo_id="media-generation", profile="test", dry_run=false)
+
+The approved profile selected `.venv/bin/python -m pytest` and passed.
+
+Full suite with an unabridged local transcript:
+
+  .venv/bin/python -m pytest > evidence/t01/full-suite-transcript.txt 2>&1
+
+Relocation proof from a separate checkout-like path:
+
+  .venv/bin/python -m pytest -q tests/test_evidence_relocation.py

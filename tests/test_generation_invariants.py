@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -10,7 +11,12 @@ from threading import Barrier
 import pytest
 
 from media_generation.adapters import AdapterCapabilities, DeterministicCpuAdapter
-from media_generation.domain import GenerationPlan, GenerationRequest
+from media_generation.domain import (
+    GenerationArtifact,
+    GenerationJob,
+    GenerationPlan,
+    GenerationRequest,
+)
 from media_generation.errors import IdempotencyConflictError, UnsupportedCapabilityError
 from media_generation.service import GenerationExecutionError, GenerationService
 
@@ -53,6 +59,132 @@ def test_generation_request_intent_cannot_be_mutated() -> None:
         request.prompt = "A different scene"
 
     assert request.reference_ids == ("art_0123456789abcdef0123456789abcdef",)
+
+
+def test_generation_job_defensively_freezes_nested_configuration() -> None:
+    """Nested input and returned mappings cannot mutate a persisted job snapshot."""
+    source_configuration = {"nested": {"items": ["original"]}}
+    source_parameters = {"nested": [{"enabled": True}]}
+    job = GenerationJob(
+        job_id="job_0123456789abcdef0123456789abcdef",
+        request_id="req_0123456789abcdef0123456789abcdef",
+        status="running",
+        adapter_id="test-adapter",
+        adapter_configuration=source_configuration,
+        resolved_prompt="A stable prompt",
+        resolved_seed=7,
+        validated_reference_ids=(),
+        output_slot="primary",
+        output_slot_id="slot_0123456789abcdef0123456789abcdef",
+        effective_parameters=source_parameters,
+        created_at="2026-10-21T00:00:00+00:00",
+        updated_at="2026-10-21T00:00:00+00:00",
+    )
+
+    source_configuration["nested"]["items"].append("changed")
+    source_parameters["nested"][0]["enabled"] = False
+    assert job.adapter_configuration["nested"]["items"] == ("original",)
+    assert job.effective_parameters["nested"][0]["enabled"] is True
+
+    with pytest.raises(TypeError):
+        job.adapter_configuration["nested"]["new"] = "value"
+    with pytest.raises(TypeError):
+        job.effective_parameters["nested"][0]["enabled"] = False
+
+    snapshot = job.to_dict()
+    snapshot["adapter_configuration"]["nested"]["items"].append("snapshot edit")
+    assert job.adapter_configuration["nested"]["items"] == ("original",)
+
+
+def test_idempotent_replay_accepts_nested_adapter_configuration(
+    tmp_path: Path,
+) -> None:
+    """Frozen nested configuration remains comparable during same-key replay."""
+    database = tmp_path / "studio.sqlite3"
+    output_directory = tmp_path / "artifacts"
+    configuration = {"nested": {"enabled": True}}
+    service = GenerationService(
+        database,
+        output_directory,
+        adapter=_VariantCpuAdapter(configuration=configuration),
+    )
+    request = GenerationRequest(prompt="A glass greenhouse", seed=19)
+
+    original = service.submit("nested-config-retry", request)
+    replay = service.submit("nested-config-retry", request)
+
+    assert replay == original
+
+
+def test_provenance_with_nested_adapter_configuration_is_json_serializable(
+    tmp_path: Path,
+) -> None:
+    """Provenance exposes detached JSON values for recursively frozen config."""
+    configuration = {"nested": {"enabled": True}}
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        tmp_path / "artifacts",
+        adapter=_VariantCpuAdapter(configuration=configuration),
+    )
+    submitted = service.submit(
+        "nested-config-provenance",
+        GenerationRequest(prompt="A glass greenhouse", seed=19),
+    )
+
+    encoded = json.dumps(service.get_provenance(submitted.job_id))
+
+    assert json.loads(encoded)["adapter_configuration"] == configuration
+
+
+def test_artifact_attempt_must_belong_to_the_job_being_completed(
+    tmp_path: Path,
+) -> None:
+    """A cross-job attempt cannot publish an artifact or transition either job."""
+    service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+
+    def pending(key: str, suffix: str):
+        request = GenerationRequest(prompt=f"Request {key}", seed=9)
+        return service._store.create_pending_execution(
+            request=request,
+            request_digest=request.digest(),
+            idempotency_key=key,
+            request_id=f"req_{suffix}",
+            job_id=f"job_{suffix}",
+            attempt_id=f"att_{suffix}",
+            output_slot_id=f"slot_{suffix}",
+            resolved_seed=9,
+            adapter_id="test-adapter",
+            adapter_configuration_json="{}",
+            effective_parameters_json='{"width":64,"height":64}',
+            resolved_output_directory=str(tmp_path / "artifacts"),
+            timestamp="2026-10-21T00:00:00+00:00",
+        )
+
+    first = pending("first", "0123456789abcdef0123456789abcdef")
+    second = pending("second", "abcdef0123456789abcdef0123456789")
+    artifact = GenerationArtifact(
+        artifact_id="art_0123456789abcdef0123456789abcdef",
+        job_id=first.job_id,
+        attempt_id=second.attempt_id,
+        output_slot_id=first.output_slot_id,
+        path=str(tmp_path / "artifacts" / "cross-job.png"),
+        media_type="image/png",
+        image_format="PNG",
+        width=64,
+        height=64,
+        file_size=1,
+        sha256="0" * 64,
+        created_at="2026-10-21T00:00:01+00:00",
+    )
+
+    with pytest.raises(RuntimeError, match="attempt.*job"):
+        service._store.complete_execution(artifact, "2026-10-21T00:00:01+00:00")
+
+    for job_id in (first.job_id, second.job_id):
+        assert service.get_job(job_id).status == "running"
+        provenance = service.get_provenance(job_id)
+        assert provenance["attempt"]["status"] == "running"
+        assert provenance["artifact"] is None
 
 
 def test_idempotent_reuse_checks_current_adapter_capabilities(tmp_path: Path) -> None:
@@ -276,6 +408,17 @@ class _FailAfterWritingAdapter:
         raise RuntimeError("controlled adapter failure")
 
 
+class _TrackingCpuAdapter(DeterministicCpuAdapter):
+    """Count adapter calls while retaining deterministic CPU behavior."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def generate(self, plan: GenerationPlan, destination: Path) -> object:
+        self.calls += 1
+        return super().generate(plan, destination)
+
+
 def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
     tmp_path: Path,
 ) -> None:
@@ -322,3 +465,68 @@ def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
     assert provenance["attempt"]["status"] == "failed"
     assert provenance["artifact"] is None
     assert list((tmp_path / "artifacts").iterdir()) == []
+
+
+def test_output_directory_file_does_not_mask_durable_execution_failure(
+    tmp_path: Path,
+) -> None:
+    """Cleanup failure leaves the job and attempt durably marked as failed."""
+    output_file = tmp_path / "not-a-directory"
+    output_file.write_text("preserve this file", encoding="utf-8")
+    service = GenerationService(tmp_path / "studio.sqlite3", output_file)
+
+    with pytest.raises(GenerationExecutionError) as failure:
+        service.submit(
+            "output-directory-is-file",
+            GenerationRequest(prompt="A quiet harbor", seed=11),
+        )
+
+    job = service.get_job(failure.value.job_id)
+    provenance = service.get_provenance(job.job_id)
+    assert job.status == "failed"
+    assert provenance["attempt"]["status"] == "failed"
+    assert provenance["artifact"] is None
+    assert output_file.read_text(encoding="utf-8") == "preserve this file"
+
+
+@pytest.mark.parametrize("corruption", ["deleted", "tampered"])
+def test_corrupt_reference_is_rejected_before_adapter_execution(
+    tmp_path: Path, corruption: str
+) -> None:
+    """Missing or changed reference bytes cannot be consumed as the saved artifact."""
+    database = tmp_path / "studio.sqlite3"
+    source_service = GenerationService(database, tmp_path / "source-artifacts")
+    source = source_service.submit(
+        "reference-source",
+        GenerationRequest(prompt="An original source image", seed=13, width=32, height=32),
+    )
+    source_artifact = source_service.get_artifact(source.artifact_id or "")
+    reference_path = Path(source_artifact.path)
+    if corruption == "deleted":
+        reference_path.unlink()
+    else:
+        reference_path.write_bytes(b"different bytes than the saved SHA-256")
+
+    adapter = _TrackingCpuAdapter()
+    consumer_service = GenerationService(
+        database, tmp_path / "consumer-artifacts", adapter=adapter
+    )
+    with pytest.raises(GenerationExecutionError) as failure:
+        consumer_service.submit(
+            f"reference-{corruption}",
+            GenerationRequest(
+                prompt="Use this reference",
+                seed=14,
+                width=32,
+                height=32,
+                reference_ids=(source_artifact.artifact_id,),
+            ),
+        )
+
+    job = consumer_service.get_job(failure.value.job_id)
+    provenance = consumer_service.get_provenance(job.job_id)
+    assert adapter.calls == 0
+    assert job.status == "failed"
+    assert provenance["attempt"]["status"] == "failed"
+    assert provenance["artifact"] is None
+    assert "reference artifact" in str(failure.value).lower()

@@ -47,13 +47,18 @@ prompt, optional seed, width, height, a list of persisted artifact IDs, and a
 semantic output-slot name. They do not accept adapter workflow syntax or input
 file paths and URLs. A reference must be an existing logical artifact ID; an
 unknown ID, malformed path-like value, unsupported dimension, or unsupported
-adapter capability produces a structured error and a nonzero exit status.
+adapter capability produces a structured error and a nonzero exit status. Before
+execution, the service verifies that every referenced file still exists and
+matches the SHA-256 value stored with its artifact record.
 
-Repeating a submission with the same idempotency key and canonical request
-returns its existing request and job identities, plus its artifact identity
-when execution succeeded. Reusing that key with different intent returns an
-explicit conflict. If no seed is supplied, the service resolves one from the
-canonical request digest and persists it before adapter execution.
+Repeating a submission reuses its existing job only when the canonical request
+intent, adapter identity, adapter configuration, and resolved output directory
+all match the values stored for that idempotency key. A changed request intent,
+adapter identity or configuration, or output directory produces an explicit
+`idempotency_conflict`. A matching succeeded job returns its existing artifact
+identity; a matching failed job remains inspectable as failed. If no seed is
+supplied, the service resolves one from the canonical request digest and
+persists it before adapter execution.
 
 ## Persistence and adapter boundary
 
@@ -79,3 +84,29 @@ artifact reconciliation, production publication workflow, or benchmark
 orchestration. T03/T04 publication and orchestration work remains out of scope.
 APEX hardware, real GPU inference, engine behavior, model quality, and hardware
 reliability are unverified.
+
+## Evidence and validation
+
+The JSON snapshots under `evidence/t01/` store artifact paths relative to the
+repository so they can be reviewed from any checkout. The SQLite database keeps
+resolved absolute paths for runtime access. After moving the evidence to a new
+checkout path, reinstall the package and rebuild those runtime paths from the
+verified artifact files:
+
+```sh
+python3 -m pip install -e '.[test]'
+python3 evidence/t01/relocate.py
+```
+
+The relocation regression test copies the evidence into a separate checkout
+path, runs the same reconstruction utility there, verifies artifact hashes and
+portable snapshots, and reads the relocated artifact through the installed CLI.
+Run it with the full test suite using `python3 -m pytest`.
+
+`evidence/t01/validator-result.json` is the historical approved validation
+record and retains the commit SHA and worktree fingerprint captured at that
+time. A later local validation is recorded separately; its branch and commit
+SHA identify the checked-out base, while its validation output and worktree
+fingerprint describe the uncommitted implementation under review. It is
+pre-push evidence and does not claim that a later commit or hosted CI run was
+validated.

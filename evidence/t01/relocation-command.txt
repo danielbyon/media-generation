@@ -1,0 +1,8 @@
+Reconstruct the current checkout's evidence paths and refresh portable snapshots:
+
+  .venv/bin/python evidence/t01/relocate.py
+
+Prove relocation in a different checkout path (the test creates and uses a
+temporary checkout-like root, then removes it):
+
+  .venv/bin/python -m pytest -q tests/test_evidence_relocation.py

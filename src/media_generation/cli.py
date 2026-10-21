@@ -20,9 +20,20 @@ from .errors import (
 from .service import GenerationService
 
 
+class _JsonArgumentParser(argparse.ArgumentParser):
+    """Write parser syntax failures using the CLI's structured error format."""
+
+    def error(self, message: str) -> None:
+        _write_json(
+            {"error": {"code": "argument_error", "message": message}},
+            sys.stderr,
+        )
+        raise SystemExit(2)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the documented local-only command surface."""
-    parser = argparse.ArgumentParser(
+    parser = _JsonArgumentParser(
         prog="media-generation",
         description="Submit and inspect synchronous local image generations.",
     )
@@ -120,7 +131,7 @@ def _unique_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _write_json(value: object, output: object) -> None:
     """Write one deterministic JSON object followed by a newline."""
-    output.write(json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n")
+    output.write(json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n")
 
 
 def _write_error(code: str, message: str, exit_code: int, **details: str) -> int:
