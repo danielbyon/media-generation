@@ -6,8 +6,4 @@ __pycache__/
 .venv/
 
 *.egg-info/
-
-# Generated local evidence and README example outputs
-evidence/
-/artifacts/
-/studio.sqlite3
+.playwright-cli/
