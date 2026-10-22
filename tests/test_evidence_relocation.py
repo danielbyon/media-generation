@@ -248,17 +248,103 @@ def _run_with_relocation_interruption(
 ) -> subprocess.CompletedProcess[str]:
     """Exit the relocation process at one directory-replacement boundary."""
     injector_dir = working_directory / f"fault-injector-{interruption}"
-    injector_dir.mkdir()
+    injector_dir.mkdir(exist_ok=True)
     (injector_dir / "sitecustomize.py").write_text(
         """import os
+import json
 import shutil
 from pathlib import Path
 
 target = Path(os.environ['T01_EVIDENCE_TARGET']).resolve()
 mode = os.environ['T01_INTERRUPTION']
 real_replace = os.replace
+real_link = os.link
+real_unlink = os.unlink
 real_rmtree = shutil.rmtree
+real_copy2 = shutil.copy2
+real_copytree = shutil.copytree
+real_mkdir = Path.mkdir
+copied_files = 0
 state_path = target.parent / f'.{target.name}.relocation-state.json'
+owner_path = target.parent / f'.{target.name}.relocation-owner.json'
+
+def staging_root(path):
+    candidate = Path(path)
+    for parent in (candidate, *candidate.parents):
+        if (
+            parent.parent == target.parent
+            and parent.name.startswith(f'.{target.name}.relocating-')
+        ):
+            return parent
+    return None
+
+def interrupted_mkdir(path, mode=0o777, parents=False, exist_ok=False):
+    is_staging_path = (
+        path.parent == target.parent
+        and path.name.startswith(f'.{target.name}.relocating-')
+    )
+    if globals()['mode'] == 'reserved' and is_staging_path:
+        os._exit(80)
+    result = real_mkdir(path, mode=mode, parents=parents, exist_ok=exist_ok)
+    return result
+
+Path.mkdir = interrupted_mkdir
+
+def interrupted_link(source, destination, *args, **kwargs):
+    if mode == 'owner_temp' and Path(destination) == owner_path:
+        os._exit(85)
+    if (
+        mode == 'journal_temp'
+        and Path(destination) == state_path
+        and Path(source).parent == target.parent
+        and Path(source).name.startswith(f'.{target.name}.relocation-state-')
+        and Path(source).suffix == '.tmp'
+    ):
+        os._exit(86)
+    if mode == 'prepared' and Path(destination) == state_path:
+        os._exit(83)
+    return real_link(source, destination, *args, **kwargs)
+
+os.link = interrupted_link
+
+def interrupted_unlink(path, *args, **kwargs):
+    if mode == 'owner_partial_cleanup' and kwargs.get('dir_fd') is not None:
+        try:
+            owner = json.loads(owner_path.read_text(encoding='utf-8'))
+        except (OSError, json.JSONDecodeError):
+            owner = {}
+        if owner.get('phase') == 'cleanup_pending':
+            result = real_unlink(path, *args, **kwargs)
+            os._exit(84)
+    return real_unlink(path, *args, **kwargs)
+
+if mode == 'owner_partial_cleanup':
+    os.unlink = interrupted_unlink
+    os.supports_dir_fd.add(os.unlink)
+
+def interrupted_copy2(source, destination, *args, **kwargs):
+    global copied_files
+    result = real_copy2(source, destination, *args, **kwargs)
+    if mode == 'copying' and staging_root(destination) is not None:
+        copied_files += 1
+    if mode == 'copying' and copied_files == 4:
+        os._exit(82)
+    return result
+
+def interrupted_copytree(source, destination, *args, **kwargs):
+    destination_path = Path(destination)
+    is_stage = (
+        destination_path.parent == target.parent
+        and destination_path.name.startswith(f'.{target.name}.relocating-')
+    )
+    # copytree runs after the staging directory identity is durably recorded.
+    if mode == 'allocated' and is_stage:
+        os._exit(81)
+    if mode == 'copying' and is_stage:
+        kwargs['copy_function'] = interrupted_copy2
+    return real_copytree(source, destination, *args, **kwargs)
+
+shutil.copytree = interrupted_copytree
 
 def interrupted_replace(source, destination):
     source_path = Path(source)
@@ -346,6 +432,559 @@ def _assert_relocated_tree_is_consistent(evidence_dir: Path) -> None:
         ).fetchone()
     assert stored_path == str(artifact_path.resolve())
     assert hashlib.sha256(artifact_path.read_bytes()).hexdigest() == stored_hash
+
+
+def _file_digest_manifest(directory: Path) -> dict[str, str]:
+    """Capture exact file contents without depending on filesystem timestamps."""
+    return {
+        path.relative_to(directory).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in directory.rglob("*")
+        if path.is_file()
+    }
+
+
+def _stable_evidence_identities(evidence_dir: Path) -> tuple[object, ...]:
+    """Capture snapshot, database-row, and artifact identities across relocation."""
+    snapshot_ids = tuple(
+        (
+            filename,
+            json.loads((evidence_dir / filename).read_text(encoding="utf-8"))[identity_key],
+        )
+        for filename, _, identity_key in relocation._SNAPSHOTS
+    )
+    primary_keys = {
+        "generation_requests": "request_id",
+        "generation_jobs": "job_id",
+        "generation_attempts": "attempt_id",
+        "generation_artifacts": "artifact_id",
+    }
+    with sqlite3.connect(evidence_dir / "t01.sqlite3") as connection:
+        database_ids = tuple(
+            (
+                table,
+                tuple(
+                    row[0]
+                    for row in connection.execute(
+                        f"SELECT {column} FROM {table} ORDER BY {column}"
+                    )
+                ),
+            )
+            for table, column in primary_keys.items()
+        )
+        artifact_hashes = tuple(
+            connection.execute(
+                "SELECT artifact_id, sha256 FROM generation_artifacts ORDER BY artifact_id"
+            )
+        )
+    image_hashes = tuple(
+        (path.name, hashlib.sha256(path.read_bytes()).hexdigest())
+        for path in sorted((evidence_dir / "artifacts").glob("*.png"))
+    )
+    return snapshot_ids, database_ids, artifact_hashes, image_hashes
+
+
+def test_orphaned_staging_owner_temporary_file_is_removed_on_recovery(
+    tmp_path: Path,
+) -> None:
+    """A crash before owner publication leaves evidence intact and is recoverable."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    original_identities = _stable_evidence_identities(evidence_dir)
+
+    interrupted = _run_with_relocation_interruption(evidence_dir, tmp_path, "owner_temp")
+
+    owner_path = evidence_dir.parent / ".t01.relocation-owner.json"
+    temporary_files = list(evidence_dir.parent.glob(".t01.relocation-owner-*.tmp"))
+    assert interrupted.returncode == 85
+    assert not owner_path.exists()
+    assert len(temporary_files) == 1
+    assert temporary_files[0].is_file()
+    assert _file_digest_manifest(evidence_dir) == original_files
+
+    recovered = _run_with_relocation_interruption(evidence_dir, tmp_path, "none")
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert list(evidence_dir.parent.glob(".t01.relocation-owner-*.tmp")) == []
+    assert _stable_evidence_identities(evidence_dir) == original_identities
+    _assert_relocated_tree_is_consistent(evidence_dir)
+
+
+def test_orphaned_recovery_journal_temporary_file_is_removed_without_changing_evidence(
+    tmp_path: Path,
+) -> None:
+    """Recovery removes an unpublished journal temp after a process crash."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    unrelated_file = evidence_dir.parent / "unrelated.keep"
+    unrelated_file.write_text("unrelated data\n", encoding="utf-8")
+
+    interrupted = _run_with_relocation_interruption(
+        evidence_dir, tmp_path, "journal_temp"
+    )
+
+    state_path = relocation._recovery_state_path(evidence_dir)
+    temporary_files = list(
+        evidence_dir.parent.glob(".t01.relocation-state-*.tmp")
+    )
+    assert interrupted.returncode == 86
+    assert not state_path.exists()
+    assert len(temporary_files) == 1
+    assert temporary_files[0].is_file()
+    assert _file_digest_manifest(evidence_dir) == original_files
+    assert unrelated_file.read_text(encoding="utf-8") == "unrelated data\n"
+
+    relocation._recover_evidence_replacement(evidence_dir)
+
+    assert list(evidence_dir.parent.glob(".t01.relocation-state-*.tmp")) == []
+    assert _file_digest_manifest(evidence_dir) == original_files
+    assert unrelated_file.read_text(encoding="utf-8") == "unrelated data\n"
+
+
+def test_recovery_journal_temporary_symlink_fails_closed(tmp_path: Path) -> None:
+    """Recovery preserves a matching temporary symlink and its unrelated target."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "preserve.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    unrelated_file = tmp_path / "unrelated-target.txt"
+    unrelated_file.write_text("unrelated data\n", encoding="utf-8")
+    temporary_path = evidence_dir.parent / ".t01.relocation-state-untrusted.tmp"
+    temporary_path.symlink_to(unrelated_file)
+    original_evidence = _file_digest_manifest(evidence_dir)
+
+    with pytest.raises(ValueError, match="ambiguous relocation recovery state"):
+        relocation._recover_evidence_replacement(evidence_dir)
+
+    assert _file_digest_manifest(evidence_dir) == original_evidence
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert unrelated_file.read_text(encoding="utf-8") == "unrelated data\n"
+    assert temporary_path.is_symlink()
+
+
+def test_staging_owner_temporary_symlink_fails_closed(tmp_path: Path) -> None:
+    """Recovery rejects owner temporary symlinks without changing their targets."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "preserve.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    target = tmp_path / "outside-owner-target.txt"
+    target.write_text("unrelated data\n", encoding="utf-8")
+    temporary_path = evidence_dir.parent / ".t01.relocation-owner-untrusted.tmp"
+    temporary_path.symlink_to(target)
+
+    with pytest.raises(ValueError, match="ambiguous pre-journal staging ownership"):
+        relocation.relocate(evidence_dir)
+
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert target.read_text(encoding="utf-8") == "unrelated data\n"
+    assert temporary_path.is_symlink()
+
+
+@pytest.mark.parametrize(
+    ("field", "malformed_value"),
+    [
+        ("version", []),
+        ("phase", []),
+        ("evidence_name", []),
+        ("staging_name", {}),
+        ("backup_name", []),
+        ("original_identity", []),
+        ("staging_tree_manifest", []),
+    ],
+)
+def test_recovery_rejects_malformed_journal_field_types_without_mutation(
+    tmp_path: Path,
+    field: str,
+    malformed_value: object,
+) -> None:
+    """Malformed journal field types fail closed before changing recovery data."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "preserve.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    staging_dir = evidence_dir.parent / ".t01.relocating-safe"
+    staging_dir.mkdir()
+    staging_file = staging_dir / "staged.txt"
+    staging_file.write_text("staged data\n", encoding="utf-8")
+    original_identity = relocation._directory_identity(evidence_dir)
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert original_identity is not None
+    assert staging_identity is not None
+    relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        evidence_dir.parent / ".t01.previous-safe",
+        original_identity,
+        staging_identity,
+    )
+    state_path = relocation._recovery_state_path(evidence_dir)
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload[field] = malformed_value
+    state_path.write_text(
+        json.dumps(payload, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    original_state = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="ambiguous relocation recovery state"):
+        relocation._recover_evidence_replacement(evidence_dir)
+
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert staging_file.read_text(encoding="utf-8") == "staged data\n"
+    assert state_path.read_bytes() == original_state
+
+
+@pytest.mark.parametrize(
+    ("interruption", "exit_code"),
+    [("allocated", 81), ("copying", 82), ("prepared", 83)],
+)
+def test_prejournal_staging_is_recovered_without_changing_original_evidence(
+    tmp_path: Path,
+    interruption: str,
+    exit_code: int,
+) -> None:
+    """An owned stage interrupted before the journal is removed on the next run."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    original_identities = _stable_evidence_identities(evidence_dir)
+
+    interrupted = _run_with_relocation_interruption(evidence_dir, tmp_path, interruption)
+
+    assert interrupted.returncode == exit_code
+    owner_path = evidence_dir.parent / ".t01.relocation-owner.json"
+    assert owner_path.is_file()
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    staging_dir = evidence_dir.parent / owner["staging_name"]
+    assert staging_dir.is_dir()
+    staging_metadata = staging_dir.lstat()
+    assert owner["staging_identity"] == {
+        "device": staging_metadata.st_dev,
+        "inode": staging_metadata.st_ino,
+    }
+    assert not (evidence_dir.parent / ".t01.relocation-state.json").exists()
+    # The interruption itself must preserve the original evidence byte-for-byte.
+    assert _file_digest_manifest(evidence_dir) == original_files
+    if interruption == "allocated":
+        assert list(staging_dir.iterdir()) == []
+
+    recovered = _run_with_relocation_interruption(evidence_dir, tmp_path, "reserved")
+
+    assert recovered.returncode == 80, recovered.stderr
+    recovered_owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    recovered_staging_dir = evidence_dir.parent / recovered_owner["staging_name"]
+    assert recovered_owner["transaction_id"] != owner["transaction_id"]
+    assert recovered_owner["staging_identity"] is None
+    assert not staging_dir.exists()
+    assert not recovered_staging_dir.exists()
+    assert _file_digest_manifest(evidence_dir) == original_files
+    assert not (evidence_dir.parent / ".t01.relocation-state.json").exists()
+
+    completed = _run_with_relocation_interruption(evidence_dir, tmp_path, "none")
+
+    assert completed.returncode == 0, completed.stderr
+    # A successful retry rewrites SQLite paths, so verify relocated content instead.
+    _assert_relocated_tree_is_consistent(evidence_dir)
+    assert _stable_evidence_identities(evidence_dir) == original_identities
+    assert not owner_path.exists()
+    assert list(evidence_dir.parent.glob(".t01.relocating-*")) == []
+    assert list(evidence_dir.parent.glob(".t01.previous-*")) == []
+    _assert_relocated_tree_is_consistent(evidence_dir)
+
+
+def test_allocating_owner_recovers_when_reserved_staging_path_is_absent(
+    tmp_path: Path,
+) -> None:
+    """An interrupted reservation without a staging path can be cleared safely."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    original_identities = _stable_evidence_identities(evidence_dir)
+
+    interrupted = _run_with_relocation_interruption(evidence_dir, tmp_path, "reserved")
+
+    assert interrupted.returncode == 80
+    owner_path = evidence_dir.parent / ".t01.relocation-owner.json"
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    staging_dir = evidence_dir.parent / owner["staging_name"]
+    assert owner["phase"] == "allocating"
+    assert owner["staging_identity"] is None
+    assert not staging_dir.exists()
+    assert _file_digest_manifest(evidence_dir) == original_files
+
+    recovered = _run_with_relocation_interruption(evidence_dir, tmp_path, "none")
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert _stable_evidence_identities(evidence_dir) == original_identities
+    assert not owner_path.exists()
+    assert not staging_dir.exists()
+    _assert_relocated_tree_is_consistent(evidence_dir)
+
+
+def test_unidentified_empty_staging_path_fails_closed_without_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty reserved path cannot be claimed without a recorded directory identity."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "original.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    original_identity = relocation._directory_identity(evidence_dir)
+    assert original_identity is not None
+
+    owner = relocation._create_staging_owner(evidence_dir)
+    owner_path = relocation._staging_owner_path(evidence_dir)
+    original_owner = owner_path.read_bytes()
+    staging_dir = evidence_dir.parent / owner["staging_name"]
+    staging_dir.mkdir()
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert staging_identity is not None
+    assert owner["_staging_identity"] is None
+
+    real_scandir = relocation.os.scandir
+    scanned_staging_paths: list[Path] = []
+
+    def record_staging_scan(path: object) -> object:
+        if path == staging_dir:
+            scanned_staging_paths.append(staging_dir)
+        return real_scandir(path)
+
+    monkeypatch.setattr(relocation.os, "scandir", record_staging_scan)
+
+    with pytest.raises(ValueError, match="ambiguous pre-journal staging ownership"):
+        relocation._cleanup_owned_staging(evidence_dir)
+
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert relocation._directory_identity(evidence_dir) == original_identity
+    assert relocation._directory_identity(staging_dir) == staging_identity
+    assert owner_path.read_bytes() == original_owner
+    assert scanned_staging_paths == []
+
+
+def test_orphan_cleanup_resumes_after_repeated_interruption_and_preserves_lookalikes(
+    tmp_path: Path,
+) -> None:
+    """Repeated cleanup attempts resume one owned stage and leave lookalikes alone."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    original_identities = _stable_evidence_identities(evidence_dir)
+
+    interrupted_copy = _run_with_relocation_interruption(evidence_dir, tmp_path, "copying")
+    assert interrupted_copy.returncode == 82
+    owner_path = evidence_dir.parent / ".t01.relocation-owner.json"
+    owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    staging_dir = evidence_dir.parent / owner["staging_name"]
+    lookalike = evidence_dir.parent / ".t01.relocating-unrelated"
+    lookalike.mkdir()
+    lookalike_file = lookalike / "preserve.txt"
+    lookalike_file.write_text("not owned by this transaction\n", encoding="utf-8")
+
+    previous_file_count = sum(path.is_file() for path in staging_dir.rglob("*"))
+    for _ in range(2):
+        interrupted_cleanup = _run_with_relocation_interruption(
+            evidence_dir,
+            tmp_path,
+            "owner_partial_cleanup",
+        )
+        assert interrupted_cleanup.returncode == 84, interrupted_cleanup.stderr
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        assert owner["phase"] == "cleanup_pending"
+        current_file_count = sum(path.is_file() for path in staging_dir.rglob("*"))
+        assert 0 < current_file_count < previous_file_count
+        assert len(list(evidence_dir.parent.glob(".t01.relocating-*"))) == 2
+        assert _file_digest_manifest(evidence_dir) == original_files
+        assert lookalike_file.read_text(encoding="utf-8") == "not owned by this transaction\n"
+        previous_file_count = current_file_count
+
+    recovered = _run_with_relocation_interruption(evidence_dir, tmp_path, "none")
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert _stable_evidence_identities(evidence_dir) == original_identities
+    assert not owner_path.exists()
+    assert not staging_dir.exists()
+    assert lookalike_file.read_text(encoding="utf-8") == "not owned by this transaction\n"
+    assert [path.name for path in evidence_dir.parent.glob(".t01.relocating-*")] == [
+        lookalike.name
+    ]
+    _assert_relocated_tree_is_consistent(evidence_dir)
+
+
+@pytest.mark.parametrize("owner_state", ["duplicate-fields", "symlink"])
+def test_ambiguous_staging_owner_fails_closed_without_touching_evidence(
+    tmp_path: Path,
+    owner_state: str,
+) -> None:
+    """Malformed or linked owner records cannot authorize staging cleanup."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    sentinel = evidence_dir / "preserve.txt"
+    sentinel.write_text("original evidence\n", encoding="utf-8")
+    owner_path = evidence_dir.parent / ".t01.relocation-owner.json"
+    if owner_state == "duplicate-fields":
+        owner_path.write_text('{"version":1,"version":1}\n', encoding="utf-8")
+    else:
+        target = tmp_path / "owner-target.json"
+        target.write_text("{}\n", encoding="utf-8")
+        owner_path.symlink_to(target)
+
+    with pytest.raises(ValueError, match="ambiguous pre-journal staging ownership"):
+        relocation.relocate(evidence_dir)
+
+    assert sentinel.read_text(encoding="utf-8") == "original evidence\n"
+    assert owner_path.is_symlink() if owner_state == "symlink" else owner_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("record_type", "field", "path_kind"),
+    [
+        ("owner", "staging_name", "parent"),
+        ("owner", "staging_name", "absolute"),
+        ("journal", "staging_name", "parent"),
+        ("journal", "staging_name", "absolute"),
+        ("journal", "staging_name", "traversal"),
+        ("journal", "backup_name", "parent"),
+        ("journal", "backup_name", "absolute"),
+        ("journal", "backup_name", "traversal"),
+    ],
+)
+def test_owner_and_journal_reject_escaped_transaction_paths(
+    tmp_path: Path,
+    record_type: str,
+    field: str,
+    path_kind: str,
+) -> None:
+    """Owner and journal names cannot redirect recovery outside the sibling paths."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "preserve.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    if path_kind == "parent":
+        unsafe_name = "../outside.txt"
+    elif path_kind == "traversal":
+        transaction_prefix = (
+            ".t01.relocating-safe"
+            if field == "staging_name"
+            else ".t01.previous-safe"
+        )
+        unsafe_name = f"{transaction_prefix}/../outside.txt"
+    else:
+        unsafe_name = str((tmp_path / "absolute-outside.txt").resolve())
+    outside_file = (evidence_dir.parent / unsafe_name).resolve()
+    outside_file.parent.mkdir(parents=True, exist_ok=True)
+    outside_file.write_text("unrelated data\n", encoding="utf-8")
+
+    if record_type == "owner":
+        relocation._create_staging_owner(evidence_dir)
+        record_path = evidence_dir.parent / ".t01.relocation-owner.json"
+        expected_error = "ambiguous pre-journal staging ownership"
+    else:
+        staging_dir = evidence_dir.parent / ".t01.relocating-safe"
+        staging_dir.mkdir()
+        (staging_dir / "staged.txt").write_text("staged data\n", encoding="utf-8")
+        original_identity = relocation._directory_identity(evidence_dir)
+        staging_identity = relocation._directory_identity(staging_dir)
+        assert original_identity is not None
+        assert staging_identity is not None
+        relocation._write_recovery_state(
+            evidence_dir,
+            staging_dir,
+            evidence_dir.parent / ".t01.previous-safe",
+            original_identity,
+            staging_identity,
+        )
+        record_path = evidence_dir.parent / ".t01.relocation-state.json"
+        expected_error = "ambiguous relocation recovery state"
+
+    payload = json.loads(record_path.read_text(encoding="utf-8"))
+    payload[field] = unsafe_name
+    record_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    original_record = record_path.read_bytes()
+
+    with pytest.raises(ValueError, match=expected_error):
+        relocation.relocate(evidence_dir)
+
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert outside_file.read_text(encoding="utf-8") == "unrelated data\n"
+    assert record_path.read_bytes() == original_record
+
+
+@pytest.mark.parametrize("path_kind", ["parent", "absolute", "missing-parent"])
+def test_recovery_rejects_escaped_or_malformed_manifest_paths(
+    tmp_path: Path,
+    path_kind: str,
+) -> None:
+    """Recovery rejects escaping manifest paths and entries with missing parents."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "preserve.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    staging_dir = evidence_dir.parent / ".t01.relocating-safe"
+    staging_dir.mkdir()
+    staging_file = staging_dir / "staged.txt"
+    staging_file.write_text("staged data\n", encoding="utf-8")
+    outside_file: Path | None = None
+    if path_kind == "parent":
+        manifest_path = "../outside.txt"
+        outside_file = (evidence_dir / manifest_path).resolve()
+    elif path_kind == "absolute":
+        outside_file = (tmp_path / "absolute-manifest-target.txt").resolve()
+        manifest_path = str(outside_file)
+    else:
+        manifest_path = "missing-parent/child.txt"
+    if outside_file is not None:
+        outside_file.parent.mkdir(parents=True, exist_ok=True)
+        outside_file.write_text("unrelated data\n", encoding="utf-8")
+
+    original_identity = relocation._directory_identity(evidence_dir)
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert original_identity is not None
+    assert staging_identity is not None
+    relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        evidence_dir.parent / ".t01.previous-safe",
+        original_identity,
+        staging_identity,
+    )
+    state_path = evidence_dir.parent / ".t01.relocation-state.json"
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    payload["original_tree_manifest"] = {
+        "root_mode": payload["original_tree_manifest"]["root_mode"],
+        "entries": [
+            {
+                "path": manifest_path,
+                "kind": "file",
+                "mode": 0o644,
+                "size": 0,
+                "sha256": "0" * 64,
+            }
+        ],
+    }
+    state_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    original_state = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="ambiguous relocation recovery state"):
+        relocation.relocate(evidence_dir)
+
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert staging_file.read_text(encoding="utf-8") == "staged data\n"
+    assert state_path.read_bytes() == original_state
+    if outside_file is not None:
+        assert outside_file.read_text(encoding="utf-8") == "unrelated data\n"
 
 
 @pytest.mark.parametrize(
@@ -643,6 +1282,258 @@ def test_tampered_staging_tree_never_replaces_or_deletes_original(
     else:
         assert evidence_dir.is_dir()
         assert staged_tree is evidence_dir
+
+
+def test_recovery_rejects_symlinked_transaction_staging_path(
+    tmp_path: Path,
+) -> None:
+    """A linked staging path cannot authorize recovery to touch its target."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    original_identity = relocation._directory_identity(evidence_dir)
+    assert original_identity is not None
+
+    staging_dir = evidence_dir.parent / ".t01.relocating-symlink"
+    backup_dir = evidence_dir.parent / ".t01.previous-symlink"
+    staging_dir.mkdir()
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert staging_identity is not None
+    relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        backup_dir,
+        original_identity,
+        staging_identity,
+    )
+
+    replacement_target = tmp_path / "unrelated-replacement-target"
+    replacement_target.mkdir()
+    replacement_file = replacement_target / "preserve.txt"
+    replacement_file.write_text("unrelated replacement data\n", encoding="utf-8")
+    staging_dir.rmdir()
+    staging_dir.symlink_to(replacement_target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="relocation recovery path is not a directory"):
+        relocation._recover_evidence_replacement(evidence_dir)
+
+    assert _file_digest_manifest(evidence_dir) == original_files
+    assert relocation._directory_identity(evidence_dir) == original_identity
+    assert replacement_file.read_text(encoding="utf-8") == "unrelated replacement data\n"
+    assert staging_dir.is_symlink()
+    assert relocation._recovery_state_path(evidence_dir).is_file()
+
+
+def test_recovery_rejects_replaced_staging_directory_with_mismatched_identity(
+    tmp_path: Path,
+) -> None:
+    """A replacement directory cannot inherit the journal's staging identity."""
+    source = REPOSITORY_ROOT / "evidence" / "t01"
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.parent.mkdir(parents=True)
+    shutil.copytree(source, evidence_dir)
+    original_files = _file_digest_manifest(evidence_dir)
+    original_identity = relocation._directory_identity(evidence_dir)
+    assert original_identity is not None
+
+    staging_dir = evidence_dir.parent / ".t01.relocating-mismatched-identity"
+    backup_dir = evidence_dir.parent / ".t01.previous-mismatched-identity"
+    staging_dir.mkdir()
+    (staging_dir / "owned-stage.txt").write_text(
+        "recorded staging tree\n", encoding="utf-8"
+    )
+    recorded_staging_identity = relocation._directory_identity(staging_dir)
+    assert recorded_staging_identity is not None
+    state = relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        backup_dir,
+        original_identity,
+        recorded_staging_identity,
+    )
+    assert relocation._read_identity_record(state["staging_identity"], "staging") == (
+        recorded_staging_identity
+    )
+
+    displaced_staging = tmp_path / "displaced-original-staging"
+    staging_dir.rename(displaced_staging)
+    staging_dir.mkdir()
+    replacement_file = staging_dir / "replacement.txt"
+    replacement_file.write_text("unrelated replacement data\n", encoding="utf-8")
+    assert relocation._directory_identity(staging_dir) != recorded_staging_identity
+
+    with pytest.raises(ValueError, match="staging identity changed"):
+        relocation._recover_evidence_replacement(evidence_dir)
+
+    assert _file_digest_manifest(evidence_dir) == original_files
+    assert relocation._directory_identity(evidence_dir) == original_identity
+    assert replacement_file.read_text(encoding="utf-8") == "unrelated replacement data\n"
+    assert (displaced_staging / "owned-stage.txt").read_text(encoding="utf-8") == (
+        "recorded staging tree\n"
+    )
+    assert relocation._recovery_state_path(evidence_dir).is_file()
+
+
+def test_legacy_v3_recovery_uses_staging_manifest_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A v3 journal derives the staging manifest before cleaning an abandoned stage."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "original.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    staging_dir = evidence_dir.parent / ".t01.relocating-legacy-v3"
+    shutil.copytree(evidence_dir, staging_dir)
+    original_identity = relocation._directory_identity(evidence_dir)
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert original_identity is not None
+    assert staging_identity is not None
+    relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        evidence_dir.parent / ".t01.previous-legacy-v3",
+        original_identity,
+        staging_identity,
+    )
+
+    state_path = relocation._recovery_state_path(evidence_dir)
+    legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy_state["version"] = 3
+    legacy_state.pop("staging_tree_manifest")
+    state_path.write_text(
+        json.dumps(legacy_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    expected_staging_manifest = relocation._tree_manifest(staging_dir)
+    real_rmtree = relocation.shutil.rmtree
+    observed_checkpoint: dict[str, object] = {}
+
+    def observe_staging_cleanup(path: str | Path, *args: object, **kwargs: object) -> None:
+        if Path(path) == staging_dir:
+            checkpoint = json.loads(state_path.read_text(encoding="utf-8"))
+            observed_checkpoint.update(checkpoint)
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(relocation.shutil, "rmtree", observe_staging_cleanup)
+
+    relocation._recover_evidence_replacement(evidence_dir)
+
+    assert observed_checkpoint["version"] == relocation._RECOVERY_STATE_VERSION
+    assert observed_checkpoint["phase"] == "staging_cleanup_pending"
+    assert observed_checkpoint["staging_tree_manifest"] == expected_staging_manifest
+    assert evidence_file.read_text(encoding="utf-8") == "original evidence\n"
+    assert not staging_dir.exists()
+    assert not state_path.exists()
+
+
+def test_legacy_v3_cleanup_pending_recovers_without_staging_manifest(
+    tmp_path: Path,
+) -> None:
+    """A v3 cleanup checkpoint removes its verified backup without a stage manifest."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "original.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    staging_dir = evidence_dir.parent / ".t01.relocating-legacy-v3"
+    staging_dir.mkdir()
+    staged_file = staging_dir / "installed.txt"
+    staged_file.write_text("installed replacement\n", encoding="utf-8")
+    backup_dir = evidence_dir.parent / ".t01.previous-legacy-v3"
+    original_identity = relocation._directory_identity(evidence_dir)
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert original_identity is not None
+    assert staging_identity is not None
+    relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        backup_dir,
+        original_identity,
+        staging_identity,
+    )
+
+    state_path = relocation._recovery_state_path(evidence_dir)
+    legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy_state["version"] = 3
+    legacy_state["phase"] = "cleanup_pending"
+    legacy_state.pop("staging_tree_manifest")
+    state_path.write_text(
+        json.dumps(legacy_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(evidence_dir, backup_dir)
+    os.replace(staging_dir, evidence_dir)
+
+    relocation._recover_evidence_replacement(evidence_dir)
+
+    assert (evidence_dir / "installed.txt").read_text(encoding="utf-8") == (
+        "installed replacement\n"
+    )
+    assert not backup_dir.exists()
+    assert not staging_dir.exists()
+    assert not state_path.exists()
+
+
+@pytest.mark.parametrize("phase", ["prepared", "cleanup_pending"])
+def test_ambiguous_legacy_v3_recovery_preserves_trees_and_journal(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    """Ambiguous v3 recovery leaves its trees and journal available for review."""
+    evidence_dir = tmp_path / "checkout" / "evidence" / "t01"
+    evidence_dir.mkdir(parents=True)
+    evidence_file = evidence_dir / "original.txt"
+    evidence_file.write_text("original evidence\n", encoding="utf-8")
+    staging_dir = evidence_dir.parent / ".t01.relocating-legacy-v3"
+    staging_dir.mkdir()
+    staged_file = staging_dir / "installed.txt"
+    staged_file.write_text("installed replacement\n", encoding="utf-8")
+    backup_dir = evidence_dir.parent / ".t01.previous-legacy-v3"
+    original_identity = relocation._directory_identity(evidence_dir)
+    staging_identity = relocation._directory_identity(staging_dir)
+    assert original_identity is not None
+    assert staging_identity is not None
+    relocation._write_recovery_state(
+        evidence_dir,
+        staging_dir,
+        backup_dir,
+        original_identity,
+        staging_identity,
+    )
+
+    state_path = relocation._recovery_state_path(evidence_dir)
+    legacy_state = json.loads(state_path.read_text(encoding="utf-8"))
+    legacy_state["version"] = 3
+    legacy_state["phase"] = phase
+    legacy_state.pop("staging_tree_manifest")
+    state_path.write_text(
+        json.dumps(legacy_state, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if phase == "prepared":
+        staged_file.write_text("unexpected stage change\n", encoding="utf-8")
+        original_tree = evidence_dir
+        staging_tree = staging_dir
+    else:
+        os.replace(evidence_dir, backup_dir)
+        os.replace(staging_dir, evidence_dir)
+        (backup_dir / "unreviewed.txt").write_text(
+            "preserve unreviewed data\n", encoding="utf-8"
+        )
+        original_tree = backup_dir
+        staging_tree = evidence_dir
+    original_tree_files = _file_digest_manifest(original_tree)
+    staging_tree_files = _file_digest_manifest(staging_tree)
+    original_state = state_path.read_bytes()
+
+    with pytest.raises(ValueError, match="ambiguous relocation recovery state"):
+        relocation._recover_evidence_replacement(evidence_dir)
+
+    assert _file_digest_manifest(original_tree) == original_tree_files
+    assert _file_digest_manifest(staging_tree) == staging_tree_files
+    assert state_path.read_bytes() == original_state
 
 
 def test_interrupted_staging_cleanup_resumes_only_with_intact_original(

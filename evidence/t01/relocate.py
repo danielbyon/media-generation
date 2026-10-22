@@ -6,11 +6,12 @@ SHA-256 digest, and rewrites the committed JSON snapshots with repository-relati
 paths so the evidence remains inspectable after a checkout moves.
 
 The transaction runs under an exclusive lock for the evidence directory:
-1. Recover any earlier journal before starting a new relocation.
-2. Build the database and refreshed snapshots in a sibling staging directory.
-3. Persist a journal with tree identities and manifests before either rename.
-4. Move the original tree to a backup, install the staged tree, and verify both.
-5. Persist the cleanup phase before removing the backup, then remove the journal.
+1. Recover any earlier journal and remove an owned pre-journal staging tree.
+2. Persist a small owner record before allocating a sibling staging directory.
+3. Build the database and refreshed snapshots in that staging directory.
+4. Persist a journal with tree identities and manifests before either rename.
+5. Move the original tree to a backup, install the staged tree, and verify both.
+6. Persist the cleanup phase before removing the backup, then remove the journal.
 
 Recovery validates the recorded phase, identities, and tree contents before it
 resumes installation or restores the original. Ambiguous states fail closed.
@@ -31,6 +32,7 @@ import subprocess
 import sys
 import sysconfig
 import tempfile
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -51,6 +53,7 @@ _SNAPSHOTS = (
 _RESOLVED_OUTPUT_DIRECTORY_KEY = "_resolved_output_directory"
 _RECOVERY_STATE_VERSION = 4
 _PREVIOUS_RECOVERY_STATE_VERSION = 3
+_STAGING_OWNER_VERSION = 1
 _UNSUPPORTED_DIRECTORY_FSYNC_ERRNOS = {
     errno.EACCES,
     errno.EBADF,
@@ -241,6 +244,11 @@ def _portable_path(value: Any, repository_root: Path) -> Any:
 def _recovery_state_path(evidence_dir: Path) -> Path:
     """Return the transaction journal path beside, rather than inside, the evidence tree."""
     return evidence_dir.parent / f".{evidence_dir.name}.relocation-state.json"
+
+
+def _staging_owner_path(evidence_dir: Path) -> Path:
+    """Return the pre-journal staging owner record beside the evidence tree."""
+    return evidence_dir.parent / f".{evidence_dir.name}.relocation-owner.json"
 
 
 def _directory_identity(directory: Path) -> tuple[int, int] | None:
@@ -471,7 +479,7 @@ def _read_recovery_state(evidence_dir: Path, state_path: Path) -> dict[str, Any]
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"ambiguous relocation recovery state: cannot read {state_path}") from error
     version = payload.get("version") if isinstance(payload, dict) else None
-    if version not in {
+    if type(version) is not int or version not in {
         _RECOVERY_STATE_VERSION,
         _PREVIOUS_RECOVERY_STATE_VERSION,
     }:
@@ -482,7 +490,8 @@ def _read_recovery_state(evidence_dir: Path, state_path: Path) -> dict[str, Any]
     allowed_phases = {"prepared", "cleanup_pending"}
     if version == _RECOVERY_STATE_VERSION:
         allowed_phases.add("staging_cleanup_pending")
-    if payload.get("phase") not in allowed_phases:
+    phase = payload.get("phase")
+    if not isinstance(phase, str) or phase not in allowed_phases:
         raise ValueError(f"ambiguous relocation recovery state: invalid phase: {state_path}")
     for field, prefix in (
         ("staging_name", f".{evidence_dir.name}.relocating-"),
@@ -554,6 +563,334 @@ def _persist_recovery_state(
         except OSError:
             pass
         raise
+
+
+def _staging_owner_error(detail: str) -> ValueError:
+    """Build a fail-closed error for malformed or ambiguous staging ownership."""
+    return ValueError(f"ambiguous pre-journal staging ownership: {detail}")
+
+
+def _read_staging_owner(evidence_dir: Path) -> dict[str, Any] | None:
+    """Load the exact staging owner record without following filesystem links."""
+    owner_path = _staging_owner_path(evidence_dir)
+    try:
+        metadata = owner_path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise _staging_owner_error(f"owner record is not a regular file: {owner_path}")
+    def reject_duplicate_fields(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in payload:
+                raise ValueError(f"duplicate owner field: {key}")
+            payload[key] = value
+        return payload
+
+    try:
+        payload = json.loads(
+            owner_path.read_text(encoding="utf-8"),
+            object_pairs_hook=reject_duplicate_fields,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        raise _staging_owner_error(f"cannot read owner record: {owner_path}") from error
+
+    fields = {
+        "version",
+        "transaction_id",
+        "evidence_path",
+        "evidence_identity",
+        "staging_name",
+        "staging_identity",
+        "phase",
+    }
+    if not isinstance(payload, dict) or set(payload) != fields:
+        raise _staging_owner_error(f"invalid owner record fields: {owner_path}")
+    transaction_id = payload["transaction_id"]
+    if (
+        type(payload["version"]) is not int
+        or payload["version"] != _STAGING_OWNER_VERSION
+        or not isinstance(transaction_id, str)
+        or len(transaction_id) != 32
+    ):
+        raise _staging_owner_error(f"unsupported owner record: {owner_path}")
+    try:
+        parsed_transaction_id = uuid.UUID(hex=transaction_id)
+    except ValueError as error:
+        raise _staging_owner_error(f"invalid transaction identity: {owner_path}") from error
+    if parsed_transaction_id.hex != transaction_id or parsed_transaction_id.version != 4:
+        raise _staging_owner_error(f"invalid transaction identity: {owner_path}")
+
+    expected_name = f".{evidence_dir.name}.relocating-{transaction_id}"
+    if (
+        payload["evidence_path"] != str(evidence_dir)
+        or payload["staging_name"] != expected_name
+        or Path(payload["staging_name"]).name != payload["staging_name"]
+    ):
+        raise _staging_owner_error(f"owner path does not match this evidence directory: {owner_path}")
+    try:
+        evidence_identity = _read_identity_record(payload["evidence_identity"], "owned evidence")
+        staging_identity = (
+            None
+            if payload["staging_identity"] is None
+            else _read_identity_record(payload["staging_identity"], "owned staging")
+        )
+    except ValueError as error:
+        raise _staging_owner_error(f"invalid directory identity: {owner_path}") from error
+    phase = payload["phase"]
+    if not isinstance(phase, str) or phase not in {
+        "allocating",
+        "building",
+        "cleanup_pending",
+        "journaled",
+    }:
+        raise _staging_owner_error(f"invalid owner phase: {owner_path}")
+    if (phase == "allocating") != (staging_identity is None):
+        raise _staging_owner_error(f"owner phase conflicts with staging identity: {owner_path}")
+    return {
+        **payload,
+        "_evidence_identity": evidence_identity,
+        "_staging_identity": staging_identity,
+    }
+
+
+def _save_staging_owner(
+    evidence_dir: Path,
+    owner: dict[str, Any],
+    *,
+    create: bool,
+) -> None:
+    """Persist an owner record atomically, refusing to replace an unsafe path."""
+    owner_path = _staging_owner_path(evidence_dir)
+    if not create:
+        try:
+            metadata = owner_path.lstat()
+        except FileNotFoundError as error:
+            raise _staging_owner_error(f"owner record disappeared: {owner_path}") from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _staging_owner_error(f"owner record is not a regular file: {owner_path}")
+    payload = {key: value for key, value in owner.items() if not key.startswith("_")}
+    try:
+        _persist_recovery_state(owner_path, payload, replace_existing=not create)
+    except FileExistsError as error:
+        raise _staging_owner_error(f"owner record already exists: {owner_path}") from error
+
+
+def _create_staging_owner(evidence_dir: Path) -> dict[str, Any]:
+    """Durably reserve one exact staging name before creating its directory."""
+    evidence_identity = _directory_identity(evidence_dir)
+    if evidence_identity is None:
+        raise FileNotFoundError(f"evidence directory does not exist: {evidence_dir}")
+    transaction_id = uuid.uuid4().hex
+    owner = {
+        "version": _STAGING_OWNER_VERSION,
+        "transaction_id": transaction_id,
+        "evidence_path": str(evidence_dir),
+        "evidence_identity": _identity_record(evidence_identity),
+        "staging_name": f".{evidence_dir.name}.relocating-{transaction_id}",
+        "staging_identity": None,
+        "phase": "allocating",
+        "_evidence_identity": evidence_identity,
+        "_staging_identity": None,
+    }
+    _save_staging_owner(evidence_dir, owner, create=True)
+    return owner
+
+
+def _mark_staging_owner_journaled(
+    evidence_dir: Path,
+    state: dict[str, Any],
+) -> None:
+    """Transfer staging responsibility after the main replacement journal commits."""
+    owner = _read_staging_owner(evidence_dir)
+    if owner is None:
+        return
+    original_identity = _read_identity_record(state["original_identity"], "original")
+    staging_identity = _read_identity_record(state["staging_identity"], "staging")
+    if (
+        owner["phase"] not in {"building", "journaled"}
+        or owner["evidence_identity"] != state["original_identity"]
+        or owner["_evidence_identity"] != original_identity
+        or owner["staging_name"] != state["staging_name"]
+        or owner["_staging_identity"] != staging_identity
+    ):
+        raise _staging_owner_error("owner record does not match the committed replacement journal")
+    if owner["phase"] == "journaled":
+        return
+    updated_owner = {**owner, "phase": "journaled"}
+    _save_staging_owner(evidence_dir, updated_owner, create=False)
+
+
+def _validate_owned_staging_tree(staging_dir: Path) -> None:
+    """Reject links and special files before deleting an owned staging tree."""
+    def fail_walk(error: OSError) -> None:
+        raise error
+
+    for root, directories, files in os.walk(
+        staging_dir,
+        topdown=True,
+        onerror=fail_walk,
+        followlinks=False,
+    ):
+        for name in (*directories, *files):
+            entry = Path(root) / name
+            metadata = entry.lstat()
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise _staging_owner_error(f"unsafe entry in owned staging tree: {entry}")
+
+
+def _supports_descriptor_staging_cleanup() -> bool:
+    """Report whether the platform supports no-follow, descriptor-relative deletion."""
+    return (
+        hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.listdir in os.supports_fd
+        and all(
+            operation in os.supports_dir_fd
+            for operation in (os.open, os.stat, os.unlink, os.rmdir)
+        )
+    )
+
+
+def _remove_staging_directory_by_descriptor(
+    staging_dir: Path,
+    expected_identity: tuple[int, int],
+) -> None:
+    """Delete a staged tree through no-follow directory descriptors."""
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def remove_contents(directory_fd: int) -> None:
+        for name in sorted(os.listdir(directory_fd)):
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if stat.S_ISDIR(before.st_mode):
+                child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                try:
+                    opened = os.fstat(child_fd)
+                    if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                        raise _staging_owner_error(f"directory changed during cleanup: {name}")
+                    remove_contents(child_fd)
+                finally:
+                    os.close(child_fd)
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                ):
+                    raise _staging_owner_error(f"directory changed during cleanup: {name}")
+                os.rmdir(name, dir_fd=directory_fd)
+            elif stat.S_ISREG(before.st_mode):
+                current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                ):
+                    raise _staging_owner_error(f"file changed during cleanup: {name}")
+                os.unlink(name, dir_fd=directory_fd)
+            else:
+                raise _staging_owner_error(f"unsafe entry during cleanup: {name}")
+
+    parent_fd = os.open(staging_dir.parent, directory_flags)
+    try:
+        root_metadata = os.stat(
+            staging_dir.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or (root_metadata.st_dev, root_metadata.st_ino) != expected_identity
+        ):
+            raise _staging_owner_error("staging directory identity changed before cleanup")
+        root_fd = os.open(staging_dir.name, directory_flags, dir_fd=parent_fd)
+        try:
+            opened_root = os.fstat(root_fd)
+            if (opened_root.st_dev, opened_root.st_ino) != expected_identity:
+                raise _staging_owner_error("staging directory identity changed during cleanup")
+            remove_contents(root_fd)
+        finally:
+            os.close(root_fd)
+        current_root = os.stat(
+            staging_dir.name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISDIR(current_root.st_mode)
+            or (current_root.st_dev, current_root.st_ino) != expected_identity
+        ):
+            raise _staging_owner_error("staging directory identity changed before removal")
+        os.rmdir(staging_dir.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _remove_staging_owner(evidence_dir: Path, owner: dict[str, Any]) -> None:
+    """Remove the exact owner record after its staging responsibility is complete."""
+    current_owner = _read_staging_owner(evidence_dir)
+    if current_owner is None:
+        return
+    if current_owner["transaction_id"] != owner["transaction_id"]:
+        raise _staging_owner_error("transaction changed during staging cleanup")
+    _staging_owner_path(evidence_dir).unlink()
+    _fsync_directory(evidence_dir.parent)
+
+
+def _cleanup_owned_staging(evidence_dir: Path) -> None:
+    """Recover an abandoned stage only when its owner record identifies its directory."""
+    owner = _read_staging_owner(evidence_dir)
+    if owner is None:
+        return
+    staging_dir = evidence_dir.parent / owner["staging_name"]
+    current_evidence_identity = _directory_identity(evidence_dir)
+
+    if owner["phase"] == "allocating":
+        if current_evidence_identity != owner["_evidence_identity"]:
+            raise _staging_owner_error("evidence directory identity changed")
+        try:
+            staging_dir.lstat()
+        except FileNotFoundError:
+            _remove_staging_owner(evidence_dir, owner)
+            return
+        except OSError as error:
+            raise _staging_owner_error(
+                f"cannot inspect reserved staging path: {staging_dir}"
+            ) from error
+        raise _staging_owner_error("staging path exists before its identity was recorded")
+
+    staging_identity = _directory_identity(staging_dir)
+
+    if owner["phase"] == "journaled":
+        if (
+            staging_identity is not None
+            or current_evidence_identity
+            not in {owner["_evidence_identity"], owner["_staging_identity"]}
+        ):
+            raise _staging_owner_error("journaled staging ownership is inconsistent")
+        _remove_staging_owner(evidence_dir, owner)
+        return
+
+    if current_evidence_identity != owner["_evidence_identity"]:
+        raise _staging_owner_error("evidence directory identity changed")
+    if staging_identity is None:
+        _remove_staging_owner(evidence_dir, owner)
+        return
+
+    if staging_identity != owner["_staging_identity"]:
+        raise _staging_owner_error("staging directory identity changed")
+    _validate_owned_staging_tree(staging_dir)
+    if owner["phase"] == "building":
+        owner = {**owner, "phase": "cleanup_pending"}
+        _save_staging_owner(evidence_dir, owner, create=False)
+    if _supports_descriptor_staging_cleanup():
+        _remove_staging_directory_by_descriptor(staging_dir, staging_identity)
+    elif getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+        shutil.rmtree(staging_dir)
+    else:
+        raise RuntimeError("safe staging cleanup is unavailable on this platform")
+    _fsync_directory(evidence_dir.parent)
+    if os.path.lexists(staging_dir):
+        raise _staging_owner_error("staging directory remains after cleanup")
+    _remove_staging_owner(evidence_dir, owner)
 
 
 def _write_recovery_state(
@@ -634,6 +971,25 @@ def _remove_recovery_temporary_files(evidence_dir: Path) -> None:
                 f"ambiguous relocation recovery state: invalid temporary file {temporary_path}"
             )
         temporary_path.unlink()
+        _fsync_directory(evidence_dir.parent)
+
+
+def _remove_staging_owner_temporary_files(evidence_dir: Path) -> None:
+    """Remove incomplete owner writes without following or broadening their paths."""
+    pattern = f"{_staging_owner_path(evidence_dir).stem}-*.tmp"
+    for temporary_path in evidence_dir.parent.glob(pattern):
+        try:
+            metadata = temporary_path.lstat()
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _staging_owner_error(
+                f"invalid owner temporary file: {temporary_path}"
+            )
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            continue
         _fsync_directory(evidence_dir.parent)
 
 
@@ -778,6 +1134,7 @@ def _replace_evidence_tree(evidence_dir: Path, staging_dir: Path) -> None:
         original_identity,
         staging_identity,
     )
+    _mark_staging_owner_journaled(evidence_dir, state)
     os.replace(evidence_dir, backup_dir)
     _fsync_directory(evidence_dir.parent)
     os.replace(staging_dir, evidence_dir)
@@ -892,7 +1249,17 @@ def relocate(evidence_dir: Path) -> int:
 
 def _relocate_locked(evidence_dir: Path) -> int:
     """Run recovery and relocation while holding the directory transaction lock."""
+    _remove_staging_owner_temporary_files(evidence_dir)
+    state_path = _recovery_state_path(evidence_dir)
+    try:
+        state_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        state = _read_recovery_state(evidence_dir, state_path)
+        _mark_staging_owner_journaled(evidence_dir, state)
     _recover_evidence_replacement(evidence_dir)
+    _cleanup_owned_staging(evidence_dir)
     if not evidence_dir.is_dir():
         raise FileNotFoundError(f"evidence directory does not exist: {evidence_dir}")
     repository_root = evidence_dir.parents[1]
@@ -907,11 +1274,21 @@ def _relocate_locked(evidence_dir: Path) -> int:
         (filename, command, identity_key, _read_snapshot_id(evidence_dir, filename, identity_key))
         for filename, command, identity_key in _SNAPSHOTS
     ]
-    staging_dir = Path(
-        tempfile.mkdtemp(prefix=f".{evidence_dir.name}.relocating-", dir=evidence_dir.parent)
-    )
-    _fsync_directory(evidence_dir.parent)
+    owner = _create_staging_owner(evidence_dir)
+    staging_dir = evidence_dir.parent / owner["staging_name"]
     try:
+        staging_dir.mkdir(mode=0o700)
+        _fsync_directory(evidence_dir.parent)
+        staging_identity = _directory_identity(staging_dir)
+        if staging_identity is None:
+            raise RuntimeError("relocation staging directory disappeared after allocation")
+        owner = {
+            **owner,
+            "phase": "building",
+            "staging_identity": _identity_record(staging_identity),
+            "_staging_identity": staging_identity,
+        }
+        _save_staging_owner(evidence_dir, owner, create=False)
         shutil.copytree(evidence_dir, staging_dir, dirs_exist_ok=True)
         staged_database = staging_dir / "t01.sqlite3"
         artifact_count = _relocate_database(
@@ -946,10 +1323,8 @@ def _relocate_locked(evidence_dir: Path) -> int:
 
         _replace_evidence_tree(evidence_dir, staging_dir)
     finally:
-        if staging_dir.exists() and not os.path.lexists(
-            _recovery_state_path(evidence_dir)
-        ):
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        if not os.path.lexists(_recovery_state_path(evidence_dir)):
+            _cleanup_owned_staging(evidence_dir)
 
     print(
         f"Relocated {artifact_count} artifact paths and refreshed "
