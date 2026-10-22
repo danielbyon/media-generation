@@ -18,6 +18,13 @@ from .errors import (
     UnsupportedCapabilityError,
 )
 from .service import GenerationService
+from .inventory import (
+    InventoryOptions,
+    InventoryOutputError,
+    InventoryValidationError,
+    collect_inventory,
+    write_inventory,
+)
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -61,6 +68,38 @@ def build_parser() -> argparse.ArgumentParser:
     provenance = commands.add_parser("provenance", help="retrieve request, job, attempt, and artifact")
     provenance.add_argument("--db", required=True, type=Path, help="SQLite database path")
     provenance.add_argument("--job-id", required=True, help="generation job ID")
+
+    inventory = commands.add_parser(
+        "inventory",
+        help="collect read-only host, runtime, and model inventory",
+    )
+    inventory.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="directory for inventory.json and transcript.txt",
+    )
+    inventory.add_argument(
+        "--manifest",
+        type=Path,
+        help="strict manifest declaring model roots, bundles, and runtime probes",
+    )
+    inventory.add_argument(
+        "--hash-components",
+        action="store_true",
+        help="compute bounded SHA-256 digests for declared model components",
+    )
+    inventory.add_argument(
+        "--hash-limit-bytes",
+        type=int,
+        default=16 * 1024 * 1024 * 1024,
+        help="maximum bytes hashed per component (default: 16 GiB)",
+    )
+    inventory.add_argument(
+        "--replay",
+        type=Path,
+        help="synthetic observation replay file for deterministic testing",
+    )
     return parser
 
 
@@ -69,6 +108,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     options = parser.parse_args(arguments)
     try:
+        if options.command == "inventory":
+            return _run_inventory(options)
         if options.command == "submit":
             request = _parse_request(options.request_json)
             service = GenerationService(options.db, options.output_dir)
@@ -101,6 +142,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("generation_failed", str(error), 1, job_id=error.job_id)
     except (json.JSONDecodeError, UnicodeError, ValueError) as error:
         return _write_error("validation_error", f"invalid request JSON: {error}", 2)
+
+
+def _run_inventory(options: argparse.Namespace) -> int:
+    """Collect and write one inventory report, preserving status exit codes."""
+    try:
+        result = collect_inventory(
+            InventoryOptions(
+                output_directory=options.output,
+                manifest_path=options.manifest,
+                hash_components=options.hash_components,
+                hash_limit_bytes=options.hash_limit_bytes,
+                replay_path=options.replay,
+            )
+        )
+        paths = write_inventory(result, options.output)
+    except InventoryValidationError as error:
+        return _write_error("inventory_validation_error", str(error), 2)
+    except InventoryOutputError as error:
+        return _write_error("inventory_output_error", str(error), 3)
+    _write_json({**result.summary, **paths}, sys.stdout)
+    return result.exit_code
 
 
 def _parse_request(source: str) -> GenerationRequest:
