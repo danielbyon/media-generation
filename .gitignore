@@ -1,2 +1,13 @@
 AGENTS.local.md
 .chatgpt
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+*.egg-info/
+
+# Generated local evidence and README example outputs
+evidence/
+/artifacts/
+/studio.sqlite3
