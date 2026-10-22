@@ -85,28 +85,19 @@ orchestration. T03/T04 publication and orchestration work remains out of scope.
 APEX hardware, real GPU inference, engine behavior, model quality, and hardware
 reliability are unverified.
 
-## Evidence and validation
+## Validation and generated outputs
 
-The JSON snapshots under `evidence/t01/` store artifact paths relative to the
-repository so they can be reviewed from any checkout. The SQLite database keeps
-resolved absolute paths for runtime access. After moving the evidence to a new
-checkout path, reinstall the package and rebuild those runtime paths from the
-verified artifact files:
+Run the full test suite with `python3 -m pytest`. The tests generate real PNG
+images, SQLite job/artifact records, and provenance snapshots in temporary
+directories, and exercise retrieval through independent installed CLI processes.
+Temporary test outputs are not committed to the repository.
 
-```sh
-python3 -m pip install -e '.[test]'
-python3 evidence/t01/relocate.py
-```
+GitHub Actions runs the same suite on Ubuntu and macOS with supported Python
+versions for pull requests and pushes to `main`. The run logs provide validation
+results. For a persistent local image and inspectable database, run the
+`media-generation submit` and retrieval commands shown above; their outputs
+remain in your chosen local directory.
 
-The relocation regression test copies the evidence into a separate checkout
-path, runs the same reconstruction utility there, verifies artifact hashes and
-portable snapshots, and reads the relocated artifact through the installed CLI.
-Run it with the full test suite using `python3 -m pytest`.
-
-`evidence/t01/validator-result.json` is the historical approved validation
-record and retains the commit SHA and worktree fingerprint captured at that
-time. A later local validation is recorded separately; its branch and commit
-SHA identify the checked-out base, while its validation output and worktree
-fingerprint describe the uncommitted implementation under review. It is
-pre-push evidence and does not claim that a later commit or hosted CI run was
-validated.
+Generated evidence bundles, screenshots, validation transcripts, and database
+snapshots are not version-controlled. Retain specific outputs outside the
+repository only when they are needed for a review or investigation.

@@ -1,6 +1,0 @@
-# Reproduce T01 validation through the approved repository validator.
-repo_validate(repo_id="media-generation", profile="test", dry_run=true)
-repo_validate(repo_id="media-generation", profile="test")
-
-# Command selected and executed by the approved test profile:
-.venv/bin/python -m pytest
