@@ -1,0 +1,14 @@
+.gitignore
+  h_fe6a8a30e51ecc 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "92b6429118c8335d4fb00ca42b4a1a300cfac0e1",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
