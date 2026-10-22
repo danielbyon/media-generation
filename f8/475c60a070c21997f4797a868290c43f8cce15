@@ -1,0 +1,64 @@
+evidence/t01/relocate.py
+  s_9d341248da4bfa::t_ad9f01c4d2a469 740-790,792-824,826,884-888
+  s_9d341248da4bfa::t_249e68946da9f9 482,493-494
+  s_9d341248da4bfa::t_bdb56a56df5692 9-14,35,56,249-251
+  s_9d341248da4bfa::t_1eda1ab01d9c46 839,845-860
+  s_9d341248da4bfa::t_5f8e85e7a37d30 1137,1253-1260,1262,1277-1278,1280-1291,1326-1327
+  s_9d341248da4bfa::t_575ef850f6544b 977-995,1252
+  s_9d341248da4bfa::t_9d70c1b37b3325 582-589,591-595,641-646,889
+  s_9d341248da4bfa::t_760c7d02530725 568-581,590,596-640,647-739,791,825,827-838,840-844,861-883,890-895
+  s_9fca9aee43ce94::t_f14a9a6c0590c9 252-253
+tests/test_evidence_relocation.py
+  s_9d341248da4bfa::t_fba3bfc81b46ab 282-287,700-730,732-772
+  s_9d341248da4bfa::t_bba887d1e1ccf5 570-588,849-857,859-860,862-874,886-914,916-921,923-977,979-984,986-987
+  s_9d341248da4bfa::t_64744e2747cab1 515-569
+  s_9d341248da4bfa::t_1cca77d6857e16 267,326,329-330
+  s_9d341248da4bfa::t_fa75cc04ce5158 294-295,484-512
+  s_9d341248da4bfa::t_d123562e663972 340-342,668-672,674,694-695
+  s_9d341248da4bfa::t_a111198211f976 590-643
+  s_9d341248da4bfa::t_1b8bd946a4f8fd 251,773-848
+  s_9d341248da4bfa::t_2ef31abac6f348 645
+  s_9d341248da4bfa::t_115b2c27c05f36 858,861,875-885
+  s_9d341248da4bfa::t_d30f485b99c564 1379-1431
+  s_9d341248da4bfa::t_41cad97142c04d 679,681-693
+  s_9d341248da4bfa::t_879023cd4be564 254,261-262,269,293,304-320,324
+  s_9d341248da4bfa::t_feebe7e0213d24 915,922
+  s_9d341248da4bfa::t_5f13a2dfa7f50d 1287-1378
+  s_9d341248da4bfa::t_e386b9859037be 664
+  s_9d341248da4bfa::t_4f0cde8992a021 978,985
+  s_9d341248da4bfa::t_ad7c0a7d26857d 264-266,271-281,288-292,325,327-328,331-339,343-347,437-483,513-514,589,644,646-663,665-667,673,675-678,680,696-699,731
+  s_9d341248da4bfa::t_42756379786027 1432-1538
+  s_9d341248da4bfa::t_baa918f18bad14 321-323
+  s_9d341248da4bfa::t_7954696ce72904 296-303
+  s_9d341248da4bfa::t_d4085766e0109e 270
+  s_9d341248da4bfa::t_5992734f93528a 988-989
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f8475c60a070c21997f4797a868290c43f8cce15",
+  "prompts": {},
+  "humans": {
+    "h_fe6a8a30e51ecc": {
+      "author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  },
+  "sessions": {
+    "s_9d341248da4bfa": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15f9a-7aa8-7d10-a648-c55867c0b7cb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_9fca9aee43ce94": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15b35-460e-7d82-8c5d-aad38b92ed3c",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
