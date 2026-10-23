@@ -85,7 +85,6 @@ def _runtimes() -> list[dict[str, object]]:
 
 def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
     """Probe ordering and free/used memory must not affect the digest."""
-    first = build_environment_fingerprint(_host(), _runtimes())
     host = _host()
     memory = host["memory"]
     assert isinstance(memory, dict)
@@ -95,13 +94,38 @@ def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
     host["identity"]["hostname"] = "different-host"  # type: ignore[index]
     accelerators = host["accelerators"]
     assert isinstance(accelerators, list)
-    host["accelerators"] = list(reversed(accelerators))
+    second_accelerator = copy.deepcopy(accelerators[0])
+    second_accelerator["id"] = "drm:card2"
+    second_accelerator["pci_address"] = "0000:02:00.0"
+    host["accelerators"] = [accelerators[0], second_accelerator]
+    first = build_environment_fingerprint(host, _runtimes())
+    host["accelerators"] = list(reversed(host["accelerators"]))
     runtimes = list(reversed(_runtimes()))
     second = build_environment_fingerprint(host, runtimes)
 
     assert first["digest"] == second["digest"]
     assert "hostname" in first["excluded_inputs"]
     assert "memory_available_bytes" in first["excluded_inputs"]
+
+
+def test_fingerprint_changes_when_accelerator_enumeration_is_incomplete() -> None:
+    """An unreadable GPU inventory is not equivalent to a verified GPU-free host."""
+    observed = _host()
+    observed["accelerator_enumeration"] = {
+        "status": "observed",
+        "candidate_count": 0,
+        "inspected_count": 0,
+    }
+    unavailable = copy.deepcopy(observed)
+    unavailable["accelerator_enumeration"] = {
+        "status": "unavailable",
+        "reason": "drm_directory_unreadable",
+    }
+
+    first = build_environment_fingerprint(observed, _runtimes())
+    second = build_environment_fingerprint(unavailable, _runtimes())
+
+    assert first["digest"] != second["digest"]
 
 
 def test_fingerprint_changes_when_kernel_changes() -> None:

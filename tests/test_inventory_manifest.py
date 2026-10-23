@@ -287,3 +287,43 @@ def test_manifest_replaced_by_directory_after_stat_is_reported(
 
     with pytest.raises(InventoryValidationError, match="not readable"):
         parse_manifest(path)
+
+
+def test_recipe_source_provenance_is_preserved(tmp_path: Path) -> None:
+    """Optional source metadata remains part of inline recipe identity."""
+    payload = _manifest()
+    source = payload["bundles"][0]["recipe"]["source"]  # type: ignore[index]
+    source["retrieved_at"] = "2026-10-22T00:00:00Z"
+    source["note"] = "copied by the operator"
+
+    manifest = parse_manifest(_write(tmp_path, payload))
+
+    recipe_source = manifest.bundles[0].recipe.source
+    assert recipe_source is not None
+    assert recipe_source["retrieved_at"] == "2026-10-22T00:00:00Z"
+    assert recipe_source["note"] == "copied by the operator"
+
+
+def test_identifier_rejects_trailing_newline(tmp_path: Path) -> None:
+    """Identifiers cannot inject a line break into probe ids or transcripts."""
+    payload = _manifest()
+    payload["bundles"][0]["id"] = "bundle-a\n"  # type: ignore[index]
+
+    with pytest.raises(InventoryValidationError, match="must match"):
+        parse_manifest(_write(tmp_path, payload))
+
+
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity", "1e400"])
+def test_manifest_rejects_non_finite_numbers(
+    tmp_path: Path, literal: str
+) -> None:
+    """Non-standard or overflowed JSON numbers fail structured validation."""
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        '{"schema": "media-generation.inventory-manifest", "schema_version": 1, '
+        f'"description": {literal}}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(InventoryValidationError, match="non-finite"):
+        parse_manifest(path)

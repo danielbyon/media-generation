@@ -434,6 +434,32 @@ class LocalObservationSource:
                 ),
                 None,
             )
+        if (
+            after.st_size != opened.st_size
+            or after.st_mtime_ns != opened.st_mtime_ns
+            or after.st_ctime_ns != opened.st_ctime_ns
+        ):
+            return (
+                Observation(
+                    status=ProbeStatus.SKIPPED.value,
+                    reason="file_changed_during_hash",
+                    detail="file metadata changed while hashing",
+                ),
+                None,
+            )
+        if (
+            final.st_size != after.st_size
+            or final.st_mtime_ns != after.st_mtime_ns
+            or final.st_ctime_ns != after.st_ctime_ns
+        ):
+            return (
+                Observation(
+                    status=ProbeStatus.SKIPPED.value,
+                    reason="file_changed_during_hash",
+                    detail="file metadata changed after hashing",
+                ),
+                None,
+            )
         return Observation(status=ProbeStatus.OK.value), "sha256:" + digest.hexdigest()
 
     def stat(self, path: Path) -> Observation:
@@ -747,8 +773,21 @@ class ReplayObservationSource:
         follow_final_symlink: bool = True,
         root: Path | None = None,
     ) -> Observation:
-        """Return a recorded file read."""
-        return self._lookup(f"read:{path}")
+        """Return a recorded file read, bounded like a local read."""
+        observation = self._lookup(f"read:{path}")
+        if not observation.ok:
+            return observation
+        raw = observation.text.encode("utf-8")
+        if len(raw) <= limit:
+            return observation
+        return Observation(
+            status=observation.status,
+            text=raw[:limit].decode("utf-8", errors="replace"),
+            reason=observation.reason,
+            detail=observation.detail,
+            exit_code=observation.exit_code,
+            truncated=True,
+        )
 
     def read_prefix(
         self,

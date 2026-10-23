@@ -45,8 +45,8 @@ ROLES = frozenset(
 )
 CAPABILITY_SUPPORT = frozenset({"advertised", "declared"})
 SOURCE_KINDS = frozenset({"url", "file", "operator"})
-_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_TASK = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_IDENTIFIER = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_TASK = re.compile(r"\A[a-z][a-z0-9_]{0,63}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +273,12 @@ def _parse_recipe(
                 source_item.get("value"), label=f"{label}.source.value"
             ),
         }
+        for optional in ("retrieved_at", "note"):
+            optional_value = source_item.get(optional)
+            if optional_value is not None:
+                source[optional] = require_string(
+                    optional_value, label=f"{label}.source.{optional}"
+                )
     parameters_raw = item.get("parameters")
     parameters = None
     if parameters_raw is not None:

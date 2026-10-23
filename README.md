@@ -95,8 +95,12 @@ PYTHONPATH=src python3 -m media_generation inventory \
   --output /path/outside-the-repository/inventory-run
 ```
 
-The command writes `inventory.json` and `transcript.txt` atomically through
-exclusive temporary files in the output directory. Add `--manifest PATH`
+Collection is read-only unless version or device probes are explicitly enabled.
+The command stages `inventory.json` and `transcript.txt` through exclusive
+temporary files in the output directory, publishes the transcript first and the
+inventory second, and rolls the pair back if the second replacement fails. The
+two replacements are not crash-atomic; both files carry the same run identifier.
+Add `--manifest PATH`
 to declare model roots, runtime paths, bundles, recipes, capabilities, and probe
 policy. Version probes and device queries are opt-in. Full component hashing is
 opt-in with `--hash-components`.

@@ -144,6 +144,21 @@ def _stable_runtimes(runtimes: list[dict[str, Any]]) -> list[dict[str, object]]:
     return stable
 
 
+def _stable_accelerator_enumeration(value: object) -> dict[str, object]:
+    """Return accelerator coverage so incomplete scans change the digest."""
+    if not isinstance(value, dict):
+        return {"status": "unknown"}
+    return {
+        "status": value.get("status"),
+        "reason": value.get("reason"),
+        "candidate_count": value.get("candidate_count"),
+        "inspected_count": value.get("inspected_count"),
+        "inspection_failures": value.get("inspection_failures"),
+        "listing_truncated": value.get("listing_truncated"),
+        "card_limit_reached": value.get("card_limit_reached"),
+    }
+
+
 def build_environment_fingerprint(
     host: dict[str, Any], runtimes: list[dict[str, Any]]
 ) -> dict[str, object]:
@@ -157,6 +172,9 @@ def build_environment_fingerprint(
         "kernel": _stable_kernel(host.get("kernel") or {}),
         "cpu": _stable_cpu(host.get("cpu") or {}),
         "accelerators": _stable_accelerators(host.get("accelerators") or []),
+        "accelerator_enumeration": _stable_accelerator_enumeration(
+            host.get("accelerator_enumeration")
+        ),
         "memory": {
             "system_total_bytes": (memory_dict.get("system") or {}).get("total_bytes")
             if isinstance(memory_dict.get("system"), dict)

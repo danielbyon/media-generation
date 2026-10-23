@@ -187,25 +187,26 @@ def linux_host_observations(
             observations[f"stat:{device}"] = observation(
                 json.dumps(stat_payload(kind="directory", realpath=device))
             )
-        observations[f"read:{device}/vendor"] = observation("0x1234\n")
-        observations[f"read:{device}/device"] = observation("0x5678\n")
-        observations[f"read:{device}/class"] = observation("0x038000\n")
-        observations[f"read:{device}/uevent"] = observation(
+        read_base = target if device_symlink else device
+        observations[f"read:{read_base}/vendor"] = observation("0x1234\n")
+        observations[f"read:{read_base}/device"] = observation("0x5678\n")
+        observations[f"read:{read_base}/class"] = observation("0x038000\n")
+        observations[f"read:{read_base}/uevent"] = observation(
             "DRIVER=example-gpu\nPCI_CLASS=38000\nPCI_SLOT_NAME=0000:01:00.0\n"
         )
-        observations[f"stat:{device}/driver"] = observation(
+        observations[f"stat:{read_base}/driver"] = observation(
             json.dumps(
                 stat_payload(
                     kind="symlink",
                     symlink=True,
                     link_target="../../../../bus/pci/drivers/example-gpu",
-                    realpath=device + "/driver",
+                    realpath=read_base + "/driver",
                 )
             )
         )
-        observations[f"read:{device}/mem_info_vram_total"] = observation("536870912\n")
-        observations[f"read:{device}/mem_info_vis_vram_total"] = observation("536870912\n")
-        observations[f"read:{device}/mem_info_gtt_total"] = observation("34359738368\n")
+        observations[f"read:{read_base}/mem_info_vram_total"] = observation("536870912\n")
+        observations[f"read:{read_base}/mem_info_vis_vram_total"] = observation("536870912\n")
+        observations[f"read:{read_base}/mem_info_gtt_total"] = observation("34359738368\n")
         observations["read:/sys/module/example-gpu/version"] = observation("1.0-synthetic\n")
     for name in ("sd", "stable-diffusion.cpp", "invokeai", "ollama", "llama-server", "llama-cli"):
         observations[f"which:{name}"] = observation(status="unavailable", reason="binary_not_found")
@@ -246,6 +247,8 @@ def build_gguf(entries: list[tuple[str, int, object]], *, version: int = 3) -> b
         payload += value_type.to_bytes(4, "little")
         if value_type == 8:
             payload += _gguf_string(str(value))
+        elif value_type == 7:
+            payload += (1 if value else 0).to_bytes(1, "little")
         elif value_type == 4:
             payload += int(value).to_bytes(4, "little")
         elif value_type == 10:

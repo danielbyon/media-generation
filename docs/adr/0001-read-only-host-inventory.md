@@ -35,12 +35,15 @@ invented value or a silent absence.
 4. Runtime and device execution is opt-in. Version and help commands come from
    the built-in catalog with timeouts and output caps. Device commands require
    `probe_policy.device_queries: true`.
-5. Model headers and approved sidecars are parsed by default under fixed size,
-   count, depth, and allocation bounds. Tensor data is not loaded. Model-root
+5. Model headers are parsed by default within fixed byte, entry, and nesting
+   limits. Approved sidecar JSON is byte-capped but parsed with the standard
+   library, so it has no separate nesting or allocation bound. Tensor data is
+   not loaded. Model-root
    reads and directory listings re-check containment at open time. Full content
-   hashing is opt-in, streaming, and bounded at read time: a file that grows or
-   is replaced aborts without publishing a digest, and only regular files are
-   accepted. GGUF quantization labels come from the header's llama.cpp file-type
+   hashing is opt-in, streaming, and bounded at read time: a file that grows,
+   changes metadata, or is replaced aborts without publishing a digest, and only
+   regular files are accepted. Mutation detection is best-effort rather than an
+   immutable snapshot. GGUF quantization labels come from the header's llama.cpp file-type
    enum; unknown values remain unclassified with the raw enum retained, and
    filenames are never used to infer quantization.
 6. Memory is reported as separate observed pools with explicit sharing
@@ -48,7 +51,8 @@ invented value or a silent absence.
    not added into one allocatable pool. Unknown topology stays unknown.
 7. Environment fingerprints cover stable host, accelerator, runtime, and Python
    identities. They exclude timestamps, run duration, probe order, hostnames,
-   paths, environment variables, and transient memory use.
+   output and manifest paths, environment variables, and transient memory use.
+   Runtime executable paths are included as part of executable identity.
 8. Report writing, host-inventory completeness, APEX verification, and
    capability qualification are separate outcomes. A `blocked` or `partial`
    inventory can still have a written report and a nonzero automation status.

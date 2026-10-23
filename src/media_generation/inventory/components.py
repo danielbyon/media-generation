@@ -225,7 +225,8 @@ def inspect_gguf(data: bytes, *, file_truncated: bool) -> dict[str, object]:
             "metadata_keys_read": metadata_keys,
         }
     file_type = selected.get("general.file_type")
-    quantization = GGUF_FILE_TYPES.get(file_type) if isinstance(file_type, int) else None
+    enum_value = file_type if isinstance(file_type, int) and not isinstance(file_type, bool) else None
+    quantization = GGUF_FILE_TYPES.get(enum_value) if enum_value is not None else None
     return {
         "status": "observed",
         "format": "gguf",
@@ -236,7 +237,7 @@ def inspect_gguf(data: bytes, *, file_truncated: bool) -> dict[str, object]:
         "architecture": selected.get("general.architecture"),
         "model_name": selected.get("general.name"),
         "quantization": quantization,
-        "quantization_enum": file_type if isinstance(file_type, int) else None,
+        "quantization_enum": enum_value,
         "split": {
             key: selected[key]
             for key in ("split.count", "split.no")
@@ -402,8 +403,10 @@ def _read_sidecar(
         return {"path": str(path), "status": stat.status, "reason": stat.reason}
     try:
         facts = json.loads(stat.text)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         facts = {}
+    if not isinstance(facts, dict):
+        return {"path": str(path), "status": "malformed", "reason": "sidecar_stat_malformed"}
     if facts.get("kind") != "file" or facts.get("symlink"):
         return {"path": str(path), "status": "skipped", "reason": "not_a_regular_file"}
     observation = ledger.read(
@@ -649,7 +652,7 @@ def _inspect_component(
             if sidecar.get("status") == "observed":
                 base["metadata"]["sidecar"] = sidecar  # type: ignore[index]
                 break
-        return base, False
+        return base, listing.truncated
     if payload.get("kind") != "file":
         base["status"] = "unavailable"
         base["reason"] = "not_a_regular_file"
@@ -672,6 +675,20 @@ def _inspect_component(
         suffix=suffix,
         root=root.path if root is not None else None,
     )
+    verification = ledger.stat(
+        ProbeSpec(f"component:{component_id}:post-inspection", "model"), path
+    )
+    verified = _stat_payload(verification)
+    if verified is None or any(
+        verified.get(key) != payload.get(key)
+        for key in ("kind", "size_bytes", "mtime", "realpath")
+    ):
+        base["metadata"] = {
+            "status": "skipped",
+            "format": suffix[1:],
+            "reason": "component_replaced_during_inspection",
+        }
+        return base, True
     if suffix in {".safetensors", ".gguf"}:
         sidecar = _read_sidecar(
             ledger,
@@ -681,7 +698,9 @@ def _inspect_component(
         )
         if sidecar.get("status") == "observed":
             base["metadata"]["sidecar"] = sidecar  # type: ignore[index]
-    return base, False
+    metadata = base.get("metadata")
+    metadata_status = metadata.get("status") if isinstance(metadata, dict) else None
+    return base, metadata_status not in {"observed", "not_inspected", "unsupported"}
 
 
 def _recipe_record(
@@ -783,7 +802,7 @@ def _bundle_identity(
     ]
     unavailable = any(component.get("status") != "observed" for component in components)
     computed = sum(1 for status in digests if status == "computed")
-    if unavailable or recipe.get("status") in {"unavailable", "error", "timeout"}:
+    if unavailable or recipe.get("status") not in {"observed", "declared"}:
         identity_status = "unavailable"
     elif computed == len(components):
         identity_status = "complete"

@@ -24,6 +24,8 @@ MAX_ACCELERATORS = 8
 MAX_DRM_FILES = 32
 DRM_ROOT = Path("/sys/class/drm")
 SYS_DEVICES_ROOT = Path("/sys/devices")
+SYS_MODULE_ROOT = Path("/sys/module")
+_DRIVER_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,12 +115,15 @@ def _read_int(
     path: Path,
     category: str = "gpu",
     criticality: str = "optional",
+    root: Path | None = None,
 ) -> int | None:
-    """Read one integer sysfs file and return ``None`` on any failure."""
+    """Read one integer sysfs file and return None on any failure."""
     observation = ledger.read(
         ProbeSpec(probe_id, category, criticality),
         path,
         limit=4096,
+        follow_final_symlink=False,
+        root=root,
     )
     if not observation.ok:
         return None
@@ -132,12 +137,15 @@ def _read_text(
     path: Path,
     category: str = "gpu",
     criticality: str = "optional",
+    root: Path | None = None,
 ) -> str | None:
-    """Read one small text file and return ``None`` on any failure."""
+    """Read one small text file and return None on any failure."""
     observation = ledger.read(
         ProbeSpec(probe_id, category, criticality),
         path,
         limit=8192,
+        follow_final_symlink=False,
+        root=root,
     )
     if not observation.ok:
         return None
@@ -320,6 +328,10 @@ def resolve_memory_topology(
         topology_class = "ambiguous"
         reported_total = None
         confidence = "low"
+    elif dedicated and unknown:
+        topology_class = "ambiguous"
+        reported_total = None
+        confidence = "low"
     elif dedicated:
         topology_class = "discrete"
         reported_total = sum(
@@ -376,7 +388,7 @@ def resolve_memory_topology(
 
 
 def _trusted_sysfs_device(device_facts: dict[str, object]) -> bool:
-    """Accept a sysfs device directory or a symlink resolved under ``/sys/devices``."""
+    """Accept a sysfs device directory or a symlink resolved under /sys/devices."""
     if device_facts.get("kind") == "directory":
         return True
     if device_facts.get("kind") != "symlink":
@@ -386,7 +398,8 @@ def _trusted_sysfs_device(device_facts: dict[str, object]) -> bool:
         return False
     try:
         resolved = Path(real).resolve(strict=False)
-        return resolved.is_relative_to(SYS_DEVICES_ROOT)
+        root = SYS_DEVICES_ROOT.resolve(strict=False)
+        return resolved.is_relative_to(root)
     except (OSError, RuntimeError, ValueError):
         return False
 
@@ -395,7 +408,7 @@ def _collect_accelerators(
     ledger: ProbeLedger,
     *,
     system: str,
-) -> tuple[list[dict[str, object]], list[Finding], bool]:
+) -> tuple[list[dict[str, object]], list[Finding], bool, dict[str, object]]:
     """Enumerate Linux DRM cards through sysfs without external tooling."""
     findings: list[Finding] = []
     degraded = False
@@ -410,7 +423,12 @@ def _collect_accelerators(
                 detail="Linux DRM sysfs enumeration is unavailable on this platform",
             ),
         )
-        return [], findings, False
+        return (
+            [],
+            findings,
+            False,
+            {"status": "not_applicable", "reason": "unsupported_platform"},
+        )
     listing = ledger.list_dir(
         ProbeSpec("gpu:drm-directory", "gpu", "optional"),
         drm_root,
@@ -425,7 +443,15 @@ def _collect_accelerators(
                 message="Linux DRM sysfs was not readable; accelerator metadata is unavailable.",
             )
         )
-        return [], findings, True
+        return (
+            [],
+            findings,
+            True,
+            {
+                "status": "unavailable",
+                "reason": listing.reason or "drm_directory_unreadable",
+            },
+        )
     if listing.truncated:
         degraded = True
         findings.append(
@@ -438,7 +464,9 @@ def _collect_accelerators(
         )
     try:
         entries = json.loads(listing.text)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
+        entries = None
+    if not isinstance(entries, list):
         findings.append(
             Finding(
                 code="accelerator_listing_malformed",
@@ -447,7 +475,12 @@ def _collect_accelerators(
                 message="DRM directory listing could not be parsed.",
             )
         )
-        return [], findings, True
+        return (
+            [],
+            findings,
+            True,
+            {"status": "malformed", "reason": "drm_listing_malformed"},
+        )
     cards = sorted(
         entry["name"]
         for entry in entries
@@ -458,10 +491,11 @@ def _collect_accelerators(
     card_limit_reached = len(cards) > MAX_ACCELERATORS
     if card_limit_reached:
         cards = cards[:MAX_ACCELERATORS]
+        degraded = True
         findings.append(
             Finding(
                 code="accelerator_limit_reached",
-                severity=Severity.INFO.value,
+                severity=Severity.WARNING.value,
                 subject="gpu",
                 message=f"Only the first {MAX_ACCELERATORS} DRM cards were inspected.",
             )
@@ -475,7 +509,9 @@ def _collect_accelerators(
         )
         try:
             device_facts = json.loads(device_stat.text) if device_stat.ok else {}
-        except json.JSONDecodeError:
+        except (TypeError, json.JSONDecodeError):
+            device_facts = {}
+        if not isinstance(device_facts, dict):
             device_facts = {}
         if not device_stat.ok or not _trusted_sysfs_device(device_facts):
             inspection_failures += 1
@@ -485,6 +521,8 @@ def _collect_accelerators(
                 if not device_stat.ok
                 else "untrusted_device_link"
                 if device_facts.get("kind") == "symlink"
+                else "malformed_device_metadata"
+                if not device_facts.get("kind")
                 else "not_a_directory"
             )
             findings.append(
@@ -498,26 +536,74 @@ def _collect_accelerators(
                 )
             )
             continue
+        device_root = drm_root
+        device_base = device
+        if device_facts.get("kind") != "directory":
+            real = device_facts.get("realpath")
+            if isinstance(real, str):
+                try:
+                    device_base = Path(real).resolve(strict=False)
+                    device_root = SYS_DEVICES_ROOT
+                    contained = device_base.is_relative_to(
+                        device_root.resolve(strict=False)
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    contained = False
+            else:
+                contained = False
+            if not contained:
+                inspection_failures += 1
+                degraded = True
+                findings.append(
+                    Finding(
+                        code="gpu_card_unavailable",
+                        severity=Severity.WARNING.value,
+                        subject=f"gpu:{card}",
+                        message=(
+                            "DRM card device metadata was not usable; "
+                            "reason: device path escaped the trusted sysfs root."
+                        ),
+                    )
+                )
+                continue
         vendor_text = _read_text(
-            ledger, probe_id=f"gpu:{card}:vendor", path=device / "vendor"
+            ledger,
+            probe_id=f"gpu:{card}:vendor",
+            path=device_base / "vendor",
+            root=device_root,
         )
         device_text = _read_text(
-            ledger, probe_id=f"gpu:{card}:device", path=device / "device"
+            ledger,
+            probe_id=f"gpu:{card}:device",
+            path=device_base / "device",
+            root=device_root,
         )
         class_text = _read_text(
-            ledger, probe_id=f"gpu:{card}:class", path=device / "class"
+            ledger,
+            probe_id=f"gpu:{card}:class",
+            path=device_base / "class",
+            root=device_root,
         )
         uevent_text = _read_text(
-            ledger, probe_id=f"gpu:{card}:uevent", path=device / "uevent"
+            ledger,
+            probe_id=f"gpu:{card}:uevent",
+            path=device_base / "uevent",
+            root=device_root,
         )
         driver_stat = ledger.stat(
-            ProbeSpec(f"gpu:{card}:driver", "gpu"), device / "driver"
+            ProbeSpec(f"gpu:{card}:driver", "gpu"), device_base / "driver"
         )
         driver: str | None = None
         if driver_stat.ok:
             try:
-                driver = Path(json.loads(driver_stat.text).get("link_target", "")).name or None
-            except (json.JSONDecodeError, TypeError):
+                driver_payload = json.loads(driver_stat.text)
+            except (TypeError, json.JSONDecodeError):
+                driver_payload = None
+            if isinstance(driver_payload, dict):
+                link_target = driver_payload.get("link_target")
+                if isinstance(link_target, str) and link_target:
+                    driver = Path(link_target).name or None
+            else:
                 driver = None
         uevent = parse_uevent(uevent_text or "")
         pci_class = (class_text or uevent.get("PCI_CLASS") or "").strip().lower()
@@ -526,15 +612,22 @@ def _collect_accelerators(
         if pci_class and not pci_class.startswith("0x03"):
             continue
         vram = _read_int(
-            ledger, probe_id=f"gpu:{card}:vram-total", path=device / "mem_info_vram_total"
+            ledger,
+            probe_id=f"gpu:{card}:vram-total",
+            path=device_base / "mem_info_vram_total",
+            root=device_root,
         )
         vis_vram = _read_int(
             ledger,
             probe_id=f"gpu:{card}:visible-vram-total",
-            path=device / "mem_info_vis_vram_total",
+            path=device_base / "mem_info_vis_vram_total",
+            root=device_root,
         )
         gtt = _read_int(
-            ledger, probe_id=f"gpu:{card}:gtt-total", path=device / "mem_info_gtt_total"
+            ledger,
+            probe_id=f"gpu:{card}:gtt-total",
+            path=device_base / "mem_info_gtt_total",
+            root=device_root,
         )
         accelerator: dict[str, object] = {
             "id": f"drm:{card}",
@@ -577,11 +670,12 @@ def _collect_accelerators(
                 )
             )
         accelerator["pools"] = pools
-        if driver:
+        if driver and _DRIVER_NAME.match(driver):
             driver_version = _read_text(
                 ledger,
                 probe_id=f"gpu:{card}:{driver}-version",
-                path=Path(f"/sys/module/{driver}/version"),
+                path=SYS_MODULE_ROOT / driver / "version",
+                root=SYS_MODULE_ROOT,
             )
             if driver_version:
                 accelerator["driver_version"] = driver_version.strip()
@@ -616,7 +710,25 @@ def _collect_accelerators(
             source="sysfs",
             observation=observation,
         )
-    return accelerators, findings, degraded
+    enumeration: dict[str, object] = {
+        "status": (
+            "partial"
+            if inspection_failures or listing.truncated or card_limit_reached
+            else "observed"
+        ),
+        "candidate_count": len(cards),
+        "inspected_count": len(accelerators),
+        "inspection_failures": inspection_failures,
+        "listing_truncated": listing.truncated,
+        "card_limit_reached": card_limit_reached,
+    }
+    if enumeration["status"] == "partial":
+        enumeration["reason"] = (
+            "accelerator_inspection_failed"
+            if inspection_failures
+            else "accelerator_enumeration_truncated"
+        )
+    return accelerators, findings, degraded, enumeration
 
 
 def _merge_tool_accelerator(
@@ -936,9 +1048,12 @@ def collect_host(ledger: ProbeLedger, policy: ProbePolicy) -> HostFacts:
     if memory_total is None:
         degraded = True
 
-    accelerators, accelerator_findings, accelerator_degraded = _collect_accelerators(
-        ledger, system=system
-    )
+    (
+        accelerators,
+        accelerator_findings,
+        accelerator_degraded,
+        accelerator_enumeration,
+    ) = _collect_accelerators(ledger, system=system)
     findings.extend(accelerator_findings)
     degraded = degraded or accelerator_degraded
     toolchain = _collect_device_queries(ledger, policy, accelerators)
@@ -963,6 +1078,7 @@ def collect_host(ledger: ProbeLedger, policy: ProbePolicy) -> HostFacts:
         "cpu": cpu_data,
         "memory": {"system": memory_system, "topology": topology},
         "accelerators": accelerators,
+        "accelerator_enumeration": accelerator_enumeration,
         "runtime_toolchain": toolchain,
         "python": {
             "implementation": python_facts.get("implementation"),

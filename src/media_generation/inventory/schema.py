@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -146,7 +147,13 @@ class Finding:
 
 def canonical_json(value: object) -> str:
     """Serialize a value with sorted keys and no insignificant whitespace."""
-    return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def digest_value(value: object) -> str:
@@ -174,6 +181,19 @@ def _unique_object_pairs(pairs: Iterable[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_non_finite(value: str) -> object:
+    """Reject JSON constants that standard JSON does not define."""
+    raise InventoryValidationError(f"non-finite JSON number is not allowed: {value}")
+
+
+def _strict_float(value: str) -> float:
+    """Reject decimal or exponent literals that overflow to infinity."""
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise InventoryValidationError(f"non-finite JSON number is not allowed: {value}")
+    return parsed
+
+
 def load_strict_json(
     path: Path, *, label: str, max_bytes: int | None = None
 ) -> object:
@@ -195,7 +215,12 @@ def load_strict_json(
     except UnicodeDecodeError as error:
         raise InventoryValidationError(f"{label} is not valid UTF-8: {error}") from error
     try:
-        return json.loads(raw, object_pairs_hook=_unique_object_pairs)
+        return json.loads(
+            raw,
+            object_pairs_hook=_unique_object_pairs,
+            parse_constant=_reject_non_finite,
+            parse_float=_strict_float,
+        )
     except json.JSONDecodeError as error:
         raise InventoryValidationError(f"{label} is not valid JSON: {error}") from error
 

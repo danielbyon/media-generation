@@ -29,7 +29,7 @@ RUNTIME_CATALOG: dict[str, RuntimeSpec] = {
     "stable-diffusion.cpp": RuntimeSpec(
         id="stable-diffusion.cpp",
         kind="binary",
-        names=("sd", "stable-diffusion.cpp"),
+        names=("stable-diffusion.cpp",),
         known_paths=(
             "~/stable-diffusion.cpp/build/bin/sd",
             "~/src/stable-diffusion.cpp/build/bin/sd",

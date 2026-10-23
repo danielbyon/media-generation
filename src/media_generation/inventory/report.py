@@ -12,9 +12,10 @@ import importlib.metadata
 import json
 import os
 import secrets
+import stat
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -43,6 +44,8 @@ from .schema import (
 
 
 TRANSCRIPT_LIMIT = 1024 * 1024
+TRANSCRIPT_MARKER = b"\n[transcript truncated]\n"
+MAX_PUBLICATION_SNAPSHOT_BYTES = 32 * 1024 * 1024
 SEVERITY_ORDER = {"blocked": 0, "warning": 1, "info": 2}
 
 
@@ -71,6 +74,7 @@ class InventoryResult:
     inventory: dict[str, object]
     transcript: str
     summary: dict[str, object]
+    publication: dict[str, str] | None = None
 
 
 def _collector_version() -> str:
@@ -200,7 +204,7 @@ def _build_transcript(
         [
             f"configuration_inspection: {configuration}",
             f"host_inventory_status: {status}",
-            "report_written: true",
+            f"report_written: {str(bool(evidence['report_written'])).lower()}",
         f"evidence_origin: {evidence['evidence_origin']}",
             f"apex_verification: {evidence['apex_verification']}",
             f"capability_qualification: {evidence['capability_qualification']}",
@@ -245,26 +249,52 @@ def _build_transcript(
             f"  capability_qualification: {evidence['capability_qualification']}",
         ]
     )
-    text = "\n".join(lines) + "\n"
-    if len(text) > TRANSCRIPT_LIMIT:
-        text = text[:TRANSCRIPT_LIMIT].rstrip() + "\n[transcript truncated]\n"
-    return text
+    return _cap_transcript("\n".join(lines) + "\n")
+
+
+def _cap_transcript(text: str, limit: int = TRANSCRIPT_LIMIT) -> str:
+    """Return UTF-8 text no larger than the limit in bytes, marker included."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text
+    marker = TRANSCRIPT_MARKER
+    if limit <= len(marker):
+        return marker[:limit].decode("utf-8", errors="ignore")
+    truncated = encoded[: limit - len(marker)].decode("utf-8", errors="ignore").rstrip()
+    return truncated + marker.decode("utf-8")
+
+
+def _set_report_written(text: str, written: bool) -> str:
+    """Rewrite metadata publication lines in an already rendered transcript."""
+    value = str(bool(written)).lower()
+    lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.lstrip(" ")
+        if stripped.startswith("report_written: false"):
+            indentation = line[: len(line) - len(stripped)]
+            line = indentation + stripped.replace(
+                "report_written: false", f"report_written: {value}", 1
+            )
+        lines.append(line)
+    return "".join(lines)
+
+
+def _resolve_operator_path(value: Path | None, *, label: str) -> Path | None:
+    """Resolve an operator-supplied path or raise a structured validation error."""
+    if value is None:
+        return None
+    try:
+        return Path(value).expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise InventoryValidationError(f"{label} path cannot be resolved: {value}") from error
 
 
 def collect_inventory(options: InventoryOptions) -> InventoryResult:
     """Collect one inventory report without writing files."""
     started_at = utc_now()
     started = time.monotonic()
-    manifest_path = (
-        Path(options.manifest_path).expanduser().resolve()
-        if options.manifest_path is not None
-        else None
-    )
-    replay_path = (
-        Path(options.replay_path).expanduser().resolve()
-        if options.replay_path is not None
-        else None
-    )
+    manifest_path = _resolve_operator_path(options.manifest_path, label="manifest")
+    replay_path = _resolve_operator_path(options.replay_path, label="replay document")
     manifest: InventoryManifest = (
         parse_manifest(manifest_path) if manifest_path is not None else empty_manifest()
     )
@@ -337,14 +367,14 @@ def collect_inventory(options: InventoryOptions) -> InventoryResult:
     duration_ms = int((time.monotonic() - started) * 1000)
     run_id = _run_id()
     evidence_gate = {
-        "report_written": True,
+        "report_written": False,
         "host_inventory_status": status,
         "configuration_inspection": configuration,
-    "evidence_origin": "synthetic_replay" if mode == "replay" else "local_host",
-    "apex_verification": "unverified",
-    "apex_verification_reason": "live_apex_inventory_not_performed",
-    "capability_qualification": "unverified",
-    "capability_qualification_reason": "no_execution_or_qualification",
+        "evidence_origin": "synthetic_replay" if mode == "replay" else "local_host",
+        "apex_verification": "unverified",
+        "apex_verification_reason": "live_apex_inventory_not_performed",
+        "capability_qualification": "unverified",
+        "capability_qualification_reason": "no_execution_or_qualification",
     }
     run = {
         "run_id": run_id,
@@ -410,41 +440,97 @@ def collect_inventory(options: InventoryOptions) -> InventoryResult:
     )
 
 
-def _write_atomic(path: Path, text: str) -> None:
-    """Write one UTF-8 file through an exclusive same-directory temporary file."""
-    descriptor: int | None = None
-    temporary: str | None = None
+_UNRESTORABLE = object()
+
+
+def _stage_file(path: Path, data: bytes) -> str:
+    """Write bytes to an exclusive temporary file beside the destination."""
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
     try:
-        descriptor, temporary = tempfile.mkstemp(
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            dir=path.parent,
-        )
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            descriptor = None
-            handle.write(text)
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        temporary = None
-    except OSError as error:
-        if descriptor is not None:
+    except BaseException:
+        if descriptor >= 0:
             try:
                 os.close(descriptor)
             except OSError:
                 pass
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return temporary
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    """Write one UTF-8 file through an exclusive same-directory temporary file."""
+    temporary: str | None = None
+    try:
+        temporary = _stage_file(path, text.encode("utf-8"))
+        os.replace(temporary, path)
+        temporary = None
+    except OSError as error:
+        raise InventoryOutputError(f"could not write {path}: {error}") from error
+    finally:
         if temporary is not None:
             try:
                 os.unlink(temporary)
             except OSError:
                 pass
-        raise InventoryOutputError(f"could not write {path}: {error}") from error
+
+
+def _write_atomic_bytes(path: Path, data: bytes) -> None:
+    """Write bytes atomically for best-effort publication rollback."""
+    temporary: str | None = None
+    try:
+        temporary = _stage_file(path, data)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
+def _snapshot(path: Path) -> bytes | object | None:
+    """Capture a regular destination for best-effort rollback."""
+    try:
+        facts = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _UNRESTORABLE
+    if not stat.S_ISREG(facts.st_mode) or facts.st_size > MAX_PUBLICATION_SNAPSHOT_BYTES:
+        return _UNRESTORABLE
+    try:
+        return path.read_bytes()
+    except OSError:
+        return _UNRESTORABLE
+
+
+def _restore(path: Path, snapshot: bytes | object | None) -> None:
+    """Restore one destination after a failed second-file publication."""
+    if isinstance(snapshot, bytes):
+        _write_atomic_bytes(path, snapshot)
+    elif snapshot is None:
+        path.unlink(missing_ok=True)
 
 
 def write_inventory(
     result: InventoryResult, output_directory: Path
-) -> dict[str, str]:
-    """Write ``inventory.json`` and ``transcript.txt`` atomically."""
+) -> InventoryResult:
+    """Publish the report pair and record publication in the returned result."""
     directory = Path(output_directory).expanduser()
     try:
         directory.mkdir(parents=True, exist_ok=True)
@@ -454,12 +540,63 @@ def write_inventory(
         raise InventoryOutputError(f"output path is not a directory: {directory}")
     inventory_path = directory / "inventory.json"
     transcript_path = directory / "transcript.txt"
-    _write_atomic(
-        inventory_path,
-        json.dumps(result.inventory, ensure_ascii=True, indent=2, sort_keys=True) + "\n",
-    )
-    _write_atomic(transcript_path, result.transcript)
-    return {
-        "inventory_path": str(inventory_path.resolve()),
-        "transcript_path": str(transcript_path.resolve()),
+
+    evidence = result.inventory.get("evidence_gate")
+    final_evidence = dict(evidence) if isinstance(evidence, dict) else {}
+    final_evidence["report_written"] = True
+    final_inventory = {**result.inventory, "evidence_gate": final_evidence}
+    final_transcript = _set_report_written(result.transcript, True)
+    inventory_text = json.dumps(
+        final_inventory, ensure_ascii=True, indent=2, sort_keys=True
+    ) + "\n"
+
+    previous = {
+        inventory_path: _snapshot(inventory_path),
+        transcript_path: _snapshot(transcript_path),
     }
+    staged: dict[Path, str] = {}
+    published: list[Path] = []
+    try:
+        staged[inventory_path] = _stage_file(
+            inventory_path, inventory_text.encode("utf-8")
+        )
+        staged[transcript_path] = _stage_file(
+            transcript_path, final_transcript.encode("utf-8")
+        )
+        os.replace(staged[transcript_path], transcript_path)
+        published.append(transcript_path)
+        del staged[transcript_path]
+        os.replace(staged[inventory_path], inventory_path)
+        published.append(inventory_path)
+        del staged[inventory_path]
+    except BaseException as error:
+        rollback_error: OSError | None = None
+        for path in reversed(published):
+            try:
+                _restore(path, previous[path])
+            except OSError as failure:
+                rollback_error = failure
+        if rollback_error is not None:
+            raise InventoryOutputError(
+                f"could not publish {directory} and rollback failed: {rollback_error}"
+            ) from error
+        if isinstance(error, OSError):
+            raise InventoryOutputError(f"could not publish {directory}: {error}") from error
+        raise
+    finally:
+        for temporary in staged.values():
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+    return replace(
+        result,
+        inventory=final_inventory,
+        transcript=final_transcript,
+        summary={**result.summary, "evidence_gate": final_evidence},
+        publication={
+            "inventory_path": str(inventory_path.resolve()),
+            "transcript_path": str(transcript_path.resolve()),
+        },
+    )

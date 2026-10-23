@@ -166,6 +166,31 @@ def test_dedicated_and_shared_evidence_is_ambiguous() -> None:
     assert topology["reported_total_bytes"] is None
 
 
+def test_dedicated_and_unknown_memory_evidence_is_ambiguous() -> None:
+    """A dedicated GPU plus unknown GPU evidence is not promoted to discrete."""
+    topology, _ = resolve_memory_topology(
+        system_total_bytes=32 * GIB,
+        accelerators=[
+            _accelerator(
+                "drm:card1",
+                "0x10de",
+                "0x030000",
+                [_pool("vram", "dedicated_vram", 8 * GIB, source="nvidia-smi")],
+            ),
+            _accelerator(
+                "drm:card2",
+                "0x1002",
+                "0x030000",
+                [_pool("vram", "unknown_vram", 512 * 1024**2)],
+            ),
+        ],
+    )
+
+    assert topology["class"] == "ambiguous"
+    assert topology["reported_total_bytes"] is None
+    assert topology["confidence"] == "low"
+
+
 def test_no_accelerators_reports_system_only_and_unknown_topology() -> None:
     """Absence of GPU pools does not invent an acceleration topology."""
     topology, findings = resolve_memory_topology(

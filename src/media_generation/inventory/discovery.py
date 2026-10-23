@@ -62,6 +62,12 @@ def _candidate(
     observation = ledger.stat(ProbeSpec(f"runtime:{runtime_id}:candidate", "runtime"), path)
     payload = _stat_payload(observation)
     if payload is None:
+        if observation.ok:
+            return None, {
+                "path": str(path),
+                "status": "malformed",
+                "reason": "stat_payload_malformed",
+            }
         return None, {"path": str(path), "status": observation.status, "reason": observation.reason}
     if payload.get("symlink"):
         return None, {"path": str(path), "status": "skipped", "reason": "symlink_not_followed"}
@@ -73,7 +79,17 @@ def _candidate(
                 ProbeSpec(f"runtime:{runtime_id}:marker", "runtime"), path / marker
             )
             marker_payload = _stat_payload(marker_observation)
-            if marker_payload is None or marker_payload.get("kind") != "file":
+            if marker_payload is None:
+                return None, {
+                    "path": str(path),
+                    "status": "malformed" if marker_observation.ok else marker_observation.status,
+                    "reason": (
+                        "marker_stat_malformed"
+                        if marker_observation.ok
+                        else marker_observation.reason or marker_observation.status
+                    ),
+                }
+            if marker_payload.get("kind") != "file":
                 return None, {
                     "path": str(path),
                     "status": "unavailable",
@@ -303,7 +319,8 @@ def _python_distribution(
         reason = observation.reason or observation.status
         unrecorded = reason == "not_recorded"
         missing = (
-            observation.status == ProbeStatus.UNAVAILABLE.value and not unrecorded
+            observation.status == ProbeStatus.UNAVAILABLE.value
+            and reason == "distribution_not_found"
         )
         status = "not_inspected" if unrecorded else observation.status
         record = {

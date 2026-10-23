@@ -12,8 +12,10 @@ from pathlib import Path
 import pytest
 
 from media_generation.inventory.components import (
+    MAX_DIRECTORY_ENTRIES,
     _bundle_identity,
     _inspect_component,
+    _read_sidecar,
     _recipe_record,
     inspect_bundles,
     inspect_gguf,
@@ -29,6 +31,7 @@ from media_generation.inventory.probes import (
     ProbeLedger,
     ReplayObservationSource,
 )
+from media_generation.inventory.schema import Observation
 
 from inventory_support import build_gguf, build_safetensors, observation, stat_payload, write_replay
 
@@ -627,3 +630,134 @@ def test_recipe_fifo_is_rejected_without_blocking(tmp_path: Path) -> None:
     assert record["status"] == "skipped"
     assert record["reason"] == "not_regular_file"
     assert record["digest"] is None
+
+
+def test_gguf_boolean_file_type_is_not_an_enum() -> None:
+    """A boolean GGUF file type is malformed evidence, not enum zero or one."""
+    data = build_gguf([("general.file_type", 7, True)])
+
+    result = inspect_gguf(data, file_truncated=False)
+
+    assert result["status"] == "observed"
+    assert result["quantization_enum"] is None
+    assert result["quantization"] is None
+
+
+def test_directory_component_truncation_degrades_the_run(tmp_path: Path) -> None:
+    """A bounded directory listing reports that model evidence is incomplete."""
+    component = tmp_path / "model-directory"
+    component.mkdir()
+    for index in range(MAX_DIRECTORY_ENTRIES + 1):
+        (component / f"part-{index:03d}.bin").write_bytes(b"x")
+
+    record, degraded = _inspect_component(
+        _ledger(),
+        component_id="bundle/model",
+        role="diffusion_model",
+        path=component,
+        roots=(ModelRoot(id="models", path=tmp_path),),
+        hash_components=False,
+        hash_limit_bytes=1024,
+    )
+
+    assert degraded is True
+    assert record["metadata"]["truncated"] is True  # type: ignore[index]
+
+
+def test_malformed_component_header_degrades_the_run(tmp_path: Path) -> None:
+    """A truncated GGUF header is surfaced as incomplete configured evidence."""
+    component = tmp_path / "model.gguf"
+    component.write_bytes(b"GGUF" + b"\x00" * 8)
+
+    record, degraded = _inspect_component(
+        _ledger(),
+        component_id="bundle/model",
+        role="diffusion_model",
+        path=component,
+        roots=(ModelRoot(id="models", path=tmp_path),),
+        hash_components=False,
+        hash_limit_bytes=1024,
+    )
+
+    assert degraded is True
+    assert record["metadata"]["status"] == "malformed"  # type: ignore[index]
+
+
+def test_component_replacement_during_inspection_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file swapped after validation is detected before its header is trusted."""
+    component = tmp_path / "model.gguf"
+    component.write_bytes(build_gguf([("general.architecture", 8, "flux")]))
+    source = LocalObservationSource()
+    real_read_prefix = source.read_prefix
+    swapped = {"done": False}
+
+    def swapping_read_prefix(path: Path, **kwargs: object):
+        if path == component and not swapped["done"]:
+            swapped["done"] = True
+            component.write_bytes(
+                build_gguf([("general.architecture", 8, "replacement")])
+                + b"\x00" * 128
+            )
+        return real_read_prefix(path, **kwargs)  # type: ignore[arg-type]
+
+    source.read_prefix = swapping_read_prefix  # type: ignore[method-assign]
+
+    record, degraded = _inspect_component(
+        ProbeLedger(source),
+        component_id="bundle/model",
+        role="diffusion_model",
+        path=component,
+        roots=(ModelRoot(id="models", path=tmp_path),),
+        hash_components=False,
+        hash_limit_bytes=1024,
+    )
+
+    assert degraded is True
+    assert record["metadata"]["status"] == "skipped"  # type: ignore[index]
+    assert (
+        record["metadata"]["reason"]  # type: ignore[index]
+        == "component_replaced_during_inspection"
+    )
+
+
+def test_bundle_identity_rejects_skipped_recipe() -> None:
+    """A skipped recipe cannot produce a complete bundle identity."""
+    identity = _bundle_identity(
+        engine="stable-diffusion.cpp",
+        recipe={"status": "skipped", "digest": None},
+        components=[
+            {
+                "id": "model",
+                "role": "diffusion_model",
+                "kind": "file",
+                "size_bytes": 10,
+                "status": "observed",
+                "digest": {"status": "unchecked", "value": None},
+            }
+        ],
+    )
+
+    assert identity["status"] == "unavailable"
+
+
+def test_malformed_sidecar_stat_is_explicitly_degraded() -> None:
+    """A non-object stat payload cannot abort sidecar inspection."""
+    path = Path("/models/model.json")
+    source = ReplayObservationSource(
+        {f"stat:{path}": Observation(status="ok", text="[]")}
+    )
+
+    record = _read_sidecar(
+        ProbeLedger(source),
+        component_id="bundle/model",
+        path=path,
+        roots=(ModelRoot(id="models", path=Path("/models")),),
+    )
+
+    assert record == {
+        "path": str(path),
+        "status": "malformed",
+        "reason": "sidecar_stat_malformed",
+    }

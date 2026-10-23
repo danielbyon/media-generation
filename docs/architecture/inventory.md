@@ -1,10 +1,11 @@
-# Read-only inventory
+# Inventory collection
 
 The inventory command collects a bounded snapshot of a local machine and the
 runtimes and model components that an operator has explicitly declared. It is
 designed to run without a GPU, without model inference, and without network
-access. The command writes only its requested output files; every host, runtime,
-and model observation is read-only.
+access. Collection is read-only unless the manifest explicitly enables version
+or device probes; those probes execute external tools that may write their own
+state. The command itself writes only its requested output files.
 
 The report is evidence about what was observed in a particular run. It does not
 prove that a model works, that an engine supports an operation, that a host has
@@ -84,6 +85,11 @@ Individual probes use `ok`, `unavailable`, `skipped`, `timeout`, `error`, or
 manifest, a permission failure, and an unknown memory relationship are different
 outcomes and must not be collapsed into `absent`.
 
+A component in a deliberately unsupported serialization format records
+`not_inspected`. That safety decision is reported explicitly and does not by
+itself downgrade the run. A malformed, truncated, or inaccessible header for a
+recognized format does downgrade the bundle and therefore the overall status.
+
 `evidence_gate` separates the report from later evidence stages:
 
 ```json
@@ -104,6 +110,15 @@ It is not a hardware, engine, model, or product qualification result. A report
 generated on another machine is not APEX evidence. Replay output sets
 `evidence_origin` to `synthetic_replay` and must never be treated as host
 evidence.
+
+Collection always returns `report_written: false`. Publication stages both
+files in the output directory, replaces the transcript first and the inventory
+second, and only then marks the returned result as written. If the second
+replacement fails, the collector restores the previous regular-file pair on a
+best-effort basis and leaves `report_written` false. The two replacements are
+not crash-atomic; both files carry the same `run_id` so a mixed pair is
+detectable. The transcript is capped at 1 MiB of UTF-8, including its
+truncation marker.
 
 ## 3. Collection scope and read-only behavior
 
@@ -128,7 +143,9 @@ It does not:
 - Follow symlinks below a declared model root, including intermediate links.
   A declared root itself may be a symlink and is treated as trusted.
 - Fetch a manifest URL.
-- Read environment variables, credentials, or arbitrary file contents.
+- Read credentials, arbitrary environment values, or arbitrary file contents.
+  It reads only `PATH` to resolve cataloged executables and to build the fixed
+  environment for opt-in probes.
 - Change firewall, network, service, or device state.
 
 Model-root containment is enforced when each file is opened, not only when

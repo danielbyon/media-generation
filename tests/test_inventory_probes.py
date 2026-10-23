@@ -7,10 +7,13 @@ import json
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from media_generation.inventory.catalog import RUNTIME_CATALOG
+from media_generation.inventory.discovery import _candidate, _python_distribution
 from media_generation.inventory.probes import (
     MAX_REPLAY_BYTES,
     LocalObservationSource,
@@ -48,6 +51,14 @@ def test_missing_file_and_permission_failures_are_explicit(tmp_path: Path) -> No
     directory = tmp_path / "directory"
     directory.mkdir()
     assert source.read_text(directory).reason == "os_error"
+
+    def deny_open(*args: object, **kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    source._open_read = deny_open  # type: ignore[method-assign]
+    denied = source.read_text(tmp_path / "denied.txt")
+    assert denied.status == "unavailable"
+    assert denied.reason == "permission_denied"
 
 
 def test_stat_does_not_follow_symlinks(tmp_path: Path) -> None:
@@ -315,6 +326,97 @@ def test_replay_missing_file_is_a_validation_error(tmp_path: Path) -> None:
     with pytest.raises(InventoryValidationError, match="not readable"):
         ReplayObservationSource.from_path(tmp_path / "missing.json")
 
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (
+            {
+                "schema": "media-generation.inventory-replay",
+                "schema_version": 1,
+                "synthetic": True,
+                "observations": {"read:/synthetic": {"status": "ok", "text": 1}},
+            },
+            "text must be a string",
+        ),
+        (
+            {
+                "schema": "media-generation.inventory-replay",
+                "schema_version": 1,
+                "synthetic": True,
+                "observations": {"read:/synthetic": {"status": "unknown"}},
+            },
+            "invalid status",
+        ),
+    ],
+)
+def test_replay_rejects_malformed_observation_payloads(
+    tmp_path: Path, payload: dict[str, object], message: str
+) -> None:
+    """Recorded observations are validated before they reach a collector."""
+    path = tmp_path / "replay.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(InventoryValidationError, match=message):
+        ReplayObservationSource.from_path(path)
+
+
+def test_malformed_candidate_stat_is_explicit_evidence(tmp_path: Path) -> None:
+    """A successful probe with an undecodable payload is not reported as absence."""
+    runtime_path = tmp_path / "runtime"
+    source = ReplayObservationSource(
+        {
+            f"stat:{runtime_path}": Observation(status="ok", text="[]"),
+        }
+    )
+    searched: list[str] = []
+
+    path, payload = _candidate(
+        ProbeLedger(source),
+        runtime_id="synthetic",
+        path=runtime_path,
+        kind="binary",
+        searched=searched,
+    )
+
+    assert path is None
+    assert payload == {
+        "path": str(runtime_path),
+        "status": "malformed",
+        "reason": "stat_payload_malformed",
+    }
+    assert searched == [str(runtime_path)]
+
+
+def test_python_distribution_access_failure_is_not_reported_as_absence() -> None:
+    """Permission failures retain metadata-unavailable evidence."""
+    source = ReplayObservationSource(
+        {
+            "distribution:diffusers": Observation(
+                status="error", reason="permission_denied"
+            )
+        }
+    )
+    spec = RUNTIME_CATALOG["diffusers"]
+
+    record, degraded, finding = _python_distribution(
+        ProbeLedger(source), spec, None
+    )
+
+    assert record["presence"] == "metadata_unavailable"
+    assert record["identity"] == {
+        "status": "error",
+        "reason": "permission_denied",
+    }
+    assert degraded is True
+    assert finding is not None
+    assert finding.code == "runtime_distribution_metadata_unavailable"
+
+
+def test_stable_diffusion_catalog_does_not_accept_generic_sd_alias() -> None:
+    """A PATH binary named ``sd`` is too generic to identify the runtime."""
+    assert "sd" not in RUNTIME_CATALOG["stable-diffusion.cpp"].names
+
 def test_sha256_detects_growth_beyond_the_limit_after_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -492,6 +594,57 @@ def test_intermediate_directory_replacement_is_not_followed(
         "containment_path_changed",
     }
     assert not observation.text
+
+
+def test_sha256_detects_in_place_metadata_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file modified in place during hashing never publishes a digest."""
+    path = tmp_path / "model.bin"
+    path.write_bytes(b"stable content")
+    real_fstat = os.fstat
+    calls = {"count": 0}
+
+    def mutating_fstat(descriptor: int) -> SimpleNamespace:
+        calls["count"] += 1
+        facts = real_fstat(descriptor)
+        if calls["count"] == 2:
+            return SimpleNamespace(
+                st_dev=facts.st_dev,
+                st_ino=facts.st_ino,
+                st_mode=facts.st_mode,
+                st_size=facts.st_size,
+                st_mtime_ns=facts.st_mtime_ns + 1,
+                st_ctime_ns=facts.st_ctime_ns + 1,
+            )
+        return SimpleNamespace(
+            st_dev=facts.st_dev,
+            st_ino=facts.st_ino,
+            st_mode=facts.st_mode,
+            st_size=facts.st_size,
+            st_mtime_ns=facts.st_mtime_ns,
+            st_ctime_ns=facts.st_ctime_ns,
+        )
+
+    monkeypatch.setattr("media_generation.inventory.probes.os.fstat", mutating_fstat)
+
+    observation, digest = LocalObservationSource().sha256(path, limit=1024)
+
+    assert observation.status == "skipped"
+    assert observation.reason == "file_changed_during_hash"
+    assert digest is None
+
+
+def test_replay_read_text_honors_requested_byte_limit() -> None:
+    """Replay reads apply the same bound as recorded local reads."""
+    source = ReplayObservationSource(
+        {"read:/model": Observation(status="ok", text="é" * 50)}
+    )
+
+    observation = source.read_text(Path("/model"), limit=10)
+
+    assert observation.truncated is True
+    assert observation.text == "é" * 5
 
 
 def test_containment_fallback_rejects_nested_paths(
