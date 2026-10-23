@@ -1,0 +1,65 @@
+tests/test_inventory_host.py
+  s_cdc67647c63380::t_6e037e4a80d1dc 60-94,118-120,184-217
+  s_9fca9aee43ce94::t_53870bcc6dedff 218
+README.md
+  s_cdc67647c63380::t_897db59738853f 99-107
+src/media_generation/inventory/probes.py
+  s_cdc67647c63380::t_1ea9d152aeb2db 742
+  s_cdc67647c63380::t_dc0f76297e0c83 693-718
+tests/test_inventory_fingerprint.py
+  s_cdc67647c63380::t_d9ef15634a87ed 96-102,115
+src/media_generation/inventory/fingerprint.py
+  s_cdc67647c63380::t_cd92af59d893c5 6-8
+src/media_generation/inventory/components.py
+  s_cdc67647c63380::t_ba69117c0d0077 686-693
+tests/test_inventory_models.py
+  s_cdc67647c63380::t_3e1abd684556dc 713,718-725,731-736
+src/media_generation/inventory/report.py
+  s_cdc67647c63380::t_6fb7889946a755 11,50
+  s_cdc67647c63380::t_5f71a8721f60e5 445-465,511-559,563-618,620-644,647,649-663,665-666
+src/media_generation/inventory/host.py
+  s_cdc67647c63380::t_ccb2cdbdccbece 491-492,494,720-721
+tests/test_inventory_probes.py
+  s_cdc67647c63380::t_9185ec602e9c60 324-340
+docs/architecture/inventory.md
+  s_cdc67647c63380::t_785bd3eedcd04b 114-126
+  s_cdc67647c63380::t_9299468e771dd2 402-405
+  s_cdc67647c63380::t_7795ec24b01a83 135-139
+  s_cdc67647c63380::t_e3a95476721266 426-427
+tests/test_inventory_output.py
+  s_cdc67647c63380::t_b69273b486fcef 6-7
+  s_cdc67647c63380::t_d6163e04482477 51-226,261-263,294-324
+  s_5176c22a60576e::t_78bb85b3b00520 325-326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dd38cfccfd45c2bcd5a94ca14c4c9ed2e37e978b",
+  "prompts": {},
+  "sessions": {
+    "s_5176c22a60576e": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1651d-c08e-7773-8e56-91c1c774e34d",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_9fca9aee43ce94": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15b35-460e-7d82-8c5d-aad38b92ed3c",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_cdc67647c63380": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a161c2-563a-7cc1-9a29-98baa3502c1a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
