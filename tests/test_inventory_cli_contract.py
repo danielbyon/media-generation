@@ -168,6 +168,24 @@ def test_missing_or_malformed_manifest_fails_without_writing_output(
     assert json_stderr(process)["error"]["code"] == "inventory_validation_error"  # type: ignore[index]
 
 
+@pytest.mark.parametrize("option", ["--manifest", "--replay"])
+def test_symlink_loop_path_is_a_structured_validation_error(
+    tmp_path: Path, option: str
+) -> None:
+    """Path-resolution loops do not escape the CLI error contract."""
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    output = tmp_path / "output"
+
+    process = run_cli("inventory", option, str(loop), "--output", str(output))
+
+    error = json_stderr(process)
+    assert process.returncode == 2
+    assert error["error"]["code"] == "inventory_validation_error"  # type: ignore[index]
+    assert error["error"]["message"]  # type: ignore[index]
+    assert not (output / "inventory.json").exists()
+
+
 def test_replay_document_must_be_synthetic(tmp_path: Path) -> None:
     """A replay file cannot be presented as real host evidence."""
     replay = tmp_path / "replay.json"
