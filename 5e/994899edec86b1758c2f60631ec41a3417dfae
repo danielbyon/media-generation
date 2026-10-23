@@ -1,0 +1,133 @@
+src/media_generation/inventory/components.py
+  s_cdc67647c63380::t_9719ab60a23e54 678-691
+  s_cdc67647c63380::t_157043efe3d706 701-702
+  s_cdc67647c63380::t_1aabd8e9ef9372 655
+  s_cdc67647c63380::t_01fafb37b770cb 703
+  s_cdc67647c63380::t_52dc98ee7d666e 406
+  s_cdc67647c63380::t_8203a7b6396e43 408-409
+  s_cdc67647c63380::t_2d4414ec10f31c 228-229,240
+  s_cdc67647c63380::t_768b8d794bff8b 805
+src/media_generation/inventory/schema.py
+  s_cdc67647c63380::t_9fa4ef461b11d2 184-196,218-223
+  s_cdc67647c63380::t_ec17c157a31100 12,150-156
+tests/test_inventory_manifest.py
+  s_cdc67647c63380::t_5d44f0d1a4af4a 290-329
+tests/test_inventory_memory.py
+  s_cdc67647c63380::t_1e881ef2c5568f 169-193
+tests/test_inventory_probes.py
+  s_cdc67647c63380::t_1fc2c64c7683af 15-16,389-418
+  s_cdc67647c63380::t_8d1c272193f8f7 599-649
+  s_cdc67647c63380::t_860b9e5e011856 10,55-61
+  s_cdc67647c63380::t_0defc3493f7984 329-388
+  s_537f13372bbf30::t_4d23541fccbcc1 62,419
+docs/architecture/inventory.md
+  s_cdc67647c63380::t_2410e2b175922a 146-148
+  s_cdc67647c63380::t_a3a3aaf8b391a7 88-92
+  s_cdc67647c63380::t_13e8b97932264e 114-122
+  s_cdc67647c63380::t_739fb1f56cf3aa 1,6-8
+src/media_generation/inventory/report.py
+  s_cdc67647c63380::t_cdf1cc67e3e172 282-289,370,373-377
+  s_cdc67647c63380::t_5539685e288aa1 15,18,47-48,77
+  s_cdc67647c63380::t_41872e8d6949f0 296-297
+  s_cdc67647c63380::t_d13a47a08051bf 533
+  s_cdc67647c63380::t_b762a34690e493 543-555,557-602
+  s_cdc67647c63380::t_a1da3751fa610c 268,270-279
+  s_cdc67647c63380::t_87cc2260a12dd7 443-473,478,482-484,486,489-498,504-527
+  s_cdc67647c63380::t_d9c7fed2635fff 207,252-267,269
+  s_cdc67647c63380::t_70dec48101cac0 532
+  s_9fca9aee43ce94::t_56c677cb8b3c73 280-281
+src/media_generation/inventory/probes.py
+  s_cdc67647c63380::t_281452073c3286 776-790
+  s_cdc67647c63380::t_88cde3e85335f7 437-441,445-459
+  s_cdc67647c63380::t_80eab44dba53d0 442-444
+  s_f2942942c3caab::t_aa2d4f63e1be29 460-462
+tests/inventory_support.py
+  s_cdc67647c63380::t_e5542f26ab66f7 190-194,197,203,207-209
+  s_cdc67647c63380::t_b80727c7ca4bed 250-251
+src/media_generation/cli.py
+  s_cdc67647c63380::t_35d186cc251d79 159,164-165
+src/media_generation/inventory/manifest.py
+  s_cdc67647c63380::t_7c4529b7e15223 48-49,276-281
+tests/test_inventory_host.py
+  s_cdc67647c63380::t_9d5f16189eb402 83-162
+  s_cdc67647c63380::t_0214c48ef75743 49,71
+src/media_generation/inventory/discovery.py
+  s_cdc67647c63380::t_e2ece549dab856 65-70,82-92
+  s_cdc67647c63380::t_de4a89c6a5e381 322-323
+README.md
+  s_cdc67647c63380::t_1c8c4056b70515 98-103
+tests/test_inventory_output.py
+  s_cdc67647c63380::t_ccae5ff27b9c4a 11,15,66-81,83-138
+  s_cdc67647c63380::t_f8a0a46d99a76a 82
+tests/test_inventory_models.py
+  s_cdc67647c63380::t_63be3d24d07ffc 15,633-742
+  s_cdc67647c63380::t_1fc2c64c7683af 18,743-748,750-763
+  s_cdc67647c63380::t_f6c7d09731ece7 34,749
+src/media_generation/inventory/fingerprint.py
+  s_cdc67647c63380::t_9d2658da8888ff 147-161
+  s_cdc67647c63380::t_984c489b47d2f5 175-177
+src/media_generation/inventory/catalog.py
+  s_cdc67647c63380::t_8dad17618393e6 32
+docs/adr/0001-read-only-host-inventory.md
+  s_cdc67647c63380::t_f829386a6eeecb 38-41,43-46,54-55
+src/media_generation/inventory/host.py
+  s_cdc67647c63380::t_140da89bc801aa 331-334
+  s_cdc67647c63380::t_a7ab141a8c22b5 615-618,623-624,627-630
+  s_cdc67647c63380::t_e57999d9f1624a 483,713-731
+  s_cdc67647c63380::t_0eb6a0a3ff6776 27-28
+  s_cdc67647c63380::t_d73a1daeb6910c 391,401-402
+  s_cdc67647c63380::t_c74d2eb267f87d 494,498
+  s_cdc67647c63380::t_d1eecfa3ecbb2d 512-514,524-525,539-542,553-568,570-573,576-579,582-585,588-591,594
+  s_cdc67647c63380::t_38cd957279846f 446-454,467-469,478-482
+  s_cdc67647c63380::t_423fe787af7293 543-552
+  s_cdc67647c63380::t_10133f2f16a108 118,120,125-126,140,142,147-148
+  s_cdc67647c63380::t_1071c22a2212d6 411,426-431
+  s_cdc67647c63380::t_e0fc7aac320d7b 673,677-678
+  s_cdc67647c63380::t_c348bd1579f43e 1051-1056,1081
+  s_cdc67647c63380::t_1a8dfd53baec29 599-606
+tests/test_inventory_fingerprint.py
+  s_cdc67647c63380::t_802992e559ee25 101
+  s_cdc67647c63380::t_f7e1c9322c3312 100,102
+  s_cdc67647c63380::t_436b0e499af106 97-99,111-128
+  s_537f13372bbf30::t_0b906fb522f428 129-130
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5e994899edec86b1758c2f60631ec41a3417dfae",
+  "prompts": {},
+  "sessions": {
+    "s_537f13372bbf30": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15836-9c35-71e2-891b-d288adcbda2a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_9fca9aee43ce94": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15b35-460e-7d82-8c5d-aad38b92ed3c",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_cdc67647c63380": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a161c2-563a-7cc1-9a29-98baa3502c1a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_f2942942c3caab": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15855-1bcd-7d92-b495-2b4e1d2b21cb",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
