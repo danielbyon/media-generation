@@ -1,0 +1,20 @@
+tests/test_inventory_cli_contract.py
+  s_cdc67647c63380::t_0199a88cea545f 185
+  s_cdc67647c63380::t_52e54e1528b7cb 171-184,186-188
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "cb36e54663d9d74041d4734386384768296b7fda",
+  "prompts": {},
+  "sessions": {
+    "s_cdc67647c63380": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a161c2-563a-7cc1-9a29-98baa3502c1a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
