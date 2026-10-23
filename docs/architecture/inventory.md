@@ -111,14 +111,19 @@ generated on another machine is not APEX evidence. Replay output sets
 `evidence_origin` to `synthetic_replay` and must never be treated as host
 evidence.
 
-Collection always returns `report_written: false`. Publication stages both
-files in the output directory, replaces the transcript first and the inventory
-second, and only then marks the returned result as written. If the second
-replacement fails, the collector restores the previous regular-file pair on a
-best-effort basis and leaves `report_written` false. The two replacements are
-not crash-atomic; both files carry the same `run_id` so a mixed pair is
-detectable. The transcript is capped at 1 MiB of UTF-8, including its
-truncation marker.
+Collection always returns `report_written: false`. Before staging, publication
+snapshots each destination without following a final link. Missing paths,
+regular files up to 32 MiB, and symlink entries are supported. An unreadable,
+non-regular, oversized, or changing destination aborts publication before
+either output file is replaced. Publication then stages both files in the
+output directory, replaces the transcript first and the inventory second, and
+only then marks the returned result as written. If the second replacement
+fails, the collector attempts to restore the previous missing path, regular
+file bytes, or symlink target and leaves `report_written` false. Rollback is
+best effort: concurrent writers or a failed restore can leave a mixed pair.
+The replacements are not crash-atomic; both files carry the same `run_id` so a
+mixed pair is detectable. The transcript is capped at 1 MiB of UTF-8, including
+its truncation marker.
 
 ## 3. Collection scope and read-only behavior
 
@@ -127,6 +132,11 @@ The collector performs these operations:
 - Reads standard platform, kernel, CPU, memory, Python, and Linux DRM/sysfs
   metadata. A DRM card device link is accepted only when it resolves beneath
   /sys/devices; unrelated links are rejected.
+- Reports every DRM candidate discovered before the accelerator card limit as
+  `candidate_count`, every successfully processed card as `inspected_count`
+  (including cards later filtered out as non-display devices), and failed card
+  inspections separately. Directory truncation and the card limit remain
+  explicit incomplete-enumeration signals.
 - Reads bounded, fixed-location runtime markers, version files, and Git HEAD and
   ref files.
 - Resolves cataloged executable names through `PATH` and a short list of known
@@ -389,6 +399,10 @@ Its inputs are:
 - CPU model, architecture, and logical core count.
 - Accelerator IDs, vendor and device IDs, PCI class and address, driver and
   driver version, name, and reported pool identity and size.
+- Accelerator enumeration status, reason, candidate and inspected counts,
+  inspection failure count, directory listing truncation, and accelerator card
+  limit state. A bounded or failed scan therefore changes the digest even when
+  no accelerator record was produced.
 - System memory total, topology class, and reported aggregate.
 - Runtime ID, presence, path, size, digest state and value, version state and
   value, source revision, and version-file value.
@@ -409,6 +423,8 @@ and the transcript begins with a synthetic-evidence banner. Replay does not
 fabricate model bytes, header contents, or content hashes. Replay documents
 are capped at 4 MiB and must be valid UTF-8 JSON; oversized or malformed input
 produces a structured validation error before the full document is parsed.
+Every replay string must also be UTF-8 encodable, so escaped lone surrogates are
+rejected during ingestion instead of failing later transcript rendering.
 
 Replay is not a live APEX inventory, a substitute for a host run, or permission
 to treat fixture values as hardware observations.

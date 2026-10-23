@@ -3,7 +3,9 @@
 The fingerprint intentionally ignores run metadata, transient memory use, probe
 order, and hostnames.  Missing stable components remain in the input document as
 explicit unknown entries so enabling a previously unavailable probe changes the
-digest instead of silently disappearing from it.
+digest instead of silently disappearing from it. Accelerator enumeration status,
+counts, failures, truncation, and card-limit state are included so an incomplete
+scan cannot produce the same digest as a verified accelerator-free result.
 """
 
 from __future__ import annotations

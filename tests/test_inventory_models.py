@@ -710,16 +710,30 @@ def test_component_replacement_during_inspection_is_skipped(
         role="diffusion_model",
         path=component,
         roots=(ModelRoot(id="models", path=tmp_path),),
-        hash_components=False,
+        hash_components=True,
         hash_limit_bytes=1024,
     )
 
     assert degraded is True
+    assert record["status"] == "skipped"
+    assert record["reason"] == "component_replaced_during_inspection"
+    assert record["digest"] == {
+        "status": "unavailable",
+        "algorithm": "sha256",
+        "value": None,
+        "reason": "component_replaced_during_inspection",
+    }
     assert record["metadata"]["status"] == "skipped"  # type: ignore[index]
     assert (
         record["metadata"]["reason"]  # type: ignore[index]
         == "component_replaced_during_inspection"
     )
+    identity = _bundle_identity(
+        engine="stable-diffusion.cpp",
+        recipe={"status": "observed", "digest": "sha256:recipe"},
+        components=[record],
+    )
+    assert identity["status"] == "unavailable"
 
 
 def test_bundle_identity_rejects_skipped_recipe() -> None:

@@ -57,6 +57,41 @@ def test_local_sysfs_symlinked_card_and_device_are_inspected(
     assert accelerator["id"] == "drm:card1"
     assert accelerator["driver"] == "amdgpu"
     assert accelerator["pools"][0]["kind"] == "unknown_vram"  # type: ignore[index]
+    assert enumeration == {
+        "status": "observed",
+        "candidate_count": 1,
+        "inspected_count": 1,
+        "inspection_failures": 0,
+        "listing_truncated": False,
+        "card_limit_reached": False,
+    }
+
+
+def test_non_display_card_is_inspected_but_not_reported_as_accelerator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successfully inspected non-VGA card still counts toward coverage."""
+    class_dir, devices = _sysfs_tree(tmp_path)
+    device_dir = devices / "pci0000:00" / "0000:00:01.0" / "0000:01:00.0"
+    (device_dir / "class").write_text("0x020000\n", encoding="utf-8")
+    monkeypatch.setattr(host, "DRM_ROOT", class_dir)
+    monkeypatch.setattr(host, "SYS_DEVICES_ROOT", devices)
+
+    accelerators, findings, degraded, enumeration = host._collect_accelerators(
+        ProbeLedger(LocalObservationSource()), system="Linux"
+    )
+
+    assert accelerators == []
+    assert findings == []
+    assert degraded is False
+    assert enumeration == {
+        "status": "observed",
+        "candidate_count": 1,
+        "inspected_count": 1,
+        "inspection_failures": 0,
+        "listing_truncated": False,
+        "card_limit_reached": False,
+    }
 
 
 def test_local_sysfs_untrusted_device_link_is_degraded(
@@ -80,6 +115,9 @@ def test_local_sysfs_untrusted_device_link_is_degraded(
     )
     assert result.status == "unavailable"
     assert result.reason == "accelerator_metadata_unavailable"
+    assert enumeration["candidate_count"] == 1
+    assert enumeration["inspected_count"] == 0
+    assert enumeration["inspection_failures"] == 1
 
 
 def test_device_replacement_after_validation_is_not_read(
@@ -142,6 +180,41 @@ def test_accelerator_limit_marks_enumeration_partial(
     assert len(accelerators) == host.MAX_ACCELERATORS
     assert degraded is True
     assert enumeration["status"] == "partial"
+    assert enumeration["card_limit_reached"] is True
+    assert enumeration["candidate_count"] == host.MAX_ACCELERATORS + 1
+    assert enumeration["inspected_count"] == host.MAX_ACCELERATORS
+    assert enumeration["inspection_failures"] == 0
+
+
+def test_truncated_drm_listing_reports_discovered_candidates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bounded directory scan advertises both truncation and the card cap."""
+    class_dir = tmp_path / "sys" / "class" / "drm"
+    class_dir.mkdir(parents=True)
+    devices = tmp_path / "sys" / "devices"
+    for index in range(1, host.MAX_DRM_FILES + 2):
+        device_dir = devices / "pci0000:00" / f"0000:{index:02d}:00.0"
+        device_dir.mkdir(parents=True)
+        (device_dir / "vendor").write_text("0x1002\n", encoding="utf-8")
+        (device_dir / "class").write_text("0x030000\n", encoding="utf-8")
+        card = class_dir / f"card{index}"
+        card.mkdir()
+        (card / "device").symlink_to(device_dir, target_is_directory=True)
+    monkeypatch.setattr(host, "DRM_ROOT", class_dir)
+    monkeypatch.setattr(host, "SYS_DEVICES_ROOT", devices)
+
+    accelerators, _, degraded, enumeration = host._collect_accelerators(
+        ProbeLedger(LocalObservationSource()), system="Linux"
+    )
+
+    assert len(accelerators) == host.MAX_ACCELERATORS
+    assert degraded is True
+    assert enumeration["status"] == "partial"
+    assert enumeration["candidate_count"] == host.MAX_DRM_FILES
+    assert enumeration["inspected_count"] == host.MAX_ACCELERATORS
+    assert enumeration["inspection_failures"] == 0
+    assert enumeration["listing_truncated"] is True
     assert enumeration["card_limit_reached"] is True
 
 

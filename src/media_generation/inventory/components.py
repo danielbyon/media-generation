@@ -683,6 +683,14 @@ def _inspect_component(
         verified.get(key) != payload.get(key)
         for key in ("kind", "size_bytes", "mtime", "realpath")
     ):
+        base["status"] = "skipped"
+        base["reason"] = "component_replaced_during_inspection"
+        base["digest"] = {
+            "status": "unavailable",
+            "algorithm": "sha256",
+            "value": None,
+            "reason": "component_replaced_during_inspection",
+        }
         base["metadata"] = {
             "status": "skipped",
             "format": suffix[1:],

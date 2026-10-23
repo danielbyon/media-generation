@@ -8,6 +8,7 @@ is never promoted beyond advertised or declared evidence.
 
 from __future__ import annotations
 
+import errno
 import importlib.metadata
 import json
 import os
@@ -46,6 +47,7 @@ from .schema import (
 TRANSCRIPT_LIMIT = 1024 * 1024
 TRANSCRIPT_MARKER = b"\n[transcript truncated]\n"
 MAX_PUBLICATION_SNAPSHOT_BYTES = 32 * 1024 * 1024
+MAX_PUBLICATION_SYMLINK_TARGET_BYTES = 4096
 SEVERITY_ORDER = {"blocked": 0, "warning": 1, "info": 2}
 
 
@@ -440,7 +442,27 @@ def collect_inventory(options: InventoryOptions) -> InventoryResult:
     )
 
 
-_UNRESTORABLE = object()
+@dataclass(frozen=True, slots=True)
+class _MissingSnapshot:
+    """Destination did not exist before publication."""
+
+
+@dataclass(frozen=True, slots=True)
+class _FileSnapshot:
+    """Bounded bytes captured from one regular destination file."""
+
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _SymlinkSnapshot:
+    """Destination symlink target captured without following the link."""
+
+    target: str
+
+
+_MISSING_SNAPSHOT = _MissingSnapshot()
+_DestinationSnapshot = _MissingSnapshot | _FileSnapshot | _SymlinkSnapshot
 
 
 def _stage_file(path: Path, data: bytes) -> str:
@@ -471,23 +493,6 @@ def _stage_file(path: Path, data: bytes) -> str:
     return temporary
 
 
-def _write_atomic(path: Path, text: str) -> None:
-    """Write one UTF-8 file through an exclusive same-directory temporary file."""
-    temporary: str | None = None
-    try:
-        temporary = _stage_file(path, text.encode("utf-8"))
-        os.replace(temporary, path)
-        temporary = None
-    except OSError as error:
-        raise InventoryOutputError(f"could not write {path}: {error}") from error
-    finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
-
-
 def _write_atomic_bytes(path: Path, data: bytes) -> None:
     """Write bytes atomically for best-effort publication rollback."""
     temporary: str | None = None
@@ -503,28 +508,162 @@ def _write_atomic_bytes(path: Path, data: bytes) -> None:
                 pass
 
 
-def _snapshot(path: Path) -> bytes | object | None:
-    """Capture a regular destination for best-effort rollback."""
+def _snapshot_identity(facts: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    """Return filesystem identity and version fields used for race checks."""
+    return (
+        facts.st_dev,
+        facts.st_ino,
+        facts.st_mode,
+        facts.st_size,
+        facts.st_mtime_ns,
+        facts.st_ctime_ns,
+    )
+
+
+def _snapshot_error(path: Path, reason: str) -> InventoryOutputError:
+    """Return one structured pre-publication snapshot failure."""
+    return InventoryOutputError(
+        f"could not safely snapshot existing output {path}: {reason}"
+    )
+
+
+def _snapshot_symlink(path: Path, before: os.stat_result) -> _SymlinkSnapshot:
+    """Capture one symlink target without reading through it."""
+    if before.st_size > MAX_PUBLICATION_SYMLINK_TARGET_BYTES:
+        raise _snapshot_error(path, "symlink target exceeds snapshot limit")
+    try:
+        target = os.readlink(path)
+        after = path.lstat()
+    except OSError as error:
+        raise _snapshot_error(path, str(error)) from error
+    if not stat.S_ISLNK(after.st_mode) or _snapshot_identity(
+        after
+    ) != _snapshot_identity(before):
+        raise _snapshot_error(path, "destination changed while snapshotting")
+    try:
+        target_size = len(os.fsencode(target))
+    except (UnicodeError, ValueError) as error:
+        raise _snapshot_error(path, "symlink target is not encodable") from error
+    if target_size > MAX_PUBLICATION_SYMLINK_TARGET_BYTES:
+        raise _snapshot_error(path, "symlink target exceeds snapshot limit")
+    return _SymlinkSnapshot(target)
+
+
+def _snapshot(path: Path) -> _DestinationSnapshot:
+    """Capture one existing destination with no-follow, bounded reads.
+
+    The destination is opened with ``O_NOFOLLOW`` and checked through the
+    opened descriptor and the final path. Any unreadable, unsupported,
+    oversized, or changed destination aborts publication before either output
+    file is staged or replaced.
+    """
     try:
         facts = path.lstat()
     except FileNotFoundError:
-        return None
-    except OSError:
-        return _UNRESTORABLE
-    if not stat.S_ISREG(facts.st_mode) or facts.st_size > MAX_PUBLICATION_SNAPSHOT_BYTES:
-        return _UNRESTORABLE
+        return _MISSING_SNAPSHOT
+    except OSError as error:
+        raise _snapshot_error(path, str(error)) from error
+    if stat.S_ISLNK(facts.st_mode):
+        return _snapshot_symlink(path, facts)
+    if not stat.S_ISREG(facts.st_mode):
+        raise _snapshot_error(path, "existing destination is not a regular file")
+    if facts.st_size > MAX_PUBLICATION_SNAPSHOT_BYTES:
+        raise _snapshot_error(path, "existing destination exceeds snapshot limit")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    if not nofollow:
+        raise _snapshot_error(path, "platform cannot open without following links")
+    descriptor = -1
+    opened: os.stat_result
+    after: os.stat_result
+    data: bytes
     try:
-        return path.read_bytes()
-    except OSError:
-        return _UNRESTORABLE
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | nofollow
+            | nonblock
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _snapshot_error(path, "opened destination is not a regular file")
+        if _snapshot_identity(opened) != _snapshot_identity(facts):
+            raise _snapshot_error(path, "destination was replaced before opening")
+        if opened.st_size > MAX_PUBLICATION_SNAPSHOT_BYTES:
+            raise _snapshot_error(path, "existing destination exceeds snapshot limit")
+        chunks: list[bytes] = []
+        remaining = MAX_PUBLICATION_SNAPSHOT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        after = os.fstat(descriptor)
+    except OSError as error:
+        raise _snapshot_error(path, str(error)) from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    if len(data) > MAX_PUBLICATION_SNAPSHOT_BYTES:
+        raise _snapshot_error(path, "existing destination grew beyond snapshot limit")
+    if len(data) != opened.st_size:
+        raise _snapshot_error(path, "destination changed while snapshotting")
+    if _snapshot_identity(after) != _snapshot_identity(opened):
+        raise _snapshot_error(path, "destination changed while snapshotting")
+    try:
+        final = path.lstat()
+    except OSError as error:
+        raise _snapshot_error(path, str(error)) from error
+    if (
+        not stat.S_ISREG(final.st_mode)
+        or _snapshot_identity(final) != _snapshot_identity(opened)
+    ):
+        raise _snapshot_error(path, "destination changed while snapshotting")
+    return _FileSnapshot(data)
 
 
-def _restore(path: Path, snapshot: bytes | object | None) -> None:
+def _stage_symlink(path: Path, target: str) -> str:
+    """Create one exclusive temporary symlink beside its destination."""
+    for _ in range(16):
+        temporary = path.parent / f".{path.name}.{secrets.token_hex(8)}.tmp"
+        try:
+            os.symlink(target, temporary)
+        except FileExistsError:
+            continue
+        return str(temporary)
+    raise OSError(
+        errno.EEXIST,
+        "could not allocate an exclusive temporary symlink",
+        str(path),
+    )
+
+
+def _restore(path: Path, snapshot: _DestinationSnapshot) -> None:
     """Restore one destination after a failed second-file publication."""
-    if isinstance(snapshot, bytes):
-        _write_atomic_bytes(path, snapshot)
-    elif snapshot is None:
+    if isinstance(snapshot, _FileSnapshot):
+        _write_atomic_bytes(path, snapshot.data)
+    elif isinstance(snapshot, _SymlinkSnapshot):
+        temporary: str | None = None
+        try:
+            temporary = _stage_symlink(path, snapshot.target)
+            os.replace(temporary, path)
+            temporary = None
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
+    elif isinstance(snapshot, _MissingSnapshot):
         path.unlink(missing_ok=True)
+    else:
+        raise AssertionError(f"unsupported destination snapshot: {snapshot!r}")
 
 
 def write_inventory(

@@ -86,12 +86,6 @@ def _runtimes() -> list[dict[str, object]]:
 def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
     """Probe ordering and free/used memory must not affect the digest."""
     host = _host()
-    memory = host["memory"]
-    assert isinstance(memory, dict)
-    system = memory["system"]
-    assert isinstance(system, dict)
-    system["available_bytes"] = 1
-    host["identity"]["hostname"] = "different-host"  # type: ignore[index]
     accelerators = host["accelerators"]
     assert isinstance(accelerators, list)
     second_accelerator = copy.deepcopy(accelerators[0])
@@ -99,6 +93,13 @@ def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
     second_accelerator["pci_address"] = "0000:02:00.0"
     host["accelerators"] = [accelerators[0], second_accelerator]
     first = build_environment_fingerprint(host, _runtimes())
+
+    memory = host["memory"]
+    assert isinstance(memory, dict)
+    system = memory["system"]
+    assert isinstance(system, dict)
+    system["available_bytes"] = 1
+    host["identity"]["hostname"] = "different-host"  # type: ignore[index]
     host["accelerators"] = list(reversed(host["accelerators"]))
     runtimes = list(reversed(_runtimes()))
     second = build_environment_fingerprint(host, runtimes)
@@ -111,6 +112,7 @@ def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
 def test_fingerprint_changes_when_accelerator_enumeration_is_incomplete() -> None:
     """An unreadable GPU inventory is not equivalent to a verified GPU-free host."""
     observed = _host()
+    observed["accelerators"] = []
     observed["accelerator_enumeration"] = {
         "status": "observed",
         "candidate_count": 0,

@@ -96,10 +96,15 @@ PYTHONPATH=src python3 -m media_generation inventory \
 ```
 
 Collection is read-only unless version or device probes are explicitly enabled.
-The command stages `inventory.json` and `transcript.txt` through exclusive
-temporary files in the output directory, publishes the transcript first and the
-inventory second, and rolls the pair back if the second replacement fails. The
-two replacements are not crash-atomic; both files carry the same run identifier.
+Before staging, the command snapshots existing destinations without following
+final links. Missing paths, regular files up to 32 MiB, and symlink entries are
+supported. Unreadable, non-regular, oversized, or changing destinations abort
+before either file is replaced. The command stages `inventory.json` and
+`transcript.txt` through exclusive temporary files in the output directory,
+publishes the transcript first and the inventory second, and attempts a
+best-effort rollback if the second replacement fails. The two replacements are
+not crash-atomic; concurrent writers or a failed rollback can leave a mixed
+pair. Both files carry the same run identifier.
 Add `--manifest PATH`
 to declare model roots, runtime paths, bundles, recipes, capabilities, and probe
 policy. Version probes and device queries are opt-in. Full component hashing is

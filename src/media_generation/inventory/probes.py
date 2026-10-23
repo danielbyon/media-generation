@@ -690,6 +690,32 @@ class LocalObservationSource:
         }
 
 
+def _require_utf8_strings(value: object, *, label: str) -> None:
+    """Reject replay strings that cannot be encoded as UTF-8.
+
+    ``json.loads`` accepts escaped lone UTF-16 surrogates, but later transcript
+    rendering encodes replay text as UTF-8. Validate the bounded replay
+    document iteratively so malformed text becomes a structured ingestion
+    error rather than a runtime encoding failure.
+    """
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            try:
+                current.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise InventoryValidationError(
+                    f"{label} contains text that cannot be encoded as UTF-8"
+                ) from error
+        elif isinstance(current, dict):
+            for key, item in current.items():
+                pending.append(key)
+                pending.append(item)
+        elif isinstance(current, list):
+            pending.extend(current)
+
+
 class ReplayObservationSource:
     """Serve synthetic recorded observations for deterministic CLI tests.
 
@@ -713,6 +739,7 @@ class ReplayObservationSource:
             path, label="replay document", max_bytes=MAX_REPLAY_BYTES
         )
         data = require_mapping(payload, label="replay document")
+        _require_utf8_strings(data, label="replay document")
         if data.get("schema") != REPLAY_SCHEMA_NAME:
             raise InventoryValidationError(
                 f"replay schema must be {REPLAY_SCHEMA_NAME!r}"

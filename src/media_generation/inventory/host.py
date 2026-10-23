@@ -488,9 +488,10 @@ def _collect_accelerators(
         and isinstance(entry.get("name"), str)
         and re.fullmatch(r"card\d+", str(entry["name"]))
     )
-    card_limit_reached = len(cards) > MAX_ACCELERATORS
+    discovered_cards = cards
+    card_limit_reached = len(discovered_cards) > MAX_ACCELERATORS
     if card_limit_reached:
-        cards = cards[:MAX_ACCELERATORS]
+        cards = discovered_cards[:MAX_ACCELERATORS]
         degraded = True
         findings.append(
             Finding(
@@ -716,8 +717,8 @@ def _collect_accelerators(
             if inspection_failures or listing.truncated or card_limit_reached
             else "observed"
         ),
-        "candidate_count": len(cards),
-        "inspected_count": len(accelerators),
+        "candidate_count": len(discovered_cards),
+        "inspected_count": len(cards) - inspection_failures,
         "inspection_failures": inspection_failures,
         "listing_truncated": listing.truncated,
         "card_limit_reached": card_limit_reached,

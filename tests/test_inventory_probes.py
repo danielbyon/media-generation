@@ -321,6 +321,23 @@ def test_replay_rejects_invalid_utf8(tmp_path: Path) -> None:
         ReplayObservationSource.from_path(path)
 
 
+def test_replay_rejects_non_utf8_encodable_strings(tmp_path: Path) -> None:
+    """Escaped lone surrogates become structured replay validation errors."""
+    path = tmp_path / "replay.json"
+    payload = {
+        "schema": "media-generation.inventory-replay",
+        "schema_version": 1,
+        "synthetic": True,
+        "observations": {
+            "run:which:test": {"status": "ok", "text": "\ud800"},
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(InventoryValidationError, match="cannot be encoded as UTF-8"):
+        ReplayObservationSource.from_path(path)
+
+
 def test_replay_missing_file_is_a_validation_error(tmp_path: Path) -> None:
     """An inaccessible replay path preserves the structured error contract."""
     with pytest.raises(InventoryValidationError, match="not readable"):
