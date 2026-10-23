@@ -253,3 +253,55 @@ class GenerationArtifact:
             "sha256": self.sha256,
             "created_at": self.created_at,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ImportedArtifact:
+    """An independent image identity with operator-approved import provenance."""
+
+    artifact_id: str
+    path: str
+    media_type: str
+    image_format: str
+    width: int
+    height: int
+    file_size: int
+    sha256: str
+    created_at: str
+    import_provenance: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "import_provenance", _freeze(self.import_provenance))
+
+    def to_dict(self) -> dict[str, object]:
+        """Return import metadata without inventing generation identifiers."""
+        return {
+            "artifact_id": self.artifact_id, "origin": "imported", "path": self.path,
+            "media_type": self.media_type, "format": self.image_format,
+            "width": self.width, "height": self.height, "file_size": self.file_size,
+            "sha256": self.sha256, "created_at": self.created_at,
+            "import_provenance": _thaw(self.import_provenance),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactSource:
+    """An ordered parent of a new artifact; reference means actual conditioning.
+
+    Source denotes an input image being edited, derivation denotes a related
+    rendition, and inspiration records creative origin without conditioning.
+    Order is the source's position in the publication's source tuple.
+    """
+
+    artifact_id: str
+    role: str = "reference"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.artifact_id, str) or not _ARTIFACT_ID.fullmatch(self.artifact_id):
+            raise InputValidationError("lineage sources require stable artifact IDs")
+        if not isinstance(self.role, str) or self.role not in {"reference", "source", "derivation", "inspiration"}:
+            raise InputValidationError("unsupported artifact lineage role")
+
+    def to_dict(self) -> dict[str, str]:
+        """Serialize the parent identity and its declared relationship."""
+        return {"artifact_id": self.artifact_id, "role": self.role}

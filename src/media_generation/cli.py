@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from .domain import GenerationRequest
+from .domain import GenerationRequest, ArtifactSource
 from .errors import (
     GenerationExecutionError,
     IdempotencyConflictError,
@@ -16,6 +16,9 @@ from .errors import (
     RecordNotFoundError,
     UnknownReferenceError,
     UnsupportedCapabilityError,
+    PublicationError,
+    PublicationIncompleteError,
+    ArtifactIntegrityError,
 )
 from .service import GenerationService
 
@@ -53,6 +56,8 @@ def build_parser() -> argparse.ArgumentParser:
         ("request", "retrieve an immutable request snapshot"),
         ("job", "retrieve durable job state"),
         ("artifact", "retrieve a logical image artifact"),
+        ("integrity", "verify authoritative artifact bytes"),
+        ("lineage", "inspect ordered artifact parents and children"),
     ):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--db", required=True, type=Path, help="SQLite database path")
@@ -61,6 +66,17 @@ def build_parser() -> argparse.ArgumentParser:
     provenance = commands.add_parser("provenance", help="retrieve request, job, attempt, and artifact")
     provenance.add_argument("--db", required=True, type=Path, help="SQLite database path")
     provenance.add_argument("--job-id", required=True, help="generation job ID")
+    ingest = commands.add_parser("import", help="operator-approved local image ingestion")
+    ingest.add_argument("--db", required=True, type=Path)
+    ingest.add_argument("--output-dir", required=True, type=Path)
+    ingest.add_argument("--approved-root", required=True, type=Path,
+                        help="explicitly authorize reads beneath this source directory")
+    ingest.add_argument("--source", required=True, help="relative path beneath the approved root")
+    ingest.add_argument("--sources-json", default="[]",
+                        help="ordered lineage parents: [{artifact_id, role}]")
+    reconcile = commands.add_parser("reconcile", help="recover owned publications and inspect integrity")
+    reconcile.add_argument("--db", required=True, type=Path)
+    reconcile.add_argument("--output-dir", required=True, type=Path)
     return parser
 
 
@@ -76,6 +92,24 @@ def main(arguments: Sequence[str] | None = None) -> int:
             _write_json(result.to_dict(), sys.stdout)
             return 0
 
+        if options.command in {"import", "reconcile"}:
+            service = GenerationService(options.db, options.output_dir)
+            if options.command == "reconcile":
+                response = service.reconcile()
+            else:
+                parents = json.loads(options.sources_json, object_pairs_hook=_unique_object_pairs)
+                if not isinstance(parents, list) or not all(isinstance(item, dict) for item in parents):
+                    raise InputValidationError("sources JSON must be an array of artifact_id/role objects")
+                try:
+                    sources = tuple(ArtifactSource(**item) for item in parents)
+                except TypeError as error:
+                    raise InputValidationError(f"invalid lineage source: {error}") from error
+                response = service.import_image(options.approved_root, options.source, sources=sources).to_dict()
+            _write_json(response, sys.stdout)
+            if options.command == "reconcile" and response["status"] == "attention_required":
+                return 1
+            return 0
+
         service = GenerationService(options.db, Path("."))
         if options.command == "request":
             response = service.get_request(options.id)
@@ -83,6 +117,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
             response = service.get_job(options.id).to_dict()
         elif options.command == "artifact":
             response = service.get_artifact(options.id).to_dict()
+        elif options.command == "integrity":
+            response = service.get_integrity(options.id)
+        elif options.command == "lineage":
+            response = service.get_lineage(options.id)
         else:
             response = service.get_provenance(options.job_id)
         _write_json(response, sys.stdout)
@@ -99,6 +137,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("not_found", str(error), 4)
     except GenerationExecutionError as error:
         return _write_error("generation_failed", str(error), 1, job_id=error.job_id)
+    except PublicationIncompleteError as error:
+        return _write_error("publication_incomplete", str(error), 1,
+                            job_id=error.job_id, recovery=error.recovery)
+    except PublicationError as error:
+        return _write_error("publication_incomplete", str(error), 1)
+    except ArtifactIntegrityError as error:
+        return _write_error("artifact_integrity", str(error), 1)
+    except OSError as error:
+        return _write_error("storage_error", str(error), 1)
     except (json.JSONDecodeError, UnicodeError, ValueError) as error:
         return _write_error("validation_error", f"invalid request JSON: {error}", 2)
 
