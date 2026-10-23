@@ -295,14 +295,16 @@ def test_failed_second_replacement_restores_previous_symlink_pair(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Rollback restores symlink entries without touching their targets."""
-    outside = tmp_path / "outside.txt"
-    outside.write_text("outside remains", encoding="utf-8")
+    inventory_target = tmp_path / "inventory-target.txt"
+    inventory_target.write_text("inventory target remains", encoding="utf-8")
+    transcript_target = tmp_path / "transcript-target.txt"
+    transcript_target.write_text("transcript target remains", encoding="utf-8")
     output = tmp_path / "out"
     output.mkdir()
     inventory = output / "inventory.json"
     transcript = output / "transcript.txt"
-    inventory.symlink_to(outside)
-    transcript.symlink_to(outside)
+    inventory.symlink_to(inventory_target)
+    transcript.symlink_to(transcript_target)
     real_replace = report.os.replace
     calls = {"count": 0}
 
@@ -318,9 +320,10 @@ def test_failed_second_replacement_restores_previous_symlink_pair(
 
     assert inventory.is_symlink()
     assert transcript.is_symlink()
-    assert Path(os.readlink(inventory)) == outside
-    assert Path(os.readlink(transcript)) == outside
-    assert outside.read_text(encoding="utf-8") == "outside remains"
+    assert Path(os.readlink(inventory)) == inventory_target
+    assert Path(os.readlink(transcript)) == transcript_target
+    assert inventory_target.read_text(encoding="utf-8") == "inventory target remains"
+    assert transcript_target.read_text(encoding="utf-8") == "transcript target remains"
     assert not list(output.glob(".*.tmp"))
 
 
