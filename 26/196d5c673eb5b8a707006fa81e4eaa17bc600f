@@ -1,0 +1,63 @@
+README.md
+  s_1a3bd5713e1743::t_ae6140fa688fca 71
+  s_1a3bd5713e1743::t_d8c775d97000f9 86
+tests/test_artifact_migration.py
+  s_1a3bd5713e1743::t_ace1a4004cac99 32,43,72,79,119-121
+  s_1a3bd5713e1743::t_c5eb64e5644d31 100
+  s_1a3bd5713e1743::t_73533ca7d2e8d2 16,23-25,52,88-89,103-105
+  s_1a3bd5713e1743::t_682f9176140e8b 21-22,107-115,129
+  s_1a3bd5713e1743::t_ae6140fa688fca 10-12,55,165-166
+  s_1a3bd5713e1743::t_42410633a20b2b 26,36-42,46-51,73
+  s_1a3bd5713e1743::t_d258767f391736 116-118
+src/media_generation/cli.py
+  s_1a3bd5713e1743::t_ae6140fa688fca 104-107
+  s_537f13372bbf30::t_868055557f1878 65-68,120-121
+src/media_generation/publication.py
+  s_1a3bd5713e1743::t_c7d927593eef87 358-384,405-411
+  s_1a3bd5713e1743::t_0eae9292338761 446-447,450,497-498
+  s_1a3bd5713e1743::t_ae6140fa688fca 23,342
+  s_1a3bd5713e1743::t_c98acff15ffb5b 334-336,341
+  s_1a3bd5713e1743::t_e3ede066245fbf 24
+  s_1a3bd5713e1743::t_9f41958e34c71c 455,461,482-496,499
+  s_1a3bd5713e1743::t_682f9176140e8b 448,453-454
+  s_1a3bd5713e1743::t_ca0fc7164df8a9 440,449,451-452,471-478,480-481
+  s_1a3bd5713e1743::t_560e0486ac4519 137-147,442,445,456-460,532,534-538,540-546
+  s_1a3bd5713e1743::t_d948d6c7604bc3 435-439,441,539,548
+  s_1a3bd5713e1743::t_42410633a20b2b 479
+  s_1a3bd5713e1743::t_eb03724e667849 136
+  s_1a3bd5713e1743::t_ac7efd8ef0606d 500
+tests/test_artifact_cli.py
+  s_1a3bd5713e1743::t_ae6140fa688fca 38-47,52,62,64,79
+tests/test_artifact_publication.py
+  s_1a3bd5713e1743::t_e17d913c60b965 1161-1174
+  s_1a3bd5713e1743::t_ae6140fa688fca 1082,1098-1110,1127-1129
+src/media_generation/service.py
+  s_1a3bd5713e1743::t_ae6140fa688fca 74
+  s_537f13372bbf30::t_dd61ad97d89032 237-238,241
+src/media_generation/store.py
+  s_1a3bd5713e1743::t_48e3715c156906 523-530
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "26196d5c673eb5b8a707006fa81e4eaa17bc600f",
+  "prompts": {},
+  "sessions": {
+    "s_1a3bd5713e1743": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1672f-adf3-7b71-b759-7db8ae374454",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_537f13372bbf30": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a15836-9c35-71e2-891b-d288adcbda2a",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
