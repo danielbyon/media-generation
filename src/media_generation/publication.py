@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Iterator
 
 from .domain import ArtifactSource, GenerationArtifact, ImportedArtifact
-from .errors import PublicationError
-from .images import ImageInfo, open_regular, validate_image
+from .errors import InputValidationError, PublicationError
+from .images import ImageInfo, validate_image
 from .store import SQLiteStore
 from .ownership import read_token, create_token
 
@@ -132,6 +132,18 @@ class PublicationManager:
                 self._identity(os.fstat(directory)) != (record['root_dev'], record['root_ino'])):
                 raise PublicationError('destination ownership token or inode changed')
         return token
+
+    @staticmethod
+    def _check_recorded_root(directory: int, record: dict[str, object]) -> None:
+        """Verify the directory pinned by one immutable publication journal row."""
+        try:
+            token = read_token(directory, _ROOT_TOKEN)
+        except OSError as error:
+            raise PublicationError('recorded destination ownership token is unavailable') from error
+        if (token.decode('ascii') != record['root_token'] or
+                (os.fstat(directory).st_dev, os.fstat(directory).st_ino) !=
+                (record['root_dev'], record['root_ino'])):
+            raise PublicationError('recorded destination ownership token or inode changed')
 
     @staticmethod
     def _owned(directory: int, name: str, record: dict[str, object]) -> bool:
@@ -319,10 +331,15 @@ class PublicationManager:
                 if record['state'] == 'committed':
                     self._clean_stage(directory, record)
                     return self.store.get_artifact(artifact_id)
+                reject_input = job_id is None and record['state'] == 'allocated' and isinstance(
+                    error, InputValidationError
+                )
                 if record['state'] == 'allocated':
                     self._abandon(directory, record, str(error))
                 else:
                     self.store.update_publication(publication_id, error=str(error))
+                if reject_input:
+                    raise
                 raise PublicationError(f'{publication_id}: {error}; inspect/reconcile publication') from error
 
     @staticmethod
@@ -337,6 +354,33 @@ class PublicationManager:
     def _matches(info: ImageInfo, artifact: Artifact) -> bool:
         return all(getattr(info, key) == getattr(artifact, key) for key in (
             'media_type', 'image_format', 'width', 'height', 'file_size', 'sha256'))
+
+    @contextmanager
+    def _verified_image(
+        self, directory: int, name: str, artifact: Artifact, *,
+        expected_identity: tuple[int, int] | None = None,
+        stage_token: bytes | None = None,
+    ) -> Iterator[tuple[BinaryIO, os.stat_result]]:
+        """Open and verify one named image relative to an authoritative directory."""
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory,
+        )
+        with os.fdopen(descriptor, 'rb') as content:
+            observed = os.fstat(content.fileno())
+            if (not stat.S_ISREG(observed.st_mode)
+                    or (expected_identity is not None
+                        and self._identity(observed) != expected_identity)
+                    or (stage_token is not None
+                        and read_token(content.fileno(), _STAGE_TOKEN) != stage_token)):
+                raise PublicationError('published file changed while opening')
+            if not self._matches(validate_image(content), artifact):
+                raise PublicationError('published bytes do not match validated metadata')
+            current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if self._identity(observed) != self._identity(current):
+                raise PublicationError('stored path changed during verification')
+            yield content, observed
 
     def _finish(self, directory: int, record: dict[str, object]) -> None:
         """Replay a validated publication without invoking a generation adapter."""
@@ -358,16 +402,13 @@ class PublicationManager:
             raise PublicationError('final path collision: existing content is not owned by publication')
         self.checkpoint('file_published')
         # Decode and hash the final inode too, including on every recovery.
-        descriptor = os.open(final_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                             dir_fd=directory)
-        with os.fdopen(descriptor, 'rb') as content:
-            observed = os.fstat(content.fileno())
-            if (not stat.S_ISREG(observed.st_mode)
-                or self._identity(observed) != (record['stage_dev'], record['stage_ino'])
-                or read_token(content.fileno(), _STAGE_TOKEN) != str(record['publication_id']).encode('ascii')):
-                raise PublicationError('published file changed while opening')
-            if not self._matches(validate_image(content), artifact):
-                raise PublicationError('published bytes do not match validated metadata')
+        with self._verified_image(
+            directory,
+            final_name,
+            artifact,
+            expected_identity=(record['stage_dev'], record['stage_ino']),
+            stage_token=str(record['publication_id']).encode('ascii'),
+        ) as (content, observed):
             os.fsync(content.fileno())
             self.checkpoint('before_directory_sync')
             os.fsync(directory)
@@ -391,11 +432,33 @@ class PublicationManager:
     def integrity(self, artifact_id: str) -> dict[str, object]:
         """Observe current content without altering the immutable artifact record."""
         artifact = self.store.get_artifact(artifact_id)
+        publication = self.store.publication_for_artifact(artifact_id)
+        return self._integrity(artifact, publication)
+
+    def _integrity(self, artifact: Artifact,
+                   publication: dict[str, object] | None) -> dict[str, object]:
+        """Inspect using journal or durable lineage ownership evidence."""
+        artifact_id = artifact.artifact_id
+        artifact_path = Path(artifact.path)
         status, detail = 'ok', None
         try:
-            with open_regular(Path(artifact.path)) as content:
-                if not self._matches(validate_image(content), artifact):
-                    status, detail = 'corrupt', 'stored content differs from immutable metadata'
+            if publication is None:
+                stored_root = artifact_path.parent
+                artifact_root = stored_root.resolve(strict=True)
+                authorized_root = self.root.resolve(strict=True)
+                linked_to_root = (artifact_root != authorized_root and
+                                  stored_root == artifact_root and
+                                  self._legacy_linked_to_root(artifact_id, authorized_root))
+                if artifact_root != authorized_root and not linked_to_root:
+                    status, detail = 'missing', 'artifact belongs to a different output root'
+                else:
+                    self._verified_integrity_path(artifact_root, artifact)
+            else:
+                owner_root = Path(str(publication['root']))
+                if (artifact_path.parent != owner_root or
+                        artifact_path.name != publication['final_name']):
+                    raise PublicationError('artifact path does not match its publication journal')
+                self._verified_integrity_path(owner_root, artifact, publication)
         except FileNotFoundError:
             status, detail = 'missing', 'authoritative file is missing'
         except Exception as error:
@@ -404,6 +467,36 @@ class PublicationManager:
         checked = now()
         self.store.record_integrity(artifact_id, status, checked, detail)
         return {'artifact_id': artifact_id, 'status': status, 'checked_at': checked, 'detail': detail}
+
+    def _legacy_linked_to_root(self, artifact_id: str, authorized_root: Path) -> bool:
+        """Require a direct durable edge to an artifact owned by the caller's root."""
+        lineage = self.store.get_lineage(artifact_id)
+        neighbors = lineage['parents'] + lineage['children']
+        for edge in neighbors:
+            neighbor_id = (edge['source_id'] if edge['target_id'] == artifact_id
+                           else edge['target_id'])
+            neighbor = self.store.get_artifact(str(neighbor_id))
+            if Path(neighbor.path).parent == authorized_root:
+                return True
+        return False
+
+    def _verified_integrity_path(
+        self,
+        root: Path,
+        artifact: Artifact,
+        publication: dict[str, object] | None = None,
+    ) -> None:
+        """Verify bytes and path identity under the selected owner root."""
+        with destination_directory(root, create=False) as directory:
+            if publication is not None:
+                self._check_recorded_root(directory, publication)
+            with self._verified_image(directory, Path(artifact.path).name, artifact):
+                if self._identity(os.fstat(directory)) != self._identity(
+                    os.stat(root, follow_symlinks=False)
+                ):
+                    raise PublicationError('stored path changed during verification')
+                if Path(artifact.path).parent.resolve(strict=True) != root:
+                    raise PublicationError('stored path changed during verification')
 
     def reconcile(self) -> dict[str, object]:
         """Recover owned journal entries and report unknown files without deleting them."""
@@ -436,10 +529,23 @@ class PublicationManager:
                     result.update(state=current['state'], error=str(error))
                 results.append(result)
             integrity = []
+            authorized_root = self.root.resolve(strict=True)
             for artifact in self.store.artifacts():
-                if Path(artifact.path).parent == self.root:
+                publication = self.store.publication_for_artifact(artifact.artifact_id)
+                if publication is not None:
+                    if str(publication['root']) == str(self.root):
+                        if publication['final_name']:
+                            known.add(str(publication['final_name']))
+                        integrity.append(self._integrity(artifact, publication))
+                    continue
+                artifact_root = Path(artifact.path).parent
+                try:
+                    artifact_root = artifact_root.resolve(strict=True)
+                except OSError:
+                    continue
+                if artifact_root == authorized_root:
                     known.add(Path(artifact.path).name)
-                    integrity.append(self.integrity(artifact.artifact_id))
+                    integrity.append(self._integrity(artifact, None))
             orphans = []
             try:
                 token = read_token(directory, _ROOT_TOKEN).decode('ascii')

@@ -520,6 +520,14 @@ class SQLiteStore:
             return [dict(row) for row in connection.execute(
                 "SELECT * FROM artifact_publications WHERE root = ? ORDER BY created_at", (root,))]
 
+    def publication_for_artifact(self, artifact_id: str) -> dict[str, object] | None:
+        """Read the publication journal that owns an artifact, if one exists."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM artifact_publications WHERE artifact_id = ?", (artifact_id,)
+            ).fetchone()
+        return None if row is None else dict(row)
+
     def publication(self, publication_id: str) -> dict[str, object]:
         """Read the durable decision, including after lost commit acknowledgement."""
         with self._connection() as connection:

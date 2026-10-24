@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--db", required=True, type=Path, help="SQLite database path")
         command.add_argument("--id", required=True, help=f"{name} ID")
+        if name == "integrity":
+            command.add_argument(
+                "--output-dir", required=True, type=Path, help="authoritative artifact directory"
+            )
 
     provenance = commands.add_parser("provenance", help="retrieve request, job, attempt, and artifact")
     provenance.add_argument("--db", required=True, type=Path, help="SQLite database path")
@@ -97,7 +101,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
             if options.command == "reconcile":
                 response = service.reconcile()
             else:
-                parents = json.loads(options.sources_json, object_pairs_hook=_unique_object_pairs)
+                try:
+                    parents = json.loads(options.sources_json, object_pairs_hook=_unique_object_pairs)
+                except (json.JSONDecodeError, UnicodeError) as error:
+                    raise InputValidationError(f"invalid sources JSON: {error}") from error
                 if not isinstance(parents, list) or not all(isinstance(item, dict) for item in parents):
                     raise InputValidationError("sources JSON must be an array of artifact_id/role objects")
                 try:
@@ -110,7 +117,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 return 1
             return 0
 
-        service = GenerationService(options.db, Path("."))
+        inspection_root = options.output_dir if options.command == "integrity" else Path(".")
+        service = GenerationService(options.db, inspection_root)
         if options.command == "request":
             response = service.get_request(options.id)
         elif options.command == "job":

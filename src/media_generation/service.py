@@ -71,7 +71,7 @@ class GenerationService:
         *, publication_checkpoint: Checkpoint | None = None,
     ) -> None:
         self._store = SQLiteStore(database_path)
-        self.output_directory = Path(os.path.abspath(output_directory.expanduser()))
+        self.output_directory = output_directory.expanduser().resolve()
         self.adapter: GenerationAdapter = adapter or DeterministicCpuAdapter()
         self._publication = PublicationManager(self._store, self.output_directory, publication_checkpoint)
 
@@ -234,10 +234,11 @@ class GenerationService:
                 if self.get_integrity(source.artifact_id)["status"] != "ok":
                     raise ArtifactIntegrityError("lineage input is not a trusted image")
         artifact_id = _new_id("art")
-        with open_approved_source(approved_root.expanduser(), relative_path) as source_file:
+        authorized_root = approved_root.expanduser().resolve()
+        with open_approved_source(authorized_root, relative_path) as source_file:
             source_stat = os.fstat(source_file.fileno())
             provenance = {
-                "approved_root": str(Path(os.path.abspath(approved_root.expanduser()))),
+                "approved_root": str(authorized_root),
                 "relative_path": relative_path,
                 "source_device": source_stat.st_dev, "source_inode": source_stat.st_ino,
                 "source_size": source_stat.st_size, "source_mtime_ns": source_stat.st_mtime_ns,

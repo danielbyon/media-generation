@@ -1079,7 +1079,7 @@ def test_t03_identity_duplicate_import_bytes_keep_independent_provenance_and_lin
 @pytest.mark.parametrize("operation", ("generated", "imported"))
 @pytest.mark.parametrize("damage", ("missing", "truncated", "different-valid-image", "symlink"))
 def test_t03_integrity_damage_is_reported_without_rewriting_provenance_or_success(
-    workspace: _Workspace, operation: str, damage: str,
+    workspace: _Workspace, operation: str, damage: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """T03 integrity: observations of lost or corrupt files never rewrite immutable publication facts."""
     service = workspace.service()
@@ -1095,7 +1095,19 @@ def test_t03_integrity_damage_is_reported_without_rewriting_provenance_or_succes
     elif damage == "truncated":
         path.write_bytes(path.read_bytes()[:20])
     elif damage == "different-valid-image":
-        _write_png(path, (222, 3, 19))
+        replacement = path.with_name(".concurrent-valid-image")
+        _write_png(replacement, (222, 3, 19))
+        original_validate = publication_module.validate_image
+        replaced = False
+
+        def replace_path_after_open(content: BinaryIO):
+            nonlocal replaced
+            if not replaced:
+                replacement.replace(path)
+                replaced = True
+            return original_validate(content)
+
+        monkeypatch.setattr(publication_module, "validate_image", replace_path_after_open)
     else:
         path.unlink()
         path.symlink_to(workspace.source_root / "input.png")
@@ -1112,6 +1124,9 @@ def test_t03_integrity_damage_is_reported_without_rewriting_provenance_or_succes
             assert service.get_job(record["job_id"]).to_dict() == job
         if damage == "missing":
             assert not path.exists()
+        elif damage == "different-valid-image":
+            assert path.is_symlink() is False
+            assert path.read_bytes() != damaged_bytes
         else:
             assert _identity(path) == damaged_identity
             assert path.read_bytes() == damaged_bytes
@@ -1142,6 +1157,20 @@ def test_t03_ownership_publication_tokens_are_unique_and_destination_token_is_st
     assert _token(workspace.output, ROOT_TOKEN) == root_token
     assert _token(Path(first_artifact.path), STAGE_TOKEN) == first_token
     assert _token(Path(second_artifact.path), STAGE_TOKEN) == second_token
+
+    service_a = workspace.service()
+    service_b = GenerationService(workspace.database, workspace.output.with_name("artifacts-b"))
+    artifact_b = service_b.import_image(workspace.source_root, "input.png")
+    assert service_b.get_integrity(artifact_b.artifact_id)["status"] == "ok"
+    foreign = service_a.get_integrity(artifact_b.artifact_id)
+    assert foreign["status"] == "ok"
+    assert foreign["detail"] is None
+    foreign_path = Path(artifact_b.path)
+    foreign_path.write_bytes(foreign_path.read_bytes() + b"\0")
+    assert service_a.get_integrity(artifact_b.artifact_id)["status"] == "corrupt"
+    foreign_path.unlink()
+    assert service_a.get_integrity(artifact_b.artifact_id)["status"] == "missing"
+    assert service_a.get_integrity(first_artifact.artifact_id)["status"] == "ok"
 
 
 @pytest.mark.parametrize("owner", ("root", "stage"))

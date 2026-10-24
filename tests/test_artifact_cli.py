@@ -35,11 +35,21 @@ def test_import_reference_generation_and_inspection_across_processes(tmp_path):
     source = tmp_path/'approved';source.mkdir()
     image = source/'image.untrusted-extension'
     Image.new('RGB',(13,17),'green').save(image,format='JPEG')
-    database,root = tmp_path/'studio.sqlite',tmp_path/'artifacts'
+    real_root = tmp_path/'artifact-store'
+    real_root.mkdir()
+    root = tmp_path/'artifacts'
+    root.symlink_to(real_root, target_is_directory=True)
+    database = tmp_path/'studio.sqlite'
+    malformed_lineage = cli(tmp_path,'import','--db',database,'--output-dir',root,
+                            '--approved-root',source,'--source',image.name,
+                            '--sources-json','{',success=False)
+    assert malformed_lineage['error']['code'] == 'validation_error'
+    assert malformed_lineage['error']['message'].startswith('invalid sources JSON:')
     imported = cli(tmp_path,'import','--db',database,'--output-dir',root,
                    '--approved-root',source,'--source',image.name)
     assert imported['format'] == 'JPEG' and imported['origin'] == 'imported'
     assert Path(imported['path']).read_bytes() == image.read_bytes()
+    assert Path(imported['path']).parent == real_root.resolve()
     assert 'job_id' not in imported
     generated = cli(tmp_path,'submit','--db',database,'--output-dir',root,
                     '--idempotency-key','from-import','--request-json',json.dumps({
@@ -49,9 +59,9 @@ def test_import_reference_generation_and_inspection_across_processes(tmp_path):
         'media_type','format','width','height','file_size','sha256','created_at'}
     parents = cli(tmp_path,'lineage','--db',database,'--id',generated['artifact_id'])['parents']
     assert parents[0]['source_id'] == imported['artifact_id'] and parents[0]['role'] == 'reference'
-    assert cli(tmp_path,'integrity','--db',database,'--id',imported['artifact_id'])['status']=='ok'
+    assert cli(tmp_path,'integrity','--db',database,'--output-dir',root,'--id',imported['artifact_id'])['status']=='ok'
     Path(imported['path']).write_bytes(b'externally changed')
-    assert cli(tmp_path,'integrity','--db',database,'--id',imported['artifact_id'])['status']=='corrupt'
+    assert cli(tmp_path,'integrity','--db',database,'--output-dir',root,'--id',imported['artifact_id'])['status']=='corrupt'
     assert cli(tmp_path,'artifact','--db',database,'--id',imported['artifact_id']) == imported
     report=cli(tmp_path,'reconcile','--db',database,'--output-dir',root,
                success=False,inspection_failure=True)
@@ -66,7 +76,7 @@ def test_cli_rejects_unapproved_or_malformed_source_without_artifact(tmp_path,so
     database=tmp_path/'studio.sqlite'
     error=cli(tmp_path,'import','--db',database,'--output-dir',tmp_path/'images',
               '--approved-root',source,'--source',source_name,success=False)
-    assert error['error']['code'] in {'validation_error','publication_incomplete'}
+    assert error['error']['code'] == 'validation_error'
     with sqlite3.connect(database) as connection:
         assert connection.execute('SELECT count(*) FROM generation_artifacts').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM generation_jobs').fetchone()[0] == 0

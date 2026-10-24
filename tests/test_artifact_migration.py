@@ -7,31 +7,52 @@ from pathlib import Path
 import pytest
 
 from media_generation.adapters import DeterministicCpuAdapter
-from media_generation.domain import ArtifactSource, GenerationPlan, GenerationRequest
+from media_generation.domain import (
+    ArtifactSource, GenerationPlan, GenerationRequest, ResolvedReference,
+)
 from media_generation.service import GenerationService
 
 
-def legacy_database(tmp_path):
+def legacy_database(tmp_path, *, cross_root=False):
     """Construct a T01 database directly, without invoking the new store at all."""
     database = tmp_path / 'legacy.sqlite3'
     root = tmp_path / 'images'
     root.mkdir()
+    root_alias = tmp_path / 'images-alias'
+    root_alias.symlink_to(root, target_is_directory=True)
+    foreign_root = tmp_path / 'foreign-images'
+    if cross_root:
+        foreign_root.mkdir()
+    artifact_count = 4 if cross_root else 2
     timestamp = '2026-10-21T00:00:00+00:00'
     adapter = DeterministicCpuAdapter()
     artifacts = []
     with sqlite3.connect(database) as connection:
         connection.executescript((Path(__file__).parent / 'fixtures/t01-schema.sql').read_text())
-        for index in range(2):
+        for index in range(artifact_count):
             suffix = f'{index+1:032x}'
             request_id, job_id, attempt_id, slot_id, artifact_id = (
                 prefix + suffix for prefix in ('req_', 'job_', 'att_', 'slot_', 'art_'))
-            references = () if index == 0 else (artifacts[0]['artifact_id'],)
+            source_index = {1:0, 2:1}.get(index)
+            references = (() if source_index is None else
+                          (artifacts[source_index]['artifact_id'],))
+            resolved_references = (() if source_index is None else (
+                ResolvedReference(artifacts[source_index]['artifact_id'],
+                                  artifacts[source_index]['sha256'],
+                                  Path(artifacts[source_index]['path'])),
+                ))
             request = GenerationRequest('Legacy image', seed=index, width=8, height=9,
                                         reference_ids=references)
-            destination = root / f'{artifact_id}.png'
+            if cross_root and index in (1, 3):
+                artifact_root = foreign_root
+            elif cross_root and index == 2:
+                artifact_root = root
+            else:
+                artifact_root = root_alias
+            destination = artifact_root / f'{artifact_id}.png'
             with destination.open('w+b') as output:
                 adapter.generate(GenerationPlan(job_id, attempt_id, request.prompt, index,
-                                 8, 9, (), 'primary', slot_id), output)
+                                 8, 9, resolved_references, 'primary', slot_id), output)
             connection.execute('INSERT INTO generation_requests VALUES (?,?,?,?)',
                 (request_id, request.canonical_json(), request.digest(), timestamp))
             connection.execute('INSERT INTO generation_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
@@ -48,12 +69,14 @@ def legacy_database(tmp_path):
             connection.execute('INSERT INTO generation_artifacts VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
                                tuple(artifact.values()))
             artifacts.append(artifact)
+    if cross_root:
+        return database,root,artifacts[:3],artifacts[3]
     return database,root,artifacts
 
 
 def test_real_t01_database_migrates_without_changing_generated_json_or_records(tmp_path):
     """TAC-3: legacy retrieval, references, idempotency, and bytes survive migration."""
-    database,root,artifacts = legacy_database(tmp_path)
+    database,root,artifacts,unlinked = legacy_database(tmp_path,cross_root=True)
     with sqlite3.connect(database) as connection:
         original = {table:connection.execute(f'SELECT * FROM {table}').fetchall()
                     for table in ('generation_requests','generation_jobs','generation_attempts')}
@@ -62,6 +85,8 @@ def test_real_t01_database_migrates_without_changing_generated_json_or_records(t
     for artifact in artifacts:
         assert service.get_artifact(artifact['artifact_id']).to_dict() == artifact
         assert service.get_integrity(artifact['artifact_id'])['status'] == 'ok'
+    assert Path(artifacts[0]['path']).parent.is_symlink()
+    assert Path(artifacts[1]['path']).parent == tmp_path/'foreign-images'
     assert service.get_lineage(artifacts[1]['artifact_id'])['parents'] == [{
         'source_id':artifacts[0]['artifact_id'],'target_id':artifacts[1]['artifact_id'],
         'role':'reference','position':0}]
@@ -72,11 +97,28 @@ def test_real_t01_database_migrates_without_changing_generated_json_or_records(t
         for table,rows in original.items():
             assert connection.execute(f'SELECT * FROM {table}').fetchall() == rows
     generated = service.submit('legacy-reference',GenerationRequest('Use legacy',seed=8,
-        reference_ids=(artifacts[0]['artifact_id'],)))
+        reference_ids=tuple(artifact['artifact_id'] for artifact in artifacts[:2])))
     assert generated.status == 'succeeded'
     restarted = GenerationService(database,root)
-    assert restarted.get_lineage(generated.artifact_id)['parents'][0]['source_id'] == artifacts[0]['artifact_id']
+    parents = restarted.get_lineage(generated.artifact_id)['parents']
+    assert [parent['source_id'] for parent in parents] == [
+        artifacts[0]['artifact_id'], artifacts[1]['artifact_id']]
     assert restarted.get_artifact(artifacts[0]['artifact_id']).to_dict() == artifacts[0]
+    legacy = artifacts[0]
+    legacy_path = Path(legacy['path'])
+    alias = legacy_path.parent
+    replacement = tmp_path/'replacement-images'
+    replacement.mkdir()
+    (replacement/legacy_path.name).write_bytes(legacy_path.read_bytes())
+    alias.unlink()
+    alias.symlink_to(replacement, target_is_directory=True)
+    assert service.get_integrity(legacy['artifact_id'])['status'] == 'missing'
+    foreign_path = Path(artifacts[1]['path'])
+    foreign_path.write_bytes(foreign_path.read_bytes() + b'\0')
+    assert service.get_integrity(artifacts[1]['artifact_id'])['status'] == 'corrupt'
+    unlinked_report = service.get_integrity(unlinked['artifact_id'])
+    assert unlinked_report['status'] == 'missing'
+    assert unlinked_report['detail'] == 'artifact belongs to a different output root'
 
 
 def test_import_identity_roles_and_transactional_graph_constraints(tmp_path):
@@ -84,6 +126,7 @@ def test_import_identity_roles_and_transactional_graph_constraints(tmp_path):
     database,root,legacy = legacy_database(tmp_path)
     service = GenerationService(database,root)
     source_root = Path(legacy[0]['path']).parent
+    assert source_root.is_symlink()
     first = service.import_image(source_root,Path(legacy[0]['path']).name)
     second = service.import_image(source_root,Path(legacy[0]['path']).name,sources=(
         ArtifactSource(first.artifact_id,'inspiration'),
@@ -119,8 +162,8 @@ def test_import_identity_roles_and_transactional_graph_constraints(tmp_path):
             connection.execute('INSERT INTO artifact_edges VALUES (?,?,?,?)',
                                (first.artifact_id,second.artifact_id,'reference',3))
     with sqlite3.connect(database) as connection:
-        for statement in ('UPDATE artifact_edges SET role="inspiration"','DELETE FROM artifact_edges',
-                          'UPDATE generation_artifacts SET sha256="changed"','DELETE FROM generation_artifacts'):
+        for statement in ("UPDATE artifact_edges SET role='inspiration'",'DELETE FROM artifact_edges',
+                          "UPDATE generation_artifacts SET sha256='changed'",'DELETE FROM generation_artifacts'):
             with pytest.raises(sqlite3.IntegrityError):
                 connection.execute(statement)
     assert service.get_lineage(second.artifact_id)['parents'] == parents

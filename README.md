@@ -68,7 +68,7 @@ resolved prompt, seed, adapter identity and configuration, validated reference
 IDs, output-slot identity, and effective dimensions. The artifact record keeps
 a unique logical ID separate from the SHA-256 hash of its file contents.
 
-The synchronous adapter interface receives a resolved `GenerationPlan` and a
+The synchronous adapter interface receives a resolved `GenerationPlan` and an
 open staging stream owned by the service. Adapters write that stream without
 reopening a pathname or closing the stream. The bundled
 `deterministic-cpu-png-v1` adapter writes an ordinary RGB PNG using only the
@@ -83,7 +83,7 @@ Explicitly approve a local source directory and import a relative filename:
 ```sh
 media-generation import --db ./studio.sqlite3 --output-dir ./artifacts \
   --approved-root /absolute/path/to/approved-images --source portrait.jpg
-media-generation integrity --db ./studio.sqlite3 --id <artifact-id>
+media-generation integrity --db ./studio.sqlite3 --output-dir ./artifacts --id <artifact-id>
 media-generation lineage --db ./studio.sqlite3 --id <artifact-id>
 media-generation reconcile --db ./studio.sqlite3 --output-dir ./artifacts
 ```
