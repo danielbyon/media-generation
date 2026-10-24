@@ -138,7 +138,7 @@ verification path. The `integrity --output-dir` argument supplies inspection
 context for legacy artifacts that have no publication record.
 
 Migration keeps historical T01 artifact paths unchanged. A legacy artifact in a
-different directory is trusted only when it has a direct durable edge to an
+different directory is trusted only when it has a direct durable edge to a
 neighbor without a publication record whose parent resolves to the configured
 output root and whose bytes still match its immutable metadata. The neighbor is
 reopened with descriptor-relative, no-follow checks under the configured root.
