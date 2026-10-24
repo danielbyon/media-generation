@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 from .adapters import DeterministicCpuAdapter, GenerationAdapter
 from .domain import (
     GenerationArtifact,
+    ImportedArtifact,
+    ArtifactSource,
     GenerationJob,
     GenerationPlan,
     GenerationRequest,
@@ -19,12 +22,16 @@ from .domain import (
 )
 from .errors import (
     GenerationExecutionError,
+    ArtifactIntegrityError,
     IdempotencyConflictError,
     InputValidationError,
+    PublicationIncompleteError,
     RecordNotFoundError,
     UnsupportedCapabilityError,
 )
 from .store import SQLiteStore
+from .images import ImageInfo, open_approved_source, copy_source
+from .publication import PublicationManager, Checkpoint
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,10 +68,12 @@ class GenerationService:
         database_path: Path,
         output_directory: Path,
         adapter: GenerationAdapter | None = None,
+        *, publication_checkpoint: Checkpoint | None = None,
     ) -> None:
         self._store = SQLiteStore(database_path)
         self.output_directory = output_directory.expanduser().resolve()
         self.adapter: GenerationAdapter = adapter or DeterministicCpuAdapter()
+        self._publication = PublicationManager(self._store, self.output_directory, publication_checkpoint)
 
     def submit(self, idempotency_key: str, request: GenerationRequest) -> SubmissionResult:
         """Create or reuse a job under the current adapter's resolved configuration.
@@ -73,6 +82,8 @@ class GenerationService:
         request and matches the persisted adapter identity, configuration, and
         resolved output directory.
         New jobs are committed before their adapter executes synchronously.
+        Recoverable publication errors identify a still-running job and require
+        reconciliation; only terminal failures raise GenerationExecutionError.
         """
         key = _validate_idempotency_key(idempotency_key)
         request_digest = request.digest()
@@ -149,66 +160,127 @@ class GenerationService:
             output_slot_id=pending.output_slot_id,
         )
         artifact_id = _new_id("art")
-        destination = self.output_directory / f"{artifact_id}.png"
         try:
             self._validate_reference_artifacts(pending.references)
-            self.output_directory.mkdir(parents=True, exist_ok=True)
-            metadata = self.adapter.generate(plan, destination)
-            if not destination.is_file():
-                raise RuntimeError("adapter returned without writing an image file")
-            if metadata.width != request.width or metadata.height != request.height:
-                raise RuntimeError("adapter image dimensions do not match the persisted request")
-            size = destination.stat().st_size
-            if size <= 0:
-                raise RuntimeError("adapter wrote an empty image file")
-            artifact = GenerationArtifact(
-                artifact_id=artifact_id,
-                job_id=pending.job_id,
-                attempt_id=pending.attempt_id,
-                output_slot_id=pending.output_slot_id,
-                path=str(destination),
-                media_type=metadata.media_type,
-                image_format=metadata.image_format,
-                width=metadata.width,
-                height=metadata.height,
-                file_size=size,
-                sha256=_sha256_file(destination),
-                created_at=_now(),
-            )
-            self._store.complete_execution(artifact, _now())
         except Exception as error:
-            try:
-                destination.unlink(missing_ok=True)
-            except OSError:
-                pass
             message = f"adapter {self.adapter.adapter_id!r} failed: {error}"
             self._store.fail_execution(pending.job_id, pending.attempt_id, message, _now())
             raise GenerationExecutionError(pending.job_id, message) from error
 
-        return SubmissionResult(
-            request_id=pending.request_id,
-            job_id=pending.job_id,
-            status="succeeded",
-            output_slot_id=pending.output_slot_id,
-            artifact_id=artifact_id,
-        )
+        metadata = None
 
-    @staticmethod
-    def _validate_reference_artifacts(
-        references: tuple[ResolvedReference, ...],
-    ) -> None:
-        """Reject reference files that are missing or differ from their saved hash."""
+        def write_image(destination: Path, staged: BinaryIO) -> None:
+            nonlocal metadata
+            metadata = self.adapter.generate(plan, staged)
+
+        def make_artifact(info: ImageInfo, destination: Path) -> GenerationArtifact:
+            if metadata is None or (
+                metadata.width != request.width or metadata.height != request.height
+                or info.width != request.width or info.height != request.height
+                or metadata.image_format != info.image_format or metadata.media_type != info.media_type
+            ):
+                raise RuntimeError("adapter image metadata does not match the decoded image and persisted request")
+            return GenerationArtifact(
+                artifact_id=artifact_id, job_id=pending.job_id, attempt_id=pending.attempt_id,
+                output_slot_id=pending.output_slot_id, path=str(destination),
+                media_type=info.media_type, image_format=info.image_format,
+                width=info.width, height=info.height, file_size=info.file_size,
+                sha256=info.sha256, created_at=_now())
+
+        try:
+            self._publication.publish(write_image, make_artifact, artifact_id=artifact_id,
+                job_id=pending.job_id, attempt_id=pending.attempt_id,
+                sources=tuple(ArtifactSource(ref.artifact_id) for ref in pending.references))
+        except Exception as error:
+            # The store refuses to fail ready or committed publications. This
+            # also records errors opening the destination before journaling.
+            self._store.fail_execution(pending.job_id, pending.attempt_id, str(error), _now())
+            # A reconciler may commit after the publisher releases its lock.
+            # Classify the durable job outcome rather than the earlier exception.
+            submission = self._submission_for_job(pending.job_id)
+            if submission.status == "succeeded":
+                return submission
+            if submission.status == "running":
+                raise PublicationIncompleteError(pending.job_id, str(error)) from error
+            message = f"adapter {self.adapter.adapter_id!r} failed: {error}"
+            raise GenerationExecutionError(pending.job_id, message) from error
+
+        return self._submission_for_job(pending.job_id)
+
+    def _validate_reference_artifacts(self, references: tuple[ResolvedReference, ...]) -> None:
+        """Require current authoritative bytes to match the immutable artifact."""
         for reference in references:
-            try:
-                actual_sha256 = _sha256_file(reference.path)
-            except OSError as error:
-                raise RuntimeError(
-                    f"reference artifact {reference.artifact_id!r} is missing or unreadable"
-                ) from error
-            if actual_sha256 != reference.content_sha256:
-                raise RuntimeError(
-                    f"reference artifact {reference.artifact_id!r} failed SHA-256 validation"
+            observation = self._publication.integrity(reference.artifact_id)
+            if observation["status"] != "ok":
+                raise ArtifactIntegrityError(
+                    f"reference artifact {reference.artifact_id!r} is missing or failed SHA-256/image validation: "
+                    f"{observation['detail']}"
                 )
+
+    def import_image(self, approved_root: Path, relative_path: str, *,
+                     sources: tuple[ArtifactSource, ...] = ()) -> ImportedArtifact:
+        """Import a local image under an explicit operator-granted source root.
+
+        This administrative boundary accepts a relative filename beneath the
+        approved root. GenerationRequest continues to accept only artifact IDs.
+        Each invocation creates a new identity, even for identical image bytes.
+        """
+        sources = tuple(sources)
+        if len({(source.artifact_id, source.role) for source in sources}) != len(sources):
+            raise InputValidationError("lineage sources cannot repeat an artifact/role pair")
+        for source in sources:
+            self._store.get_artifact(source.artifact_id)
+            if source.role in {"reference", "source"}:
+                if self.get_integrity(source.artifact_id)["status"] != "ok":
+                    raise ArtifactIntegrityError("lineage input is not a trusted image")
+        artifact_id = _new_id("art")
+        # Keep every operator-supplied component intact. The source opener pins
+        # each directory with O_NOFOLLOW before provenance is recorded.
+        approved_path = approved_root.expanduser()
+        with open_approved_source(approved_path, relative_path) as source_file:
+            source_stat = os.fstat(source_file.fileno())
+            provenance = {
+                "approved_root": str(approved_path),
+                "relative_path": relative_path,
+                "source_device": source_stat.st_dev, "source_inode": source_stat.st_ino,
+                "source_size": source_stat.st_size, "source_mtime_ns": source_stat.st_mtime_ns,
+                "source_ctime_ns": source_stat.st_ctime_ns,
+                "imported_at": _now(),
+            }
+
+            def copy_image(destination: Path, staged: BinaryIO) -> None:
+                # Copy into the publisher's pinned descriptor without reopening
+                # either side through a caller-controlled path.
+                copy_source(source_file, staged)
+                after = os.fstat(source_file.fileno())
+                if any(getattr(source_stat, field) != getattr(after, field) for field in (
+                    "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns"
+                )):
+                    raise InputValidationError("source changed after import approval")
+
+            def make_artifact(info: ImageInfo, destination: Path) -> ImportedArtifact:
+                return ImportedArtifact(
+                    artifact_id=artifact_id, path=str(destination), media_type=info.media_type,
+                    image_format=info.image_format, width=info.width, height=info.height,
+                    file_size=info.file_size, sha256=info.sha256, created_at=_now(),
+                    import_provenance=provenance)
+
+            artifact = self._publication.publish(copy_image, make_artifact,
+                artifact_id=artifact_id, sources=sources)
+        assert isinstance(artifact, ImportedArtifact)
+        return artifact
+
+    def get_integrity(self, artifact_id: str) -> dict[str, object]:
+        """Verify current stored bytes while preserving immutable metadata."""
+        return self._publication.integrity(artifact_id)
+
+    def get_lineage(self, artifact_id: str) -> dict[str, object]:
+        """Inspect ordered parents and children of a logical artifact."""
+        return self._store.get_lineage(artifact_id)
+
+    def reconcile(self) -> dict[str, object]:
+        """Recover owned publications and report unresolved storage conditions."""
+        return self._publication.reconcile()
 
     def get_request(self, request_id: str) -> dict[str, object]:
         """Retrieve one immutable request snapshot by ID."""
@@ -218,7 +290,7 @@ class GenerationService:
         """Retrieve durable job state by ID."""
         return self._store.get_job(job_id)
 
-    def get_artifact(self, artifact_id: str) -> GenerationArtifact:
+    def get_artifact(self, artifact_id: str) -> GenerationArtifact | ImportedArtifact:
         """Retrieve a logical artifact and its persisted image metadata."""
         return self._store.get_artifact(artifact_id)
 
@@ -280,12 +352,3 @@ def _now() -> str:
 def _canonical_json(value: object) -> str:
     """Serialize adapter settings and effective parameters deterministically."""
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def _sha256_file(path: Path) -> str:
-    """Hash a generated file without loading the full image into memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as image_file:
-        for block in iter(lambda: image_file.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()

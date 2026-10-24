@@ -7,8 +7,7 @@ import json
 import struct
 import zlib
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from .domain import GenerationPlan
 
@@ -43,8 +42,12 @@ class GenerationAdapter(Protocol):
     def configuration(self) -> dict[str, object]:
         """Return the stable, JSON-compatible configuration to persist per job."""
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> ImageMetadata:
-        """Write one image file for a previously persisted plan."""
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> ImageMetadata:
+        """Write to the publisher's open staging stream without closing it.
+
+        Adapters must not reopen or replace its pathname. The publisher owns
+        validation, flush/sync ordering, and final filesystem publication.
+        """
 
 
 class DeterministicCpuAdapter:
@@ -68,7 +71,7 @@ class DeterministicCpuAdapter:
         """Describe the implementation version retained in job provenance."""
         return {"configuration_version": 1, "image_format": "PNG", "pattern_version": 1}
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> ImageMetadata:
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> ImageMetadata:
         """Write a valid RGB PNG whose bytes are stable for equivalent plan input."""
         material = json.dumps(
             {
@@ -107,8 +110,10 @@ class DeterministicCpuAdapter:
         png.extend(_png_chunk(b"tEXt", f"GenerationSeed\x00{plan.seed}".encode("ascii")))
         png.extend(_png_chunk(b"IDAT", zlib.compress(bytes(scanlines), level=9)))
         png.extend(_png_chunk(b"IEND", b""))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(png)
+        destination.seek(0)
+        destination.write(png)
+        destination.truncate()
+        destination.flush()
         return ImageMetadata("image/png", "PNG", plan.width, plan.height)
 
 

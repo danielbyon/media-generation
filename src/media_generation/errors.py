@@ -25,6 +25,30 @@ class RecordNotFoundError(GenerationError):
     """A requested persisted record does not exist."""
 
 
+class PublicationError(GenerationError):
+    """Publication needs inspection or reconciliation before it can complete."""
+
+
+class PublicationIncompleteError(PublicationError):
+    """A generated publication is recoverable and its job is still running.
+
+    The job ID identifies the durable execution to inspect. Recovery guidance
+    applies to that execution without creating a new request or attempt.
+    """
+
+    def __init__(self, job_id: str, message: str) -> None:
+        super().__init__(message)
+        self.job_id = job_id
+        self.recovery = (
+            "Run reconcile with the same database and output directory, then "
+            "resubmit the same request and idempotency key."
+        )
+
+
+class ArtifactIntegrityError(GenerationError):
+    """Authoritative image content is missing, corrupt, or unsafe to read."""
+
+
 class GenerationExecutionError(GenerationError):
     """An adapter failed after a job and attempt were durably created."""
 

@@ -6,6 +6,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import BinaryIO
 from threading import Barrier
 
 import pytest
@@ -396,7 +397,7 @@ class _FailAfterWritingAdapter:
         self.persisted_attempt = None
         self.persisted_output_directory: str | None = None
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> object:
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
         assert self.service is not None
         self.persisted_job = self.service.get_job(plan.job_id)
         self.persisted_output_directory = self.service._store.get_resolved_output_directory(
@@ -404,7 +405,7 @@ class _FailAfterWritingAdapter:
         )
         self.persisted_request = self.service.get_request(self.persisted_job.request_id)
         self.persisted_attempt = self.service.get_provenance(plan.job_id)["attempt"]
-        destination.write_bytes(b"partial image that must not become an artifact")
+        destination.write(b"partial image that must not become an artifact")
         raise RuntimeError("controlled adapter failure")
 
 
@@ -414,7 +415,7 @@ class _TrackingCpuAdapter(DeterministicCpuAdapter):
     def __init__(self) -> None:
         self.calls = 0
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> object:
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
         self.calls += 1
         return super().generate(plan, destination)
 
@@ -464,7 +465,11 @@ def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
     assert job.status == "failed"
     assert provenance["attempt"]["status"] == "failed"
     assert provenance["artifact"] is None
-    assert list((tmp_path / "artifacts").iterdir()) == []
+    # The permanent storage mutex survives cleanup so another process cannot
+    # lock a different inode while reconciliation is active.
+    assert {path.name for path in (tmp_path / "artifacts").iterdir()} == {
+        ".artifact-publication.lock", ".artifact-cleanup"
+    }
 
 
 def test_output_directory_file_does_not_mask_durable_execution_failure(
