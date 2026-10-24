@@ -51,8 +51,13 @@ hard links, durable extended attributes, advisory `flock`, and file and director
 `fsync`. Its components must
 be real directories. A permanent `.artifact-publication.lock` serializes all
 publishers and reconciliation for that destination, including separate processes.
-Never unlink that file or edit the private `.artifact-cleanup` directory while
-the store is in use. A stable random directory ownership token is synced and
+External writers, operators, and unrelated processes must never unlink that lock
+file or edit the private `.artifact-cleanup` directory while the store is in use.
+The store's own publication and reconciliation operations may create, inspect,
+and remove entries in that directory while holding the publication lock and after
+verifying the directory and captured inode ownership tokens; an unrecognized or
+replaced cleanup directory is reported and preserved rather than adopted. A
+stable random directory ownership token is synced and
 bound into each publication record; a reused inode number alone is insufficient
 proof of ownership. This is a filesystem publication
 mutex; execution scheduling, attempt authorization, leases, and fencing are not

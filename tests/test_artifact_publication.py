@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -30,6 +31,7 @@ from typing import BinaryIO, Callable
 
 import pytest
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 from media_generation import publication as publication_module
 from media_generation import store as store_module
@@ -1588,3 +1590,233 @@ def test_t03_publication_fifo_replacing_final_is_opened_nonblocking_and_preserve
             assert _identity(final) == fifo_identity
             assert stage.read_bytes() == staged_bytes
             _assert_unpublished(workspace, record, "running")
+
+
+def _store_snapshot(workspace: _Workspace) -> dict[str, list[dict]]:
+    """Read every durable table a rejected publication transition could touch."""
+    tables = (
+        "artifact_publications",
+        "generation_artifacts",
+        "artifact_edges",
+        "generation_jobs",
+        "generation_attempts",
+    )
+    return {
+        table: _rows(workspace.database, f"SELECT * FROM {table} ORDER BY rowid")
+        for table in tables
+    }
+
+
+def test_t03_lifecycle_general_update_cannot_set_committed_or_publish(
+    workspace: _Workspace,
+) -> None:
+    """T03 journal API: metadata updates cannot bypass the commit transaction."""
+    record = _crash_at(workspace, "before_stage_write")
+    publication_id = str(record["publication_id"])
+    before = _store_snapshot(workspace)
+    store = workspace.service()._store
+
+    with pytest.raises(ValueError, match="unsupported publication update"):
+        store.update_publication(publication_id, state="committed")
+
+    assert _store_snapshot(workspace) == before
+    assert store.publication(publication_id)["state"] == "allocated"
+    assert _rows(workspace.database, "SELECT * FROM generation_artifacts") == []
+    assert _rows(workspace.database, "SELECT * FROM artifact_edges") == []
+    job = workspace.service().get_job(str(record["job_id"]))
+    assert job.status == "running"
+    assert job.artifact_id is None
+
+
+def test_t03_lifecycle_allocated_to_ready_transition_records_metadata(
+    workspace: _Workspace,
+) -> None:
+    """T03 journal API: ready is an explicit allocated-to-ready transition."""
+    record = _crash_at(workspace, "before_stage_write")
+    publication_id = str(record["publication_id"])
+    store = workspace.service()._store
+
+    store.mark_publication_ready(publication_id, "final.png", '{"artifact_id": "test"}')
+
+    durable = store.publication(publication_id)
+    assert durable["state"] == "ready"
+    assert durable["final_name"] == "final.png"
+    assert durable["artifact_json"] == '{"artifact_id": "test"}'
+    with pytest.raises(RuntimeError, match="not allocated"):
+        store.abandon_publication(publication_id, "too late")
+    assert store.publication(publication_id)["state"] == "ready"
+
+
+def test_t03_lifecycle_allocated_to_abandoned_transition_records_error(
+    workspace: _Workspace,
+) -> None:
+    """T03 journal API: abandonment is an explicit allocated-to-abandoned transition."""
+    record = _crash_at(workspace, "before_stage_write")
+    publication_id = str(record["publication_id"])
+    store = workspace.service()._store
+
+    store.abandon_publication(publication_id, "injected abandonment")
+
+    durable = store.publication(publication_id)
+    assert durable["state"] == "abandoned"
+    assert durable["error"] == "injected abandonment"
+    with pytest.raises(RuntimeError, match="not allocated"):
+        store.mark_publication_ready(publication_id, "final.png", "{}")
+    assert store.publication(publication_id)["state"] == "abandoned"
+
+
+def test_t03_lifecycle_committed_publication_rejects_transition_methods(
+    workspace: _Workspace,
+) -> None:
+    """T03 journal API: committed publications accept no further lifecycle transition."""
+    service = workspace.service()
+    artifact = service.import_image(workspace.source_root, "input.png")
+    record = _publication_for(workspace, artifact.artifact_id)
+    assert record["state"] == "committed"
+
+    with pytest.raises(RuntimeError, match="not allocated"):
+        service._store.mark_publication_ready(
+            str(record["publication_id"]), Path(artifact.path).name, "{}"
+        )
+    with pytest.raises(RuntimeError, match="not allocated"):
+        service._store.abandon_publication(str(record["publication_id"]), "too late")
+
+    assert service._store.publication(str(record["publication_id"]))["state"] == "committed"
+
+
+def _png_bytes(size: tuple[int, int], color: tuple[int, int, int]) -> bytes:
+    """Encode one ordinary image independently of the publication adapter."""
+    stream = io.BytesIO()
+    Image.new("RGB", size, color).save(stream, format="PNG")
+    return stream.getvalue()
+
+
+def _png_bytes_of_size(encoded_size: int, color: tuple[int, int, int]) -> bytes:
+    """Encode a valid image padded to an exact length with a text chunk."""
+    base = _png_bytes((17, 13), color)
+    if len(base) == encoded_size:
+        return base
+    # A tEXt chunk occupies 12 bytes of envelope plus its key, separator, and value.
+    padding = encoded_size - len(base) - 20
+    assert padding >= 0, (len(base), encoded_size)
+    metadata = PngInfo()
+    metadata.add_text("Comment", "x" * padding)
+    stream = io.BytesIO()
+    Image.new("RGB", (17, 13), color).save(stream, format="PNG", pnginfo=metadata)
+    replacement = stream.getvalue()
+    assert len(replacement) == encoded_size, (len(replacement), encoded_size)
+    return replacement
+
+
+def _rewrite_in_place_during_validation(
+    monkeypatch: pytest.MonkeyPatch, replacement: bytes, path: Path,
+) -> list[tuple[os.stat_result, os.stat_result]]:
+    """Rewrite validated bytes in the same inode before verification returns."""
+    real_validate = publication_module.validate_image
+    observations: list[tuple[os.stat_result, os.stat_result]] = []
+    expected_identity = _identity(path)
+
+    def validate_then_rewrite(content: BinaryIO):
+        info = real_validate(content)
+        descriptor = os.open(path, os.O_RDWR)
+        before = os.fstat(descriptor)
+        assert len(replacement) == before.st_size
+        os.pwrite(descriptor, replacement, 0)
+        os.ftruncate(descriptor, len(replacement))
+        os.fsync(descriptor)
+        changed = os.fstat(descriptor)
+        # Force a distinct timestamp so detection never depends on clock resolution.
+        os.utime(descriptor, ns=(changed.st_atime_ns, changed.st_mtime_ns + 1_000_000_000))
+        after = os.fstat(descriptor)
+        os.close(descriptor)
+        assert _identity_from_stat(before) == _identity_from_stat(after)
+        assert _identity_from_stat(after) == expected_identity
+        assert before.st_size == after.st_size
+        assert (before.st_mtime_ns, before.st_ctime_ns) != (after.st_mtime_ns, after.st_ctime_ns)
+        observations.append((before, after))
+        return info
+
+    monkeypatch.setattr(publication_module, "validate_image", validate_then_rewrite)
+    return observations
+
+
+def _identity_from_stat(value: os.stat_result) -> tuple[int, int]:
+    """Expose the device and inode pair of an already-open descriptor snapshot."""
+    return value.st_dev, value.st_ino
+
+
+@pytest.mark.parametrize("operation", ("generated", "imported"))
+def test_t03_integrity_same_inode_rewrite_during_validation_is_corrupt(
+    workspace: _Workspace, operation: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T03 integrity: an equal-length in-place rewrite cannot be reported as trusted."""
+    service = workspace.service()
+    invoked = _invoke(service, workspace, operation)
+    artifact = service.get_artifact(invoked.artifact_id)
+    assert service.get_integrity(artifact.artifact_id)["status"] == "ok"
+    replacement = _png_bytes_of_size(artifact.file_size, (200, 30, 70))
+    assert len(replacement) == Path(artifact.path).stat().st_size
+
+    observations = _rewrite_in_place_during_validation(
+        monkeypatch, replacement, Path(artifact.path)
+    )
+    report = service.get_integrity(artifact.artifact_id)
+
+    assert report["status"] == "corrupt"
+    assert "changed during validation" in str(report["detail"])
+    assert len(observations) == 1
+
+
+def test_t03_generation_reference_rejects_same_inode_rewrite_before_adapter(
+    workspace: _Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T03 reference admission: changed content fails before adapter execution."""
+    service = workspace.service()
+    parent = service.import_image(workspace.source_root, "input.png")
+    calls: list[tuple[object, ...]] = []
+
+    def record_adapter_call(*args: object, **kwargs: object) -> None:
+        calls.append(args)
+
+    monkeypatch.setattr(service.adapter, "generate", record_adapter_call)
+    _rewrite_in_place_during_validation(
+        monkeypatch,
+        _png_bytes_of_size(parent.file_size, (200, 30, 70)),
+        Path(parent.path),
+    )
+
+    with pytest.raises(GenerationExecutionError, match="reference artifact"):
+        service.submit("rewrite-reference", _request((parent.artifact_id,)))
+
+    assert calls == []
+    jobs = _rows(workspace.database, "SELECT * FROM generation_jobs")
+    assert len(jobs) == 1
+    assert jobs[0]["status"] == "failed"
+    assert service.get_job(str(jobs[0]["job_id"])).artifact_id is None
+
+
+def test_t03_reconciliation_reports_same_inode_rewrite_without_rewriting_success(
+    workspace: _Workspace, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T03 reconciliation: integrity observations cannot rewrite committed history."""
+    service = workspace.service()
+    result = service.submit("reconcile-rewrite", _request())
+    artifact = service.get_artifact(result.artifact_id)
+    record = _only_publication(workspace)
+    frozen_artifact = artifact.to_dict()
+    frozen_lineage = service.get_lineage(artifact.artifact_id)
+    frozen_job = service.get_job(str(record["job_id"])).to_dict()
+    _rewrite_in_place_during_validation(
+        monkeypatch,
+        _png_bytes_of_size(artifact.file_size, (200, 30, 70)),
+        Path(artifact.path),
+    )
+
+    report = service.reconcile()
+
+    assert report["status"] == "attention_required"
+    assert [entry["status"] for entry in report["integrity"]] == ["corrupt"]
+    assert service.get_artifact(artifact.artifact_id).to_dict() == frozen_artifact
+    assert service.get_lineage(artifact.artifact_id) == frozen_lineage
+    assert service.get_job(str(record["job_id"])).to_dict() == frozen_job
+    assert _only_publication(workspace)["state"] == "committed"

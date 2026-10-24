@@ -504,8 +504,8 @@ class SQLiteStore:
                 f"VALUES ({','.join('?' for _ in fields)})", tuple(record.values()))
 
     def update_publication(self, publication_id: str, **values: object) -> None:
-        """Update the private journal while the destination publication lock is held."""
-        allowed = {"stage_dev", "stage_ino", "state", "final_name", "artifact_json", "error"}
+        """Update journal metadata without changing its publication lifecycle state."""
+        allowed = {"stage_dev", "stage_ino", "final_name", "artifact_json", "error"}
         if not values or not set(values) <= allowed:
             raise ValueError("unsupported publication update")
         with self._connection(transaction=True) as connection:
@@ -513,6 +513,29 @@ class SQLiteStore:
                 f"UPDATE artifact_publications SET {','.join(key+' = ?' for key in values)} "
                 "WHERE publication_id = ? AND state != 'committed'",
                 (*values.values(), publication_id))
+
+    def mark_publication_ready(self, publication_id: str, final_name: str,
+                               artifact_json: str) -> None:
+        """Record validated publication metadata through an allocated-to-ready transition."""
+        with self._connection(transaction=True) as connection:
+            updated = connection.execute(
+                "UPDATE artifact_publications SET state = 'ready', final_name = ?, "
+                "artifact_json = ? WHERE publication_id = ? AND state = 'allocated'",
+                (final_name, artifact_json, publication_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("publication is not allocated for the ready transition")
+
+    def abandon_publication(self, publication_id: str, error: str) -> None:
+        """Abandon an allocated publication through its explicit lifecycle transition."""
+        with self._connection(transaction=True) as connection:
+            updated = connection.execute(
+                "UPDATE artifact_publications SET state = 'abandoned', error = ? "
+                "WHERE publication_id = ? AND state = 'allocated'",
+                (error, publication_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("publication is not allocated for abandonment")
 
     def publications(self, root: str) -> list[dict[str, object]]:
         """List durable publication decisions for an exact authoritative root."""

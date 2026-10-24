@@ -99,6 +99,14 @@ class PublicationManager:
     def _identity(value: os.stat_result) -> tuple[int, int]:
         return value.st_dev, value.st_ino
 
+    @staticmethod
+    def _same_file_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
+        """Compare the inode and metadata that can change during an in-place rewrite."""
+        return all(
+            getattr(first, field) == getattr(second, field)
+            for field in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+        )
+
     def _assert_root(self, directory: int) -> None:
         with destination_directory(self.root, create=False) as current:
             if self._identity(os.fstat(current)) != self._identity(os.fstat(directory)):
@@ -256,7 +264,7 @@ class PublicationManager:
             return f'cleanup_pending: {error}'
 
     def _abandon(self, directory: int, record: dict[str, object], error: str) -> str:
-        self.store.update_publication(str(record['publication_id']), state='abandoned', error=error)
+        self.store.abandon_publication(str(record['publication_id']), error)
         if record['job_id'] is not None:
             self.store.fail_execution(str(record['job_id']), str(record['attempt_id']), error, now())
         return self._clean_stage(directory, record)
@@ -313,9 +321,11 @@ class PublicationManager:
                     self.checkpoint('before_file_sync')
                     os.fsync(staged.fileno())
                     self.checkpoint('file_synced')
-                    self.store.update_publication(publication_id, state='ready',
-                        final_name=Path(artifact.path).name,
-                        artifact_json=json.dumps(artifact.to_dict(), sort_keys=True))
+                    self.store.mark_publication_ready(
+                        publication_id,
+                        Path(artifact.path).name,
+                        json.dumps(artifact.to_dict(), sort_keys=True),
+                    )
                     self.checkpoint('ready_committed')
                     record = self.store.publication(publication_id)
                     self._finish(directory, record)
@@ -377,10 +387,14 @@ class PublicationManager:
                 raise PublicationError('published file changed while opening')
             if not self._matches(validate_image(content), artifact):
                 raise PublicationError('published bytes do not match validated metadata')
+            validated = os.fstat(content.fileno())
+            if not self._same_file_snapshot(observed, validated):
+                raise PublicationError('published file changed during validation')
             current = os.stat(name, dir_fd=directory, follow_symlinks=False)
-            if self._identity(observed) != self._identity(current):
+            if (not stat.S_ISREG(current.st_mode)
+                    or not self._same_file_snapshot(validated, current)):
                 raise PublicationError('stored path changed during verification')
-            yield content, observed
+            yield content, validated
 
     def _finish(self, directory: int, record: dict[str, object]) -> None:
         """Replay a validated publication without invoking a generation adapter."""
