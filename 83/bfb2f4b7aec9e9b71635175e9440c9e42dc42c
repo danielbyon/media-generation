@@ -1,0 +1,32 @@
+src/media_generation/store.py
+  s_cdc67647c63380::t_7e22aa23fb1a5c 507-508,517-538
+  s_cdc67647c63380::t_09de2d95b43b66 539
+docs/architecture/artifact-publication.md
+  s_cdc67647c63380::t_9dd2e7c6a519fe 54-60
+src/media_generation/publication.py
+  s_cdc67647c63380::t_b67d0d35e6bda1 102-109,390-392,394-395,397
+  s_cdc67647c63380::t_0cb164a139619f 267,324-328
+tests/test_artifact_publication.py
+  s_cdc67647c63380::t_03d7118b8490d3 1712,1717,1721,1731,1733,1760-1762,1783-1785,1810-1812
+  s_cdc67647c63380::t_4efe1c59f92cf4 1754-1755
+  s_cdc67647c63380::t_7b9c7ba73ac8c0 15
+  s_cdc67647c63380::t_1304ee06c98466 1795
+  s_cdc67647c63380::t_d96481962306d4 1593-1693,1711,1713-1716,1718-1720,1722-1730,1732,1734-1753,1756,1758-1759,1763-1781,1787-1794,1796-1808,1814-1822
+  s_cdc67647c63380::t_e9b5bcea23e34b 34,1694-1710,1757,1782,1786,1809,1813
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "83bfb2f4b7aec9e9b71635175e9440c9e42dc42c",
+  "prompts": {},
+  "sessions": {
+    "s_cdc67647c63380": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a161c2-563a-7cc1-9a29-98baa3502c1a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
