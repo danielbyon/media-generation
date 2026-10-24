@@ -1,0 +1,56 @@
+docs/architecture/artifact-publication.md
+  s_1a3bd5713e1743::t_a1465bc13b9b82 139-140
+  s_1a3bd5713e1743::t_b55b60520a66ca 144-146
+  s_1a3bd5713e1743::t_f4308d4e23d178 137-138
+  s_1a3bd5713e1743::t_74c51714a581c3 143
+  s_1a3bd5713e1743::t_e44016631c9ef9 131-136,141-142
+tests/test_artifact_publication.py
+  s_1a3bd5713e1743::t_647f4688172d97 40,270-306
+  s_cb886f0949a23d::t_2752aefb6c9391 307-308
+src/media_generation/service.py
+  s_1a3bd5713e1743::t_51f5a03d806570 237-240,243
+src/media_generation/publication.py
+  s_1a3bd5713e1743::t_7dc3896efa6e18 481,488,498
+  s_1a3bd5713e1743::t_2fe99d08821c4e 484-485
+  s_1a3bd5713e1743::t_51f5a03d806570 479-480,482,489
+  s_1a3bd5713e1743::t_6a78a7cc59cc4f 472
+  s_1a3bd5713e1743::t_00948255645ee2 483,486-487,490,493-497,499-510
+  s_1a3bd5713e1743::t_2a85a5f7940a45 511
+tests/test_artifact_migration.py
+  s_1a3bd5713e1743::t_05d452d5028e1a 79-83,86-132,165-166
+  s_1a3bd5713e1743::t_791d0e618fdc24 167-183
+  s_1a3bd5713e1743::t_d275f58dad43e3 14,133-144,146-147,150,153-158,160-161,163
+  s_1a3bd5713e1743::t_cf64a35e597f31 162,164
+  s_1a3bd5713e1743::t_0f0745e08f497a 145,148-149,151-152,159
+  s_1a3bd5713e1743::t_3bea1644001cfb 5
+  s_1a3bd5713e1743::t_e616fb7b637196 235-236
+  s_1a3bd5713e1743::t_a639757a88842e 84-85
+src/media_generation/cli.py
+  s_1a3bd5713e1743::t_51f5a03d806570 67-69
+tests/test_artifact_cli.py
+  s_1a3bd5713e1743::t_2e8975b51d938f 85-146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fcb8bbdb6f6a81b247767361599b1f2bfe3f5917",
+  "prompts": {},
+  "sessions": {
+    "s_1a3bd5713e1743": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1672f-adf3-7b71-b759-7db8ae374454",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_cb886f0949a23d": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16afd-5d10-7ac2-b410-30f2d6d9f24b",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
