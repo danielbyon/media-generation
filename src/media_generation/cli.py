@@ -64,7 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--id", required=True, help=f"{name} ID")
         if name == "integrity":
             command.add_argument(
-                "--output-dir", required=True, type=Path, help="authoritative artifact directory"
+                "--output-dir", required=True, type=Path,
+                help=("directory for legacy artifacts without publication records; "
+                      "journal-backed artifacts use their recorded publication owner"),
             )
 
     provenance = commands.add_parser("provenance", help="retrieve request, job, attempt, and artifact")

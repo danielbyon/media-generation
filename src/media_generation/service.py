@@ -234,11 +234,13 @@ class GenerationService:
                 if self.get_integrity(source.artifact_id)["status"] != "ok":
                     raise ArtifactIntegrityError("lineage input is not a trusted image")
         artifact_id = _new_id("art")
-        authorized_root = approved_root.expanduser().resolve()
-        with open_approved_source(authorized_root, relative_path) as source_file:
+        # Keep every operator-supplied component intact. The source opener pins
+        # each directory with O_NOFOLLOW before provenance is recorded.
+        approved_path = approved_root.expanduser()
+        with open_approved_source(approved_path, relative_path) as source_file:
             source_stat = os.fstat(source_file.fileno())
             provenance = {
-                "approved_root": str(authorized_root),
+                "approved_root": str(approved_path),
                 "relative_path": relative_path,
                 "source_device": source_stat.st_dev, "source_inode": source_stat.st_ino,
                 "source_size": source_stat.st_size, "source_mtime_ns": source_stat.st_mtime_ns,

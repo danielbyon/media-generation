@@ -37,6 +37,7 @@ from media_generation.adapters import DeterministicCpuAdapter, ImageMetadata
 from media_generation.domain import ArtifactSource, GenerationPlan, GenerationRequest
 from media_generation.errors import (
     GenerationExecutionError,
+    InputValidationError,
     PublicationError,
     PublicationIncompleteError,
     RecordNotFoundError,
@@ -264,6 +265,45 @@ def _assert_committed(workspace: _Workspace, record: dict) -> dict:
         assert provenance["attempt"]["error_message"] is None
         assert provenance["artifact"] == artifact.to_dict()
     return artifact.to_dict()
+
+
+@pytest.mark.parametrize("link_position", ("ancestor", "root", "directory", "leaf"))
+def test_t03_import_rejects_symlink_components_in_approved_source_path(
+    workspace: _Workspace, link_position: str,
+) -> None:
+    """TAC-3: import rechecks the operator path instead of resolving links away."""
+    base = workspace.source_root.parent
+    approved = base / "approved-source"
+    nested = approved / "nested"
+    nested.mkdir(parents=True)
+    source = nested / "input.png"
+    _write_png(source)
+    relative = "nested/input.png"
+    if link_position == "ancestor":
+        real_parent = base / "real-parent"
+        real_parent.mkdir()
+        approved.rename(real_parent / approved.name)
+        (base / "ancestor-link").symlink_to(real_parent, target_is_directory=True)
+        approved_root = base / "ancestor-link" / approved.name
+    elif link_position == "root":
+        approved_root = base / "approved-link"
+        approved_root.symlink_to(approved, target_is_directory=True)
+    elif link_position == "directory":
+        approved_root = approved
+        (approved / "nested-link").symlink_to(nested, target_is_directory=True)
+        relative = "nested-link/input.png"
+    else:
+        approved_root = approved
+        (approved / "input-link.png").symlink_to(source)
+        relative = "input-link.png"
+
+    service = workspace.service()
+    tables = ("generation_artifacts", "artifact_edges", "artifact_publications")
+    before = {table: _rows(workspace.database, f"SELECT * FROM {table}") for table in tables}
+    with pytest.raises(InputValidationError, match="without following links"):
+        service.import_image(approved_root, relative)
+    after = {table: _rows(workspace.database, f"SELECT * FROM {table}") for table in tables}
+    assert after == before
 
 
 def _reconcile_repeatedly(workspace: _Workspace, *, status: str = "complete") -> list[dict]:

@@ -2,6 +2,7 @@
 import hashlib
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from media_generation.adapters import DeterministicCpuAdapter
 from media_generation.domain import (
     ArtifactSource, GenerationPlan, GenerationRequest, ResolvedReference,
 )
+from media_generation.publication import PublicationManager
 from media_generation.service import GenerationService
 
 
@@ -74,6 +76,111 @@ def legacy_database(tmp_path, *, cross_root=False):
     return database,root,artifacts
 
 
+def _legacy_alias_only_case(tmp_path):
+    """Remove the real-root child edge so artifact 2 trusts only the alias parent."""
+    database, root, artifacts, unlinked = legacy_database(tmp_path, cross_root=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE generation_jobs SET validated_reference_ids_json = '[]' WHERE job_id = ?",
+            (artifacts[2]["job_id"],),
+        )
+    return database, root, artifacts, unlinked
+
+
+def test_t01_cross_root_lineage_accepts_only_a_verified_legacy_alias_after_restart(
+    tmp_path,
+):
+    """TAC-3: a direct T01 edge through an alias preserves historical reads."""
+    database, root, artifacts, unlinked = _legacy_alias_only_case(tmp_path)
+    service = GenerationService(database, root)
+    assert Path(artifacts[0]["path"]).parent.is_symlink()
+    assert service.get_integrity(artifacts[0]["artifact_id"])["status"] == "ok"
+    assert service.get_integrity(artifacts[1]["artifact_id"])["status"] == "ok"
+
+    restarted = GenerationService(database, root)
+    assert restarted.get_integrity(artifacts[1]["artifact_id"])["status"] == "ok"
+    assert Path(restarted.get_artifact(artifacts[1]["artifact_id"]).path) == Path(
+        artifacts[1]["path"]
+    )
+    assert restarted.get_integrity(unlinked["artifact_id"])["status"] != "ok"
+
+
+@pytest.mark.parametrize("damage", ("missing", "corrupt", "redirected"))
+def test_t01_cross_root_alias_does_not_authorize_missing_corrupt_or_redirected_neighbor(
+    tmp_path, damage,
+):
+    """TAC-3: alias compatibility cannot outlive its verified legacy evidence."""
+    database, root, artifacts, _ = _legacy_alias_only_case(tmp_path)
+    neighbor = Path(artifacts[0]["path"])
+    alias = neighbor.parent
+    if damage == "missing":
+        neighbor.unlink()
+    elif damage == "corrupt":
+        neighbor.write_bytes(b"not an image")
+    else:
+        replacement = tmp_path / "replacement-images"
+        replacement.mkdir()
+        (replacement / neighbor.name).write_bytes(neighbor.read_bytes())
+        alias.unlink()
+        alias.symlink_to(replacement, target_is_directory=True)
+
+    service = GenerationService(database, root)
+    assert service.get_integrity(artifacts[0]["artifact_id"])["status"] != "ok"
+    assert service.get_integrity(artifacts[1]["artifact_id"])["status"] != "ok"
+    assert Path(service.get_artifact(artifacts[1]["artifact_id"]).path) == Path(
+        artifacts[1]["path"]
+    )
+
+
+def test_t01_alias_redirect_during_neighbor_verification_remains_untrusted(
+    tmp_path, monkeypatch,
+):
+    """TAC-3: an alias must remain bound to the root throughout verification."""
+    database, root, artifacts, _ = _legacy_alias_only_case(tmp_path)
+    neighbor = Path(artifacts[0]["path"])
+    alias = neighbor.parent
+    replacement = tmp_path / "replacement-images"
+    replacement.mkdir()
+    (replacement / neighbor.name).write_bytes(neighbor.read_bytes())
+    original = PublicationManager._verified_image
+    redirected = False
+
+    @contextmanager
+    def redirect_after_verify(self, directory, name, artifact, **options):
+        nonlocal redirected
+        with original(self, directory, name, artifact, **options) as verified:
+            yield verified
+        if artifact.artifact_id == artifacts[0]["artifact_id"] and not redirected:
+            redirected = True
+            alias.unlink()
+            alias.symlink_to(replacement, target_is_directory=True)
+
+    monkeypatch.setattr(
+        PublicationManager, "_verified_image", redirect_after_verify,
+    )
+    service = GenerationService(database, root)
+    report = service.get_integrity(artifacts[1]["artifact_id"])
+    assert redirected
+    assert report["status"] != "ok"
+
+
+@pytest.mark.parametrize("damage", ("missing", "corrupt"))
+def test_t01_broken_alias_neighbor_does_not_mask_a_verified_authorized_neighbor(
+    tmp_path, damage,
+):
+    """TAC-3: candidate failures remain local to the neighbor under inspection."""
+    database, root, artifacts, _ = legacy_database(tmp_path, cross_root=True)
+    alias_neighbor = Path(artifacts[0]["path"])
+    if damage == "missing":
+        alias_neighbor.unlink()
+    else:
+        alias_neighbor.write_bytes(b"not an image")
+
+    service = GenerationService(database, root)
+    assert service.get_integrity(artifacts[0]["artifact_id"])["status"] != "ok"
+    assert service.get_integrity(artifacts[1]["artifact_id"])["status"] == "ok"
+
+
 def test_real_t01_database_migrates_without_changing_generated_json_or_records(tmp_path):
     """TAC-3: legacy retrieval, references, idempotency, and bytes survive migration."""
     database,root,artifacts,unlinked = legacy_database(tmp_path,cross_root=True)
@@ -125,8 +232,8 @@ def test_import_identity_roles_and_transactional_graph_constraints(tmp_path):
     """TAC-2/7/8: duplicate bytes keep identities; edges retain role and order."""
     database,root,legacy = legacy_database(tmp_path)
     service = GenerationService(database,root)
-    source_root = Path(legacy[0]['path']).parent
-    assert source_root.is_symlink()
+    source_root = Path(legacy[0]['path']).parent.resolve()
+    assert not source_root.is_symlink()
     first = service.import_image(source_root,Path(legacy[0]['path']).name)
     second = service.import_image(source_root,Path(legacy[0]['path']).name,sources=(
         ArtifactSource(first.artifact_id,'inspiration'),

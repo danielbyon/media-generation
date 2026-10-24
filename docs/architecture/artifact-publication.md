@@ -128,6 +128,22 @@ resolved, cleanup is finished, and inspected content is healthy. Otherwise it
 returns `attention_required`; the CLI still prints the report to stdout and
 exits 1. The `integrity` command is an observation query and returns its explicit
 `ok`, `missing`, or `corrupt` status in JSON without changing historical success.
+For a journal-backed artifact, the recorded publication owner determines the
+verification path. The `integrity --output-dir` argument supplies inspection
+context for legacy artifacts that have no publication record.
+
+Migration keeps historical T01 artifact paths unchanged. A legacy artifact in a
+different directory is trusted only when it has a direct durable edge to an
+neighbor without a publication record whose parent resolves to the configured
+output root and whose bytes still match its immutable metadata. The neighbor is
+reopened with descriptor-relative, no-follow checks under the configured root.
+An alias is
+compatibility evidence for legacy lineage, not authority for a new import or
+for an artifact owned by a publication journal. Missing or corrupt neighbor
+content and aliases that resolve elsewhere remain untrusted. Verification also
+pins and compares the alias directory's identity with the configured root,
+reads the neighbor through that pinned descriptor, and reconfirms the alias
+binding before accepting the evidence.
 
 ## 5. Lineage
 

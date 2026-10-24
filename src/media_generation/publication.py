@@ -469,16 +469,45 @@ class PublicationManager:
         return {'artifact_id': artifact_id, 'status': status, 'checked_at': checked, 'detail': detail}
 
     def _legacy_linked_to_root(self, artifact_id: str, authorized_root: Path) -> bool:
-        """Require a direct durable edge to an artifact owned by the caller's root."""
+        """Require a verified legacy neighbor reached through the caller's root."""
         lineage = self.store.get_lineage(artifact_id)
         neighbors = lineage['parents'] + lineage['children']
         for edge in neighbors:
             neighbor_id = (edge['source_id'] if edge['target_id'] == artifact_id
                            else edge['target_id'])
             neighbor = self.store.get_artifact(str(neighbor_id))
-            if Path(neighbor.path).parent == authorized_root:
-                return True
+            if self.store.publication_for_artifact(str(neighbor_id)) is not None:
+                continue
+            stored_root = Path(neighbor.path).parent
+            try:
+                with self._legacy_alias_directory(stored_root, authorized_root) as directory:
+                    with self._verified_image(directory, Path(neighbor.path).name, neighbor):
+                        pass
+                with self._legacy_alias_directory(stored_root, authorized_root):
+                    pass
+            except (FileNotFoundError, InputValidationError, OSError, PublicationError):
+                continue
+            return True
         return False
+
+    @contextmanager
+    def _legacy_alias_directory(
+        self, stored_root: Path, authorized_root: Path,
+    ) -> Iterator[int]:
+        """Pin and identify a legacy directory alias of the authorized root."""
+        try:
+            with destination_directory(authorized_root, create=False) as authorized:
+                directory = os.open(stored_root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    if self._identity(os.fstat(directory)) != self._identity(
+                        os.fstat(authorized)
+                    ):
+                        raise PublicationError('legacy alias resolves to a different root')
+                    yield directory
+                finally:
+                    os.close(directory)
+        except (OSError, RuntimeError) as error:
+            raise PublicationError('legacy alias cannot be verified') from error
 
     def _verified_integrity_path(
         self,

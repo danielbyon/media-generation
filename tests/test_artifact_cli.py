@@ -82,6 +82,68 @@ def test_cli_rejects_unapproved_or_malformed_source_without_artifact(tmp_path,so
         assert connection.execute('SELECT count(*) FROM generation_jobs').fetchone()[0] == 0
 
 
+@pytest.mark.parametrize("link_position", ("ancestor", "root", "directory", "leaf"))
+def test_cli_import_rejects_symlink_components_in_approved_source_path(
+    tmp_path, link_position,
+):
+    """TAC-3: the CLI reports a validation error and leaves durable state unchanged."""
+    base = tmp_path.resolve()
+    approved = base / "approved-source"
+    nested = approved / "nested"
+    nested.mkdir(parents=True)
+    source = nested / "input.png"
+    Image.new("RGB", (13, 17), "green").save(source, format="PNG")
+    relative = "nested/input.png"
+    if link_position == "ancestor":
+        real_parent = base / "real-parent"
+        real_parent.mkdir()
+        approved.rename(real_parent / approved.name)
+        (base / "ancestor-link").symlink_to(real_parent, target_is_directory=True)
+        approved_root = base / "ancestor-link" / approved.name
+    elif link_position == "root":
+        approved_root = base / "approved-link"
+        approved_root.symlink_to(approved, target_is_directory=True)
+    elif link_position == "directory":
+        approved_root = approved
+        (approved / "nested-link").symlink_to(nested, target_is_directory=True)
+        relative = "nested-link/input.png"
+    else:
+        approved_root = approved
+        (approved / "input-link.png").symlink_to(source)
+        relative = "input-link.png"
+
+    database = base / "studio.sqlite"
+    output = base / "artifacts"
+    error = cli(
+        tmp_path,
+        "import",
+        "--db",
+        database,
+        "--output-dir",
+        output,
+        "--approved-root",
+        approved_root,
+        "--source",
+        relative,
+        success=False,
+    )
+    assert error["error"]["code"] == "validation_error"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT count(*) FROM generation_artifacts").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM artifact_edges").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM artifact_publications").fetchone()[0] == 0
+
+
+def test_integrity_help_distinguishes_owner_from_legacy_directory(capsys):
+    """The help names the publication owner used by journal-backed artifacts."""
+    with pytest.raises(SystemExit) as stopped:
+        cli_module.main(["integrity", "--help"])
+    assert stopped.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "journal-backed artifacts use their recorded publication owner" in help_text
+    assert "legacy artifacts without publication records" in help_text
+
+
 def _submit_arguments(database, output):
     """Use the same request and idempotency key throughout a recovery scenario."""
     return [
