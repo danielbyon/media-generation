@@ -1,0 +1,19 @@
+docs/architecture/artifact-publication.md
+  s_cdc67647c63380::t_834ca1b66392c6 141
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7d905b70e40e1fc3325cce935684437e7fab1f49",
+  "prompts": {},
+  "sessions": {
+    "s_cdc67647c63380": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a161c2-563a-7cc1-9a29-98baa3502c1a",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
