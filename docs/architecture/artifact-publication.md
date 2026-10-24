@@ -178,10 +178,12 @@ repeated recovery, duplicate bytes, and external corruption.
 
 These tests establish process-crash behavior on the tested filesystem. They do
 not simulate a power-cutting device or certify storage firmware, controller
-caches, network filesystems, or hardware reliability. POSIX fsync success is the
-host's durability acknowledgement. Cooperative writers must use this protocol and leave the private cleanup
-namespace untouched;
-a privileged or same-account process can still modify files or the database
+caches, network filesystems, or hardware reliability. On platforms where
+`os.fsync` does not request a device-cache flush, notably Darwin without
+`F_FULLFSYNC`, success acknowledges the host filesystem's writeback state only;
+this project does not claim power-loss durability there. Cooperative writers
+must use this protocol and leave the private cleanup namespace untouched. A
+privileged or same-account process can still modify files or the database
 outside it. Descriptor checks and later integrity verification detect observable
 changes, but are not protection from an adversary controlling the storage host.
 The bundled adapter remains CPU-only test infrastructure.

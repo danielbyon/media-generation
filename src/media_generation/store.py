@@ -404,7 +404,7 @@ class SQLiteStore:
         self, artifact: GenerationArtifact, timestamp: str, *,
         publication_id: str | None = None, sources: tuple[ArtifactSource, ...] = (),
     ) -> None:
-        """Persist the artifact and successful job/attempt transition together."""
+        """Commit a generated artifact only with its ready publication row."""
         with self._connection(transaction=True) as connection:
             row = connection.execute(
                 "SELECT status, output_slot_id FROM generation_jobs WHERE job_id = ?", (artifact.job_id,)
@@ -427,6 +427,10 @@ class SQLiteStore:
             if attempt["status"] != "running":
                 raise RuntimeError(
                     f"attempt {artifact.attempt_id} for job {artifact.job_id} is not running"
+                )
+            if publication_id is None:
+                raise RuntimeError(
+                    "generated artifact completion requires a publication journal row"
                 )
             connection.execute(
                 """INSERT INTO generation_artifacts (

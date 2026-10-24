@@ -36,7 +36,12 @@ from PIL.PngImagePlugin import PngInfo
 from media_generation import publication as publication_module
 from media_generation import store as store_module
 from media_generation.adapters import DeterministicCpuAdapter, ImageMetadata
-from media_generation.domain import ArtifactSource, GenerationPlan, GenerationRequest
+from media_generation.domain import (
+    ArtifactSource,
+    GenerationArtifact,
+    GenerationPlan,
+    GenerationRequest,
+)
 from media_generation.errors import (
     GenerationExecutionError,
     InputValidationError,
@@ -1820,3 +1825,41 @@ def test_t03_reconciliation_reports_same_inode_rewrite_without_rewriting_success
     assert service.get_lineage(artifact.artifact_id) == frozen_lineage
     assert service.get_job(str(record["job_id"])).to_dict() == frozen_job
     assert _only_publication(workspace)["state"] == "committed"
+
+
+def test_t03_generation_completion_requires_publication_journal_row(
+    workspace: _Workspace,
+) -> None:
+    """T03 ownership: a valid running job cannot expose an artifact without a publication."""
+    record = _crash_at(workspace, "before_stage_write")
+    job = _rows(
+        workspace.database,
+        "SELECT job_id, output_slot_id FROM generation_jobs WHERE job_id = ?",
+        (record["job_id"],),
+    )[0]
+    artifact = GenerationArtifact(
+        artifact_id=str(record["artifact_id"]),
+        job_id=str(record["job_id"]),
+        attempt_id=str(record["attempt_id"]),
+        output_slot_id=str(job["output_slot_id"]),
+        path=str(workspace.output / "unpublished.png"),
+        media_type="image/png",
+        image_format="PNG",
+        width=17,
+        height=13,
+        file_size=1,
+        sha256="0" * 64,
+        created_at="2026-10-24T10:38:13+00:00",
+    )
+
+    with pytest.raises(RuntimeError, match="publication journal row"):
+        workspace.service()._store.complete_execution(
+            artifact, "2026-10-24T10:38:13+00:00"
+        )
+
+    assert _rows(workspace.database, "SELECT * FROM generation_artifacts") == []
+    job_state = workspace.service().get_job(str(record["job_id"]))
+    assert job_state.status == "running"
+    assert job_state.artifact_id is None
+    attempts = _rows(workspace.database, "SELECT * FROM generation_attempts")
+    assert [row["status"] for row in attempts] == ["running"]
