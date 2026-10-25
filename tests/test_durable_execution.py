@@ -248,8 +248,8 @@ def test_cli_enqueue_preserves_omitted_budget_and_rejects_explicit_conflict(
         "--request-json",
         payload,
     )
-    assert conflict.returncode == 3, conflict.stderr
-    assert json.loads(conflict.stderr)["error"]["code"] == "idempotency_conflict"
+    assert conflict.returncode == 0, conflict.stderr
+    assert json.loads(conflict.stdout)["artifact_id"] == submitted_result["artifact_id"]
     inspected_final = cli(tmp_path, "provenance", "--job-id", admitted["job_id"])
     assert inspected_final.returncode == 0, inspected_final.stderr
     assert json.loads(inspected_final.stdout) == snapshot
@@ -812,3 +812,104 @@ def test_idempotency_rejects_contract_for_existing_queued_null_job(
     service_at(tmp_path, adapter=ExternalAdapter()).enqueue("external-queued", request())
     with pytest.raises(IdempotencyConflictError, match="containment contract"):
         service_at(tmp_path).enqueue("external-queued", request())
+
+
+def test_succeeded_reuse_ignores_incoming_budget_without_rewriting_policy(tmp_path: Path) -> None:
+    """An existing image is reusable without changing its first admission budget."""
+    service = service_at(tmp_path)
+    queued = service.enqueue("succeeded-budget", request(), max_attempts=2)
+    service.work()
+    before = service.get_provenance(queued.job_id)
+
+    reused = service.enqueue("succeeded-budget", request(), max_attempts=99)
+
+    assert reused.job_id == queued.job_id
+    assert reused.artifact_id == before["artifact"]["artifact_id"]
+    assert reused.status == "succeeded"
+    assert service.get_provenance(queued.job_id) == before
+    with pytest.raises(IdempotencyConflictError, match="request intent"):
+        service.enqueue("succeeded-budget", request("different"), max_attempts=99)
+    service.enqueue("queued-budget", request(), max_attempts=2)
+    with pytest.raises(IdempotencyConflictError, match="attempt budget"):
+        service.enqueue("queued-budget", request(), max_attempts=99)
+
+
+def test_worker_report_preserves_each_claim_outcome_after_retry_success(tmp_path: Path) -> None:
+    """Loop completion cannot erase a failed attempt when its retry succeeds."""
+    class RetryOnce(DeterministicCpuAdapter):
+        containment_contract = PROCESS_CONTAINED_CONTRACT
+
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, plan, stream):
+            self.calls += 1
+            if self.calls == 1:
+                raise RetryableGenerationError("retry once")
+            return super().generate(plan, stream)
+
+    service = service_at(tmp_path, adapter=RetryOnce())
+    job = service.enqueue("outcome-retry", request(), max_attempts=2)
+    report = service.work(limit=2)
+    assert report["status"] == "complete"
+    assert report["processed"] == 2
+    assert [item["status"] for item in report["outcomes"]] == ["failed", "succeeded"]
+    assert [item["execution_status"] for item in report["outcomes"]] == ["queued", "succeeded"]
+    assert all(item["job_id"] == job.job_id for item in report["outcomes"])
+    assert len({item["attempt_id"] for item in report["outcomes"]}) == 2
+
+
+@pytest.mark.parametrize("mode", ("success", "failed", "retry", "external", "canceled"))
+def test_worker_cli_exit_reflects_claim_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys, mode: str
+) -> None:
+    """A completed worker loop reports failed generation with a nonzero exit."""
+    from media_generation.cli import main
+
+    class Adapter(DeterministicCpuAdapter):
+        containment_contract = None if mode == "external" else PROCESS_CONTAINED_CONTRACT
+
+        def generate(self, plan, stream):
+            if mode == "failed":
+                raise RuntimeError("terminal generation failure")
+            if mode == "retry":
+                raise RetryableGenerationError("retry queued")
+            if mode == "canceled":
+                service.cancel(plan.job_id)
+            return super().generate(plan, stream)
+
+    service = service_at(tmp_path, adapter=Adapter())
+    job = service.enqueue("outcome-cli", request(), max_attempts=2)
+    monkeypatch.setattr("media_generation.cli.GenerationService", lambda *args, **kwargs: service)
+    exit_code = main(["worker", "--db", str(tmp_path / "studio.sqlite3"), "--output-dir", str(tmp_path / "images")])
+    report = json.loads(capsys.readouterr().out)
+    assert exit_code == (0 if mode == "success" else 1)
+    assert report["outcomes"][0]["job_id"] == job.job_id
+    assert report["outcomes"][0]["status"] == {
+        "success": "succeeded", "external": "succeeded", "failed": "failed",
+        "retry": "failed", "canceled": "canceled",
+    }[mode]
+
+    assert report["outcomes"][0]["execution_status"] == {
+        "success": "succeeded", "external": "succeeded", "failed": "failed",
+        "retry": "queued", "canceled": "canceled",
+    }[mode]
+
+
+def test_worker_contention_preserves_already_processed_claim_outcomes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """A later quarantine stop must not hide an earlier batch outcome."""
+    from media_generation.cli import main
+
+    class External(DeterministicCpuAdapter):
+        containment_contract = None
+
+    service = service_at(tmp_path, adapter=External())
+    job = service.enqueue("batch-quarantine", request())
+    monkeypatch.setattr("media_generation.cli.GenerationService", lambda *args, **kwargs: service)
+    code = main(["worker", "--db", str(tmp_path / "studio.sqlite3"), "--output-dir", str(tmp_path / "images"), "--limit", "2"])
+    result = json.loads(capsys.readouterr().err)
+    assert code == 1
+    assert result["error"]["code"] == "resource_busy"
+    assert result["error"]["outcomes"][0]["job_id"] == job.job_id

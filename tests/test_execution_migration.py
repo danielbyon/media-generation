@@ -154,9 +154,6 @@ def test_t01_successful_rows_bytes_and_lineage_survive_execution_upgrade(
 ) -> None:
     database, images, artifacts = legacy_database(tmp_path)
     with sqlite3.connect(database) as connection:
-        has_edges = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'artifact_edges'"
-        ).fetchone() is not None
         legacy_references = {
             artifact["artifact_id"]: json.loads(
                 connection.execute(
@@ -170,57 +167,34 @@ def test_t01_successful_rows_bytes_and_lineage_survive_execution_upgrade(
             name: connection.execute(f"SELECT * FROM {name}").fetchall()
             for name in ("generation_requests", "generation_jobs", "generation_attempts")
         }
-        if has_edges:
-            before_lineage = {
-                artifact["artifact_id"]: {
-                    "artifact_id": artifact["artifact_id"],
-                    "parents": [
-                        dict(zip(("source_id", "target_id", "role", "position"), row))
-                        for row in connection.execute(
-                            "SELECT * FROM artifact_edges WHERE target_id = ? ORDER BY position",
-                            (artifact["artifact_id"],),
-                        ).fetchall()
-                    ],
-                    "children": [
-                        dict(zip(("source_id", "target_id", "role", "position"), row))
-                        for row in connection.execute(
-                            """SELECT * FROM artifact_edges WHERE source_id = ?
-                               ORDER BY target_id, position""",
-                            (artifact["artifact_id"],),
-                        ).fetchall()
-                    ],
-                }
-                for artifact in artifacts
+        before_lineage = {
+            artifact["artifact_id"]: {
+                "artifact_id": artifact["artifact_id"],
+                "parents": [
+                    {
+                        "source_id": source_id,
+                        "target_id": artifact["artifact_id"],
+                        "role": "reference",
+                        "position": position,
+                    }
+                    for position, source_id in enumerate(
+                        legacy_references[artifact["artifact_id"]]
+                    )
+                ],
+                "children": [
+                    {
+                        "source_id": artifact["artifact_id"],
+                        "target_id": child_id,
+                        "role": "reference",
+                        "position": position,
+                    }
+                    for child_id, references in legacy_references.items()
+                    for position, source_id in enumerate(references)
+                    if source_id == artifact["artifact_id"]
+                ],
             }
-        else:
-            before_lineage = {
-                artifact["artifact_id"]: {
-                    "artifact_id": artifact["artifact_id"],
-                    "parents": [
-                        {
-                            "source_id": source_id,
-                            "target_id": artifact["artifact_id"],
-                            "role": "reference",
-                            "position": position,
-                        }
-                        for position, source_id in enumerate(
-                            legacy_references[artifact["artifact_id"]]
-                        )
-                    ],
-                    "children": [
-                        {
-                            "source_id": artifact["artifact_id"],
-                            "target_id": child_id,
-                            "role": "reference",
-                            "position": position,
-                        }
-                        for child_id, references in legacy_references.items()
-                        for position, source_id in enumerate(references)
-                        if source_id == artifact["artifact_id"]
-                    ],
-                }
-                for artifact in artifacts
-            }
+            for artifact in artifacts
+        }
         before_bytes = {
             artifact["artifact_id"]: Path(artifact["path"]).read_bytes()
             for artifact in artifacts
@@ -496,3 +470,47 @@ def test_failed_historical_job_replays_without_accepting_missing_contract(
     assert service.get_provenance(job_id)["attempts"] == after["attempts"]
     with pytest.raises(GenerationError, match="not eligible for retry"):
         service.retry(job_id)
+
+
+@pytest.mark.parametrize("version", ("t01", "t03"))
+@pytest.mark.parametrize("status", ("failed", "succeeded"))
+def test_terminal_historical_status_is_not_termination_proof(
+    tmp_path: Path, version: str, status: str
+) -> None:
+    """A completed legacy row cannot invent external-process containment."""
+    database, images, job_id = historical_failed(tmp_path, version)
+    with sqlite3.connect(database) as connection:
+        if status == "succeeded":
+            connection.execute("UPDATE generation_jobs SET status = 'succeeded'")
+            connection.execute("UPDATE generation_attempts SET status = 'succeeded', error_message = NULL")
+        before = connection.execute("SELECT * FROM generation_attempts").fetchall()
+    service = GenerationService(database, images)
+    snapshot = service.get_provenance(job_id)
+    assert snapshot["status"] == status
+    assert snapshot["attempt"]["containment_contract"] is None
+    assert snapshot["attempt"]["termination_proven"] is False
+    assert snapshot["execution"]["retry_eligible"] is False
+    assert service.work() == {"status": "idle", "processed": 0}
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT * FROM generation_attempts").fetchall() == before
+
+
+@pytest.mark.parametrize("version", ("t01", "t03"))
+def test_ownerless_historical_attempt_cannot_authorize_finalization(
+    tmp_path: Path, version: str
+) -> None:
+    """Unknown historical ownership must not become a current execution claim."""
+    database, images, job_id = historical_running(tmp_path, version)
+    service = GenerationService(database, images)
+    attempt_id = service.get_provenance(job_id)["attempt"]["attempt_id"]
+    with sqlite3.connect(database) as connection:
+        before = list(connection.iterdump())
+
+    assert service._store.assert_attempt_authority(job_id, attempt_id, None, None) is False
+    assert service._store.fail_execution(
+        job_id, attempt_id, "ownerless mutation", "2026-10-25T00:00:00+00:00"
+    ) is False
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+    assert service.get_provenance(job_id)["execution"]["resource_state"] == "quarantined"

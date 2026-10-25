@@ -103,7 +103,8 @@ class GenerationService:
 
         ``None`` means the caller did not request a policy. New jobs default to
         one total attempt; reused jobs retain their original persisted budget.
-        An explicitly supplied positive budget must match a reused job.
+        An explicitly supplied positive budget must match unfinished work.
+        Succeeded reuse ignores it without changing the persisted policy.
         """
         queued = self._admit(idempotency_key, request, max_attempts=max_attempts)
         return self._submission_for_job(queued.job_id)
@@ -275,7 +276,11 @@ class GenerationService:
                 self._publication.reconcile()
                 snapshot = self._store.get_provenance(job_id)
                 if snapshot["status"] == "succeeded":
-                    return {"status": "recovered"}
+                    resource = self._store.resource_snapshot()
+                    return {
+                        "status": "attention_required"
+                        if resource["state"] == "quarantined" else "recovered"
+                    }
                 return {"status": "attention_required"}
             self._store.revoke_ready_publication(
                 publication_id,
@@ -304,10 +309,11 @@ class GenerationService:
                 attempt_id,
                 "adapter invocation ended after cancellation",
                 timestamp,
-                attempt_owner_id=None if publication_was_fenced else owner_id,
-                claim_epoch=None if publication_was_fenced else epoch,
+                attempt_owner_id=owner_id,
+                claim_epoch=epoch,
                 failure_class="canceled",
                 termination_proven=contained,
+                _revoked_publication_id=str(publication["publication_id"]) if publication_was_fenced else None,
             )
             if not finalized:
                 return {"status": "attention_required"}
@@ -322,10 +328,11 @@ class GenerationService:
                     else "fenced attempt has no trusted process-termination proof"
                 ),
                 timestamp,
-                attempt_owner_id=None,
-                claim_epoch=None,
+                attempt_owner_id=owner_id,
+                claim_epoch=epoch,
                 failure_class="terminal" if contained else "ambiguous",
                 termination_proven=contained,
+                _revoked_publication_id=str(publication["publication_id"]),
             )
             if not finalized:
                 return {"status": "attention_required"}
@@ -366,12 +373,14 @@ class GenerationService:
             if not locked:
                 return {"status": "resource_busy", "processed": 0}
             processed = 0
+            outcomes: list[dict[str, object]] = []
             for _ in range(limit):
                 resource = self._store.resource_snapshot()
                 if resource["state"] != "available":
                     return {
                         "status": "resource_busy",
                         "processed": processed,
+                        "outcomes": outcomes,
                     }
                 timestamp = _now()
                 claim = self._store.claim_next_execution(
@@ -392,9 +401,25 @@ class GenerationService:
                 failure = self._execute_claim(claim)
                 if failure is not None and _failures is not None:
                     _failures.append(failure)
+                # Snapshot each claim before another retry can replace the
+                # current job state. A later success must not erase a failed
+                # attempt from the worker's observable batch outcome.
+                snapshot = self._store.get_provenance(claim.job_id)
+                attempt = next(
+                    item for item in snapshot["attempts"]
+                    if item["attempt_id"] == claim.attempt_id
+                )
+                outcomes.append({
+                    "job_id": claim.job_id,
+                    "attempt_id": claim.attempt_id,
+                    "status": attempt["status"],
+                    "execution_status": snapshot["status"],
+                    "failure_class": attempt["failure_class"],
+                    "termination_proven": attempt["termination_proven"],
+                })
             if processed == 0:
                 return {"status": "idle", "processed": 0}
-            return {"status": "complete", "processed": processed}
+            return {"status": "complete", "processed": processed, "outcomes": outcomes}
 
     def _execute_claim(self, claim: ExecutionClaim) -> Exception | None:
         stop_heartbeat = threading.Event()
@@ -483,7 +508,7 @@ class GenerationService:
             if snapshot["artifact"] is not None and snapshot["status"] == "succeeded":
                 return None
             if snapshot["status"] == "canceled":
-                self._store.fail_execution(
+                finalized = self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
                     str(error),
@@ -493,6 +518,10 @@ class GenerationService:
                     failure_class="canceled",
                     termination_proven=claim.containment_contract is not None,
                 )
+                if not finalized:
+                    return PublicationIncompleteError(
+                        claim.job_id, "canceled attempt could not be durably finalized"
+                    )
                 return error
             if not adapter_dispatched:
                 self._store.fail_execution(

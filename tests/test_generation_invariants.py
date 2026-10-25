@@ -142,37 +142,49 @@ def test_provenance_with_nested_adapter_configuration_is_json_serializable(
     assert json.loads(encoded)["adapter_configuration"] == configuration
 
 
+def test_retired_pending_admission_cannot_create_sidecarless_jobs(tmp_path: Path) -> None:
+    """Unsupported legacy admission must fail before changing the database."""
+    service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+    request = GenerationRequest("retired pending", seed=9)
+    with pytest.raises(RuntimeError, match="queued admission"):
+        service._store.create_pending_execution(
+            request=request, request_digest=request.digest(), idempotency_key="retired",
+            request_id="req_" + "a" * 32, job_id="job_" + "a" * 32,
+            attempt_id="att_" + "a" * 32, output_slot_id="slot_" + "a" * 32,
+            resolved_seed=9, adapter_id="retired", adapter_configuration_json="{}",
+            effective_parameters_json='{"width":64,"height":64}',
+            resolved_output_directory=str(tmp_path / "artifacts"),
+            timestamp="2026-10-25T00:00:00+00:00",
+        )
+    with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM generation_requests").fetchone() == (0,)
+    GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+
+
 def test_artifact_attempt_must_belong_to_the_job_being_completed(
     tmp_path: Path,
 ) -> None:
     """A cross-job attempt cannot publish an artifact or transition either job."""
     service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
 
-    def pending(key: str, suffix: str):
-        request = GenerationRequest(prompt=f"Request {key}", seed=9)
-        return service._store.create_pending_execution(
-            request=request,
-            request_digest=request.digest(),
-            idempotency_key=key,
-            request_id=f"req_{suffix}",
-            job_id=f"job_{suffix}",
-            attempt_id=f"att_{suffix}",
-            output_slot_id=f"slot_{suffix}",
-            resolved_seed=9,
-            adapter_id="test-adapter",
-            adapter_configuration_json="{}",
-            effective_parameters_json='{"width":64,"height":64}',
-            resolved_output_directory=str(tmp_path / "artifacts"),
-            timestamp="2026-10-21T00:00:00+00:00",
-        )
-
-    first = pending("first", "0123456789abcdef0123456789abcdef")
-    second = pending("second", "abcdef0123456789abcdef0123456789")
+    first = service.enqueue("first", GenerationRequest("Request first", seed=9))
+    second = service.enqueue("second", GenerationRequest("Request second", seed=9))
+    first_claim = service._store.claim_next_execution(
+        attempt_id="att_0123456789abcdef0123456789abcdef",
+        owner_id="worker_first", adapter_id=service.adapter.adapter_id,
+        adapter_configuration_json=json.dumps(service.adapter.configuration, sort_keys=True, separators=(",", ":")),
+        resolved_output_directory=str(tmp_path / "artifacts"),
+        process_contained=True, containment_contract=PROCESS_CONTAINED_CONTRACT,
+        timestamp="2026-10-21T00:00:00+00:00",
+        lease_expires_at="2026-10-21T00:01:00+00:00", job_id=first.job_id,
+    )
+    assert first_claim is not None
     artifact = GenerationArtifact(
         artifact_id="art_0123456789abcdef0123456789abcdef",
-        job_id=first.job_id,
-        attempt_id=second.attempt_id,
-        output_slot_id=first.output_slot_id,
+        job_id=second.job_id,
+        attempt_id=first_claim.attempt_id,
+        output_slot_id=second.output_slot_id,
         path=str(tmp_path / "artifacts" / "cross-job.png"),
         media_type="image/png",
         image_format="PNG",
@@ -186,11 +198,11 @@ def test_artifact_attempt_must_belong_to_the_job_being_completed(
     with pytest.raises(RuntimeError, match="attempt.*job"):
         service._store.complete_execution(artifact, "2026-10-21T00:00:01+00:00")
 
+    assert service.get_provenance(first.job_id)["attempt"]["status"] == "running"
+    assert service.get_provenance(second.job_id)["status"] == "queued"
+    assert service.get_provenance(second.job_id)["attempt"] is None
     for job_id in (first.job_id, second.job_id):
-        assert service.get_job(job_id).status == "running"
-        provenance = service.get_provenance(job_id)
-        assert provenance["attempt"]["status"] == "running"
-        assert provenance["artifact"] is None
+        assert service.get_provenance(job_id)["artifact"] is None
 
 
 def test_idempotent_reuse_checks_current_adapter_capabilities(tmp_path: Path) -> None:

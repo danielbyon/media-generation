@@ -97,7 +97,18 @@ Execution scheduling uses separate SQLite rows and transaction guards in the
 same database. All cooperating workers must use the database and output
 directory. Admission atomically stores one immutable request, job, output slot,
 fully resolved plan, adapter identity and configuration, ordered reference IDs
-An omitted budget defaults to one only for a new job; reuse preserves the first admission's budget, and an explicitly different value conflicts. Reuse also requires a matching resolved destination and any containment contract recorded by a non-succeeded job. A terminal historical T01/T03 failure with a NULL migrated contract keeps the legacy NULL compatibility exception; queued, running, and differing non-NULL contracts fail closed. A queued job has no attempt until a worker claim succeeds. Each database contains one heavyweight resource row for its local execution domain.
+and content hashes, resolved destination, and persisted attempt budget before
+any attempt exists.
+
+An omitted budget defaults to one only for a new job; reuse preserves the first
+admission's budget, and an explicitly different value conflicts for non-
+succeeded jobs. Succeeded reuse returns the existing artifact without changing
+its saved budget. Reuse also requires a matching resolved destination and any
+containment contract recorded by a non-succeeded job. A terminal historical
+T01/T03 failure with a NULL migrated contract keeps the legacy NULL
+compatibility exception; queued, running, and differing non-NULL contracts fail
+closed. A queued job has no attempt until a worker claim succeeds. Each database
+contains one heavyweight resource row for its local execution domain.
 
 A claim atomically reserves that resource and creates the current attempt with a
 random owner, monotonically changing fence epoch, heartbeat, and lease. The

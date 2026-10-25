@@ -64,7 +64,8 @@ or to two different non-NULL contracts. A matching queued job retains its
 persisted attempt budget; a matching succeeded job returns its existing artifact
 identity; and a matching failed or ambiguous job remains inspectable. An omitted
 `max_attempts` does not rewrite the budget chosen by the first admission, while an
-explicitly different budget conflicts. If no seed is supplied, the service resolves one
+explicitly different budget conflicts for non-succeeded work. If no seed is supplied,
+the service resolves one
 from the canonical request digest and persists it before adapter execution.
 
 `submit` atomically admits a job and then attempts one synchronous execution.
@@ -140,9 +141,21 @@ five-second heartbeat while the adapter runs. `--limit` bounds how many queued
 jobs one worker invocation considers; it does not permit concurrent heavyweight
 attempts in the same database.
 
+Worker JSON keeps invocation-level status and processed count. A complete loop
+also returns outcomes for each claimed job and attempt, including attempt
+status, job execution_status, failure_class, and termination_proven. Each
+outcome is captured before another claim, so a failed retry followed by success
+remains visible as two outcomes. The worker CLI exits 0 only for an idle loop
+or when every processed attempt succeeded with termination proof. It exits 1
+for contention or any failed, canceled, ambiguous, retry-queued, unresolved, or
+unproven attempt, while preserving the JSON outcomes. A retry queued within its
+saved budget remains available to a later worker despite that nonzero exit.
+
 `--max-attempts` applies when a new job is admitted and defaults to one total
 attempt. Reusing a matching job never resets its persisted budget; supplying
-an explicitly different value conflicts. An automatic retry requires an
+an explicitly different value conflicts for non-succeeded work. Reusing a
+succeeded job ignores the incoming budget and leaves its persisted policy and
+artifact unchanged. An automatic retry requires an
 eligible failure classification, proof that the previous execution terminated,
 successful publication recovery, an available resource, and remaining
 persisted budget. An unknown outcome is quarantined and is never replayed

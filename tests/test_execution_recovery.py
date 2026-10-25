@@ -153,6 +153,8 @@ def test_crash_then_cancel_before_reconcile_converges_without_artifact(
         ).fetchone()
         if state == "ready" and final_name is not None:
             final = tmp_path / "images" / final_name
+            if checkpoint == "before_commit":
+                assert final.is_file()
             if final.exists():
                 preserved = (final, final.stat().st_dev, final.stat().st_ino, final.read_bytes())
 
@@ -351,14 +353,14 @@ def test_stale_identity_cannot_fail_or_complete_successor_attempt(tmp_path: Path
                     attempt_owner_id=old["owner_id"],
                     claim_epoch=old["claim_epoch"],
                 )
-            service._store.fail_execution(
+            assert service._store.fail_execution(
                 queued.job_id,
                 old["attempt_id"],
                 "stale failure",
                 timestamp,
                 attempt_owner_id=old["owner_id"],
                 claim_epoch=old["claim_epoch"],
-            )
+            ) is False
             with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
                 assert tuple(connection.execute("SELECT * FROM execution_jobs").fetchone()) == before["job"]
                 assert tuple(connection.execute(
@@ -444,7 +446,7 @@ def test_canceled_external_publication_without_termination_proof_quarantines_res
     service.work()
 
     assert canceled[0]["outcome"] == "accepted"
-    assert service_at(tmp_path).recover()["status"] == "canceled"
+    assert service_at(tmp_path).recover()["status"] == "attention_required"
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
     assert snapshot["status"] == "canceled"
     assert snapshot["attempts"][0]["termination_proven"] is False
@@ -681,3 +683,180 @@ def test_contained_recovery_reports_attention_when_finalization_fails(
     snapshot = service.get_provenance(queued.job_id)
     assert snapshot["attempts"][0]["status"] == "running"
     assert snapshot["execution"]["resource_state"] == "claimed"
+
+
+@pytest.mark.parametrize("checkpoint", ("ready_committed", "file_published", "before_commit"))
+@pytest.mark.parametrize("external", (False, True))
+def test_live_ready_cancellation_finalizes_before_recovery(
+    tmp_path: Path, checkpoint: str, external: bool
+) -> None:
+    """A returned worker cannot leave its canceled ready journal owning a claim."""
+    class Adapter(DeterministicCpuAdapter):
+        containment_contract = None if external else PROCESS_CONTAINED_CONTRACT
+
+    preserved = []
+
+    def cancel_at(name):
+        if name != checkpoint:
+            return
+        if name != "ready_committed":
+            final = next((tmp_path / "images").glob("*.png"))
+            preserved.append((final, final.stat().st_ino, final.read_bytes()))
+        assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+
+    service = service_at(tmp_path, adapter=Adapter(), publication_checkpoint=cancel_at)
+    queued = service.enqueue("live-ready-cancel", request(), max_attempts=2)
+    service.work()
+
+    # These assertions intentionally precede every explicit recovery call.
+    snapshot = service.get_provenance(queued.job_id)
+    assert snapshot["status"] == "canceled"
+    assert snapshot["artifact"] is None
+    assert snapshot["attempt"]["status"] == "canceled"
+    assert snapshot["attempt"]["termination_proven"] is (not external)
+    assert snapshot["execution"]["resource_state"] == (
+        "quarantined" if external else "available"
+    )
+    with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+        assert connection.execute("SELECT state FROM artifact_publications").fetchone() == ("abandoned",)
+        assert connection.execute("SELECT count(*) FROM generation_artifacts").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM artifact_edges").fetchone() == (0,)
+
+    service.recover()
+    service.recover()
+    assert service.get_provenance(queued.job_id)["attempts"] == snapshot["attempts"]
+    for final, inode, content in preserved:
+        assert final.stat().st_ino == inode
+        assert final.read_bytes() == content
+
+
+def test_recovered_external_artifact_reports_quarantine_immediately(tmp_path: Path) -> None:
+    """Recovering image bytes cannot report the execution resource as reusable."""
+    class ExternalAdapter(DeterministicCpuAdapter):
+        containment_contract = None
+
+    service = service_at(tmp_path, adapter=ExternalAdapter())
+    queued = service.enqueue("external-ready", request())
+    crash_worker(tmp_path, checkpoint="ready_committed", external=True)
+
+    report = service.recover()
+
+    assert report["status"] == "attention_required"
+    snapshot = service.get_provenance(queued.job_id)
+    assert snapshot["status"] == "succeeded"
+    assert snapshot["artifact"] is not None
+    assert snapshot["attempt"]["termination_proven"] is False
+    assert snapshot["execution"]["resource_state"] == "quarantined"
+    assert service.recover()["status"] == "attention_required"
+
+
+def test_cancellation_does_not_authorize_a_different_attempt_owner(tmp_path: Path) -> None:
+    """Canceled state cannot turn arbitrary credentials into a finalization claim."""
+    service = service_at(tmp_path)
+    queued = service.enqueue("wrong-cancel-owner", request())
+    crash_worker(tmp_path, checkpoint="before_stage_write")
+    attempt = service._store.current_attempt(queued.job_id)
+    service.cancel(queued.job_id)
+    publication = service._store.publications(str(tmp_path / "images"))[0]
+    service._store.abandon_publication(publication["publication_id"], "canceled")
+    before = service.get_provenance(queued.job_id)
+
+    assert service._store.fail_execution(
+        queued.job_id, attempt["attempt_id"], "wrong owner", "2026-10-25T00:00:00+00:00",
+        attempt_owner_id="worker_wrong", claim_epoch=attempt["claim_epoch"],
+        failure_class="canceled", termination_proven=True,
+    ) is False
+    assert service.get_provenance(queued.job_id) == before
+
+
+@pytest.mark.parametrize("external", (False, True))
+@pytest.mark.parametrize("max_attempts", (1, 2))
+def test_cancel_after_reconciliation_snapshot_cannot_restore_retry(
+    tmp_path: Path, monkeypatch, external: bool, max_attempts: int,
+) -> None:
+    """A committed cancellation outranks an earlier crash-recovery snapshot."""
+    class CrashAdapter(DeterministicCpuAdapter):
+        containment_contract = None if external else PROCESS_CONTAINED_CONTRACT
+
+    service = service_at(tmp_path, adapter=CrashAdapter())
+    queued = service.enqueue("snapshot-cancel-race", request(), max_attempts=max_attempts)
+    crash_worker(tmp_path, checkpoint="stage_written", external=external)
+    snapshot_read = threading.Event()
+    resume_finalization = threading.Event()
+    finalize = service._store.fail_execution
+
+    def pause_after_snapshot(*args, **kwargs):
+        # Reconciliation has already selected its classification from the real
+        # running attempt. Pause before the finalization transaction starts.
+        assert kwargs["failure_class"] == ("ambiguous" if external else "crash")
+        assert kwargs["_revoked_publication_id"]
+        snapshot_read.set()
+        assert resume_finalization.wait(10), "cancellation did not resume finalization"
+        return finalize(*args, **kwargs)
+
+    monkeypatch.setattr(service._store, "fail_execution", pause_after_snapshot)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        reconciliation = pool.submit(service.reconcile)
+        try:
+            assert snapshot_read.wait(10), "reconciliation did not reach finalization"
+            assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+            canceled = service.get_provenance(queued.job_id)
+            assert canceled["status"] == "canceled"
+            assert canceled["execution"]["retry_eligible"] is False
+            assert canceled["execution"]["resource_state"] == "claimed"
+        finally:
+            resume_finalization.set()
+        report = reconciliation.result(timeout=10)
+
+    # Check the stale finalization result before any further recovery can hide
+    # an overwritten cancellation or an incorrectly released reservation.
+    after_finalization = service.get_provenance(queued.job_id)
+    assert after_finalization["status"] == "canceled"
+    assert after_finalization == canceled
+    assert report["status"] == "attention_required"
+    assert canceled["attempt"]["status"] == "running"
+    assert canceled["artifact"] is None
+    with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM artifact_edges").fetchone() == (0,)
+
+    monkeypatch.setattr(service._store, "fail_execution", finalize)
+    service.recover()
+    finalized = service.get_provenance(queued.job_id)
+    assert finalized["status"] == "canceled"
+    assert finalized["attempt"]["status"] == "canceled"
+    assert finalized["attempt"]["termination_proven"] is (not external)
+    assert finalized["execution"]["retry_eligible"] is False
+    assert finalized["execution"]["resource_state"] == (
+        "quarantined" if external else "available"
+    )
+    service.recover()
+    assert service.get_provenance(queued.job_id) == finalized
+    assert service.work()["status"] == ("resource_busy" if external else "idle")
+    assert len(service.get_provenance(queued.job_id)["attempts"]) == 1
+
+
+@pytest.mark.parametrize(("epoch_advance", "failure_class"), ((2, "crash"), (1, "canceled")))
+def test_abandoned_journal_requires_matching_job_fence_and_classification(
+    tmp_path: Path, epoch_advance: int, failure_class: str,
+) -> None:
+    """A journal cannot grant finalization across unrelated fencing or status."""
+    service = service_at(tmp_path)
+    queued = service.enqueue("revoked-fence-relation", request(), max_attempts=2)
+    crash_worker(tmp_path, checkpoint="stage_written")
+    attempt = service._store.current_attempt(queued.job_id)
+    publication = service._store.publications(str(tmp_path / "images"))[0]
+    service._store.abandon_publication(publication["publication_id"], "revoked")
+    with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+        connection.execute(
+            "UPDATE execution_jobs SET fence_epoch = fence_epoch + ? WHERE job_id = ?",
+            (epoch_advance, queued.job_id),
+        )
+    before = service.get_provenance(queued.job_id)
+
+    assert service._store.fail_execution(
+        queued.job_id, attempt["attempt_id"], "stale recovery", "2026-10-25T00:00:00+00:00",
+        attempt_owner_id=attempt["owner_id"], claim_epoch=attempt["claim_epoch"],
+        failure_class=failure_class, termination_proven=True,
+        _revoked_publication_id=publication["publication_id"],
+    ) is False
+    assert service.get_provenance(queued.job_id) == before

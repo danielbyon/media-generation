@@ -317,6 +317,7 @@ class PublicationManager:
             claim_epoch=epoch,
             failure_class=failure_class,
             termination_proven=contained,
+            _revoked_publication_id=str(record['publication_id']),
         )
 
     def _abandon(
@@ -426,6 +427,13 @@ class PublicationManager:
                 )
                 if record['state'] == 'allocated':
                     self._abandon(directory, record, str(error))
+                elif record['state'] == 'ready' and not self.store.publication_authority_current(
+                    publication_id
+                ):
+                    # The invocation has unwound, but its ready journal still
+                    # blocks attempt finalization. Revoke only the fenced
+                    # durable decision; T03 retains any physical final file.
+                    self.store.revoke_ready_publication(publication_id, str(error))
                 else:
                     self.store.update_publication(publication_id, error=str(error))
                 if reject_input:

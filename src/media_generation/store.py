@@ -483,7 +483,7 @@ class SQLiteStore:
                         attempt["attempt_number"],
                         attempt["status"],
                         "ambiguous" if running else (None if attempt["status"] == "succeeded" else "terminal"),
-                        0 if running else 1,
+                        0,
                         plan_json,
                         attempt["finished_at"],
                     ),
@@ -694,6 +694,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     )
                 if (
                     max_attempts is not None
+                    and existing["execution_status"] != "succeeded"
                     and int(existing["execution_max_attempts"]) != max_attempts
                 ):
                     raise IdempotencyConflictError(
@@ -833,115 +834,12 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         resolved_output_directory: str,
         timestamp: str,
     ) -> PendingExecution:
-        """Persist or reuse a matching execution, including its output directory."""
-        with self._connection(transaction=True) as connection:
-            existing = connection.execute(
-                "SELECT job_id, request_id, request_digest, output_slot_id, "
-                "adapter_id, adapter_configuration_json, effective_parameters_json "
-                "FROM generation_jobs WHERE idempotency_key = ?",
-                (idempotency_key,),
-            ).fetchone()
-            if existing is not None:
-                if existing["request_digest"] != request_digest:
-                    raise IdempotencyConflictError(
-                        "idempotency key is already bound to different canonical request intent"
-                    )
-                if (
-                    existing["adapter_id"] != adapter_id
-                    or existing["adapter_configuration_json"] != adapter_configuration_json
-                ):
-                    raise IdempotencyConflictError(
-                        "idempotency key is already bound to a different adapter identity "
-                        "or configuration"
-                    )
-                existing_output_directory = self._output_directory_for_job(
-                    connection,
-                    str(existing["job_id"]),
-                    str(existing["effective_parameters_json"]),
-                )
-                if existing_output_directory != str(
-                    Path(resolved_output_directory).expanduser().resolve()
-                ):
-                    raise IdempotencyConflictError(
-                        "idempotency key is already bound to a different or unknown "
-                        "output directory"
-                    )
-                return PendingExecution(
-                    False,
-                    str(existing["request_id"]),
-                    str(existing["job_id"]),
-                    "",
-                    str(existing["output_slot_id"]),
-                    (),
-                )
+        """Reject the retired pre-queue admission path before it changes rows.
 
-            references: list[ResolvedReference] = []
-            for artifact_id in request.reference_ids:
-                row = connection.execute(
-                    "SELECT artifact_id, sha256, path FROM generation_artifacts WHERE artifact_id = ?",
-                    (artifact_id,),
-                ).fetchone()
-                if row is None:
-                    raise UnknownReferenceError(f"unknown reference artifact ID: {artifact_id}")
-                references.append(
-                    ResolvedReference(
-                        artifact_id=str(row["artifact_id"]),
-                        content_sha256=str(row["sha256"]),
-                        path=Path(str(row["path"])),
-                    )
-                )
-
-            effective_parameters = json.loads(effective_parameters_json)
-            effective_parameters[_RESOLVED_OUTPUT_DIRECTORY_KEY] = str(
-                Path(resolved_output_directory).expanduser().resolve()
-            )
-            effective_parameters_json = _json(effective_parameters)
-
-            connection.execute(
-                "INSERT INTO generation_requests "
-                "(request_id, canonical_json, request_digest, created_at) VALUES (?, ?, ?, ?)",
-                (request_id, request.canonical_json(), request_digest, timestamp),
-            )
-            connection.execute(
-                """INSERT INTO generation_jobs (
-                    job_id, request_id, idempotency_key, request_digest, status,
-                    adapter_id, adapter_configuration_json, resolved_prompt, resolved_seed,
-                    validated_reference_ids_json, output_slot, output_slot_id,
-                    effective_parameters_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    job_id,
-                    request_id,
-                    idempotency_key,
-                    request_digest,
-                    adapter_id,
-                    adapter_configuration_json,
-                    request.prompt,
-                    resolved_seed,
-                    _json(request.reference_ids),
-                    request.output_slot,
-                    output_slot_id,
-                    effective_parameters_json,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO generation_attempts (
-                    attempt_id, job_id, attempt_number, status, adapter_id,
-                    started_at, finished_at, error_message
-                ) VALUES (?, ?, 1, 'running', ?, ?, NULL, NULL)""",
-                (attempt_id, job_id, adapter_id, timestamp),
-            )
-
-        return PendingExecution(
-            True,
-            request_id,
-            job_id,
-            attempt_id,
-            output_slot_id,
-            tuple(references),
-        )
+        Callers must use queued admission and a resource-owning claim so that
+        every running attempt has durable sidecars and publication authority.
+        """
+        raise RuntimeError("use queued admission and claim_next_execution")
 
     def claim_next_execution(
         self,
@@ -1220,17 +1118,8 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         owner_id: str | None,
         claim_epoch: int | None,
     ) -> bool:
-        if owner_id is None and claim_epoch is None:
-            return connection.execute(
-                """SELECT 1
-                   FROM execution_jobs AS jobs
-                   JOIN execution_attempts AS attempts
-                     ON attempts.attempt_id = jobs.current_attempt_id
-                   WHERE jobs.job_id = ? AND jobs.status = 'running'
-                     AND jobs.current_attempt_id = ? AND attempts.job_id = jobs.job_id
-                     AND attempts.status = 'running'""",
-                (job_id, attempt_id),
-            ).fetchone() is not None
+        if owner_id is None or claim_epoch is None:
+            return False
         return connection.execute(
             """SELECT 1 FROM execution_jobs AS jobs
                JOIN execution_attempts AS attempts
@@ -1295,19 +1184,15 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 raise RuntimeError(
                     f"attempt {artifact.attempt_id} for job {artifact.job_id} is not running"
                 )
-            if attempt_owner_id is not None or claim_epoch is not None:
-                if not self._attempt_authorized(
-                    connection,
-                    artifact.job_id,
-                    artifact.attempt_id,
-                    attempt_owner_id,
-                    claim_epoch,
-                ):
-                    raise RuntimeError("attempt ownership, epoch, or current-job authority is stale")
             if publication_id is None:
                 raise RuntimeError(
                     "generated artifact completion requires a publication journal row"
                 )
+            if not self._attempt_authorized(
+                connection, artifact.job_id, artifact.attempt_id,
+                attempt_owner_id, claim_epoch,
+            ):
+                raise RuntimeError("attempt ownership, epoch, or current-job authority is stale")
             connection.execute(
                 """INSERT INTO generation_artifacts (
                     artifact_id, job_id, attempt_id, output_slot_id, path, media_type,
@@ -1729,6 +1614,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         claim_epoch: int | None = None,
         failure_class: str = "terminal",
         termination_proven: bool = False,
+        _revoked_publication_id: str | None = None,
     ) -> bool:
         """Finalize one current attempt and apply the durable outcome.
 
@@ -1749,8 +1635,45 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             current = self._attempt_authorized(
                 connection, job_id, attempt_id, attempt_owner_id, claim_epoch
             )
-            if not current and failure_class != "canceled":
-                return False
+            if not current:
+                # Finalization of a canceled or durably revoked journal is a
+                # narrower capability than publication. It still requires the
+                # actual persisted claim and reservation, never ownerless data.
+                if attempt_owner_id is None or claim_epoch is None:
+                    return False
+                canceled_claim = failure_class == "canceled" and connection.execute(
+                    """SELECT 1 FROM execution_jobs AS jobs
+                       JOIN execution_attempts AS attempts ON attempts.attempt_id = jobs.current_attempt_id
+                       JOIN execution_resource AS resource ON resource.id = 1
+                       WHERE jobs.job_id = ? AND jobs.status = 'canceled'
+                         AND jobs.fence_epoch = ? + 1 AND attempts.attempt_id = ?
+                         AND attempts.owner_id = ? AND attempts.claim_epoch = ?
+                         AND resource.job_id = jobs.job_id AND resource.attempt_id = attempts.attempt_id
+                         AND resource.owner_id = attempts.owner_id AND resource.state = 'claimed'""",
+                    (job_id, claim_epoch, attempt_id, attempt_owner_id, claim_epoch),
+                ).fetchone() is not None
+                # A revoked journal can finalize only the immediately fenced,
+                # still-running job. A newer cancellation must use the explicit
+                # canceled capability above, never a stale crash classification.
+                revoked_claim = failure_class != "canceled" and _revoked_publication_id is not None and connection.execute(
+                    """SELECT 1 FROM artifact_publications AS publications
+                       JOIN artifact_publication_authority AS authority USING (publication_id)
+                       JOIN execution_jobs AS jobs ON jobs.job_id = authority.job_id
+                       JOIN execution_attempts AS attempts ON attempts.attempt_id = jobs.current_attempt_id
+                       JOIN execution_resource AS resource ON resource.id = 1
+                       WHERE publications.publication_id = ? AND publications.state = 'abandoned'
+                         AND authority.job_id = ? AND authority.attempt_id = ?
+                         AND authority.owner_id = ? AND authority.claim_epoch = ?
+                         AND jobs.status = 'running'
+                         AND jobs.fence_epoch = authority.claim_epoch + 1
+                         AND attempts.attempt_id = authority.attempt_id
+                         AND attempts.owner_id = authority.owner_id AND attempts.claim_epoch = authority.claim_epoch
+                         AND resource.job_id = jobs.job_id AND resource.attempt_id = attempts.attempt_id
+                         AND resource.owner_id = attempts.owner_id AND resource.state = 'claimed'""",
+                    (_revoked_publication_id, job_id, attempt_id, attempt_owner_id, claim_epoch),
+                ).fetchone() is not None
+                if not canceled_claim and not revoked_claim:
+                    return False
             if connection.execute(
                 "SELECT 1 FROM artifact_publications WHERE job_id = ? "
                 "AND state IN ('ready', 'committed')",

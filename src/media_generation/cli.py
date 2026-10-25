@@ -146,9 +146,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
             service = GenerationService(options.db, options.output_dir)
             report = service.work(limit=options.limit)
             if report["status"] == "resource_busy":
-                return _write_error("resource_busy", "local generation resource is busy", 1)
+                return _write_error(
+                    "resource_busy", "local generation resource is busy", 1,
+                    outcomes=report.get("outcomes", []),
+                )
             _write_json(report, sys.stdout)
-            return 0
+            return int(any(
+                item["status"] != "succeeded" or not item["termination_proven"]
+                for item in report.get("outcomes", [])
+            ))
 
         if options.command == "recover":
             service = GenerationService(options.db, options.output_dir)
@@ -265,7 +271,7 @@ def _write_json(value: object, output: object) -> None:
     output.write(json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n")
 
 
-def _write_error(code: str, message: str, exit_code: int, **details: str) -> int:
+def _write_error(code: str, message: str, exit_code: int, **details: object) -> int:
     """Write a machine-readable failure to stderr without a success-shaped response."""
     _write_json({"error": {"code": code, "message": message, **details}}, sys.stderr)
     return exit_code
