@@ -152,7 +152,13 @@ class GenerationPlan:
 
 @dataclass(frozen=True, slots=True)
 class GenerationJob:
-    """Durable execution state derived from an immutable request."""
+    """Persisted job with legacy and durable execution status.
+
+    ``status`` is the legacy ``generation_jobs.status`` lifecycle value.
+    ``execution_status`` is the durable queue state when its sidecar exists.
+    Resource occupancy is database-wide and is exposed by provenance rather
+    than this job snapshot.
+    """
 
     job_id: str
     request_id: str
@@ -171,7 +177,6 @@ class GenerationJob:
     max_attempts: int = 1
     fence_epoch: int = 0
     execution_status: str | None = None
-    resource_state: str = "available"
     retry_eligible: bool = False
     failure_message: str | None = None
 
@@ -199,7 +204,6 @@ class GenerationJob:
             "max_attempts": self.max_attempts,
             "fence_epoch": self.fence_epoch,
             "execution_status": self.execution_status or self.status,
-            "resource_state": self.resource_state,
             "retry_eligible": self.retry_eligible,
             "failure_message": self.failure_message,
         }

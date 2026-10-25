@@ -54,13 +54,17 @@ matches the SHA-256 value stored with its artifact record.
 
 Repeating a submission reuses the existing job when the canonical request
 intent, adapter identity, adapter configuration, and resolved output directory
-all match the values stored for that idempotency key. A changed request intent,
-adapter identity or configuration, or output directory produces an explicit
-`idempotency_conflict`. A matching queued job retains its persisted attempt
-budget; a matching succeeded job returns its existing artifact identity; and a
-matching failed or ambiguous job remains inspectable. An omitted `max_attempts`
-does not rewrite the budget chosen by the first admission, while an explicitly
-different budget conflicts. If no seed is supplied, the service resolves one
+all match the values stored for that idempotency key. A supplied attempt budget
+must also match for a non-succeeded job. If a non-succeeded job recorded a
+containment contract, the contract must match as well. A changed value produces
+an explicit `idempotency_conflict`. A migrated terminal failed T01/T03 job whose
+persisted containment contract is NULL keeps the legacy reuse behavior after
+the other checks pass; that exception never applies to a queued or running job,
+or to two different non-NULL contracts. A matching queued job retains its
+persisted attempt budget; a matching succeeded job returns its existing artifact
+identity; and a matching failed or ambiguous job remains inspectable. An omitted
+`max_attempts` does not rewrite the budget chosen by the first admission, while an
+explicitly different budget conflicts. If no seed is supplied, the service resolves one
 from the canonical request digest and persists it before adapter execution.
 
 `submit` atomically admits a job and then attempts one synchronous execution.
@@ -70,6 +74,22 @@ resource, the command returns a structured `resource_busy` error containing
 the durable `job_id`; it does not report a queue entry as a completed image.
 Repeating `submit` after the resource is free executes the same queued job
 without creating a second job, output slot, or attempt budget.
+
+Job JSON reports two status dimensions without removing either compatibility
+field: `status` is the legacy `generation_jobs.status` lifecycle
+(`running`, `succeeded`, or `failed`), while `execution_status` is the durable
+queue state (`queued`, `running`, `succeeded`, `failed`, `canceled`, or
+`ambiguous`). `SubmissionResult.status` and provenance's top-level `status`
+report the durable execution state. A queued job can show legacy `status`
+`running` while `execution_status` is `queued`.
+
+The SQLite database has one heavyweight execution resource shared by every job.
+Resource occupancy is therefore provenance-wide context, not a property of an
+individual job snapshot. `provenance.execution.resource_state` reports that
+global state, and `resource_job_id`, `resource_attempt_id`, and
+`resource_owner_id` identify its owner when one applies. A queued job must not
+be interpreted as claiming the resource merely because a different job holds
+it.
 
 ## Persistence and adapter boundary
 
@@ -86,6 +106,17 @@ reopening a pathname or closing the stream. The bundled
 Python standard library. Its output is reproducible for the same prompt, seed,
 dimensions, and reference contents. Artifact retrieval reports the file path,
 PNG dimensions, media type, byte count, and content hash.
+
+Before opening an existing T01 or T03 database with this release, stop every
+older CLI worker, adapter process, and inference child that can write the
+database or image tree; wait for them to exit. Back up the database with the
+SQLite backup API or while it is offline, and preserve the image tree and
+publication roots with it. The version 3 migration installs database guards
+that reject later writes from binaries that do not identify themselves as
+current, but a trigger cannot prove that an already-running process stopped or
+prevent it from changing files before its database commit fails. Restore the
+pre-migration database before intentionally running an older binary again; a
+version 3 database is not safely downgradeable in place.
 
 ## Durable execution
 
@@ -135,7 +166,17 @@ media-generation recover --db ./studio.sqlite3 --output-dir ./artifacts
 
 `retry` acknowledges an eligible bounded retry that is already queued. Repeated
 retry requests are idempotent and preserve the job, request, output slot, attempt
-history, and immutable budget; a later worker claim creates the next attempt.
+history, and immutable budget while the job remains queued, eligible, within
+budget, and the heavyweight resource is available. A later worker claim, failed
+recovery, or another job's resource claim can make a later request fail instead
+of acknowledging stale eligibility. A later worker claim creates the next
+attempt only when the persisted retry policy permits it.
+
+Migration preserves historical failed work as terminal. The job keeps one
+historical attempt, a one-attempt budget, retry eligibility set to false, and a
+terminal attempt classification. Neither `work` nor `retry` replays that work.
+Reusing its idempotency key returns the existing failed job under the NULL
+containment compatibility rule above; it does not admit or execute new work.
 
 Cancellation of a never-claimed job is terminal and creates no attempt. An
 active attempt is fenced immediately, but cancel returns `accepted` while the

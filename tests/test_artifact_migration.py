@@ -13,6 +13,15 @@ from media_generation.domain import (
 )
 from media_generation.publication import PublicationManager
 from media_generation.service import GenerationService
+from media_generation.store import _WRITER_EPOCH, _WRITER_EPOCH_FUNCTION
+
+
+@contextmanager
+def current_writer_connection(database: Path):
+    """Open a raw test connection that identifies itself as the current writer."""
+    with sqlite3.connect(database) as connection:
+        connection.create_function(_WRITER_EPOCH_FUNCTION, 0, lambda: _WRITER_EPOCH)
+        yield connection
 
 
 def legacy_database(tmp_path, *, cross_root=False):
@@ -255,7 +264,7 @@ def test_import_identity_roles_and_transactional_graph_constraints(tmp_path):
         (('art_'+'f'*32,first.artifact_id,'reference',0), 'FOREIGN KEY'),
         ((second.artifact_id,first.artifact_id,'derivation',0), 'cycle'),
     ):
-        with sqlite3.connect(database) as connection:
+        with current_writer_connection(database) as connection:
             connection.execute('PRAGMA foreign_keys=ON')
             # Exercise graph constraints inside a publication transaction. The
             # transaction is rolled back so historical lineage remains sealed.
@@ -264,11 +273,11 @@ def test_import_identity_roles_and_transactional_graph_constraints(tmp_path):
             with pytest.raises(sqlite3.IntegrityError,match=reason):
                 connection.execute('INSERT INTO artifact_edges VALUES (?,?,?,?)',values)
             connection.rollback()
-    with sqlite3.connect(database) as connection:
-        with pytest.raises(sqlite3.IntegrityError,match='sealed'):
-            connection.execute('INSERT INTO artifact_edges VALUES (?,?,?,?)',
-                               (first.artifact_id,second.artifact_id,'reference',3))
-    with sqlite3.connect(database) as connection:
+        with current_writer_connection(database) as connection:
+            with pytest.raises(sqlite3.IntegrityError,match='sealed'):
+                connection.execute('INSERT INTO artifact_edges VALUES (?,?,?,?)',
+                                   (first.artifact_id,second.artifact_id,'reference',3))
+    with current_writer_connection(database) as connection:
         for statement in ("UPDATE artifact_edges SET role='inspiration'",'DELETE FROM artifact_edges',
                           "UPDATE generation_artifacts SET sha256='changed'",'DELETE FROM generation_artifacts'):
             with pytest.raises(sqlite3.IntegrityError):

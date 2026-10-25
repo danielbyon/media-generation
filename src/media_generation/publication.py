@@ -270,6 +270,55 @@ class PublicationManager:
         except Exception as error:
             return f'cleanup_pending: {error}'
 
+    def _finalize_abandoned_attempt(
+        self,
+        record: dict[str, object],
+        error: str,
+    ) -> bool:
+        """Finalize the current running attempt for an abandoned publication.
+
+        Cancellation fences the owner and epoch before reconciliation observes
+        the attempt. Only the ``canceled`` classification is allowed to finalize
+        through stale ownership. Other attempts use containment evidence to
+        choose crash or ambiguous, so an unproven process remains quarantined.
+
+        Returns ``True`` when no current attempt needs finalization or SQLite
+        committed the transition. A current running attempt that cannot be
+        finalized returns ``False`` so the caller can fail closed.
+        """
+        if record.get('job_id') is None:
+            return True
+        job_id = str(record['job_id'])
+        attempt_id = str(record['attempt_id'])
+        attempt = self.store.current_attempt(job_id)
+        if (
+            attempt is None
+            or attempt['attempt_id'] != attempt_id
+            or attempt['status'] != 'running'
+        ):
+            return True
+        owner_id = None if attempt['owner_id'] is None else str(attempt['owner_id'])
+        epoch = int(attempt['claim_epoch'])
+        contained = (
+            attempt['containment_contract'] is not None
+            and bool(attempt['process_contained'])
+        )
+        failure_class = (
+            'canceled'
+            if attempt['job_status'] == 'canceled'
+            else 'crash' if contained else 'ambiguous'
+        )
+        return self.store.fail_execution(
+            job_id,
+            attempt_id,
+            error,
+            now(),
+            attempt_owner_id=owner_id,
+            claim_epoch=epoch,
+            failure_class=failure_class,
+            termination_proven=contained,
+        )
+
     def _abandon(
         self,
         directory: int,
@@ -279,27 +328,10 @@ class PublicationManager:
         finalize_attempt: bool = False,
     ) -> str:
         self.store.abandon_publication(str(record['publication_id']), error)
-        if finalize_attempt and record.get('job_id') is not None:
-            job_id = str(record['job_id'])
-            attempt_id = str(record['attempt_id'])
-            attempt = self.store.current_attempt(job_id)
-            if attempt is not None and attempt['attempt_id'] == attempt_id:
-                owner_id = None if attempt['owner_id'] is None else str(attempt['owner_id'])
-                epoch = int(attempt['claim_epoch'])
-                contained = (
-                    attempt['containment_contract'] is not None
-                    and bool(attempt['process_contained'])
-                )
-                self.store.fail_execution(
-                    job_id,
-                    attempt_id,
-                    error,
-                    now(),
-                    attempt_owner_id=owner_id,
-                    claim_epoch=epoch,
-                    failure_class='crash' if contained else 'ambiguous',
-                    termination_proven=contained,
-                )
+        if finalize_attempt and not self._finalize_abandoned_attempt(record, error):
+            raise PublicationError(
+                f"{record['publication_id']}: abandoned attempt was not finalized"
+            )
         return self._clean_stage(directory, record)
 
     def publish(self, writer: Callable[[Path, BinaryIO], object], factory: Callable[[ImageInfo, Path], Artifact],
@@ -637,9 +669,12 @@ class PublicationManager:
                         record = self.store.publication(str(record['publication_id']))
                     else:
                         cleanup = self._clean_stage(directory, record)
-                        if record['state'] == 'abandoned' and record['job_id'] is not None:
-                            self.store.fail_execution(str(record['job_id']), str(record['attempt_id']),
-                                str(record['error']), now())
+                        if record['state'] == 'abandoned' and not self._finalize_abandoned_attempt(
+                            record, str(record['error'])
+                        ):
+                            raise PublicationError(
+                                f"{record['publication_id']}: abandoned attempt was not finalized"
+                            )
                     result.update(state=record['state'], cleanup=cleanup)
                 except Exception as error:
                     # A failed response after commit is still a committed result.

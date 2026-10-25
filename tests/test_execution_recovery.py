@@ -599,3 +599,85 @@ def test_canceled_ready_publication_reports_retained_final_as_orphan(
         assert connection.execute(
             "SELECT count(*) FROM generation_artifacts"
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("external", "expected_resource_state"),
+    ((False, "available"), (True, "quarantined")),
+)
+def test_canceled_allocated_attempt_reconciliation_finalizes_attempt_and_resource(
+    tmp_path: Path,
+    external: bool,
+    expected_resource_state: str,
+) -> None:
+    """Reconciliation must not report success while a canceled claim is live."""
+    adapter: DeterministicCpuAdapter
+    if external:
+
+        class ExternalAdapter(DeterministicCpuAdapter):
+            containment_contract = None
+
+        adapter = ExternalAdapter()
+    else:
+        adapter = DeterministicCpuAdapter()
+
+    queued = service_at(tmp_path, adapter=adapter).enqueue(
+        "canceled-allocation", request(), max_attempts=2
+    )
+    crash_worker(tmp_path, checkpoint="stage_written", external=external)
+    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+
+    report = service_at(tmp_path).reconcile()
+
+    assert report["status"] == "complete"
+    snapshot = service_at(tmp_path).get_provenance(queued.job_id)
+    assert snapshot["status"] == "canceled"
+    assert snapshot["attempts"][0]["status"] == "canceled"
+    assert snapshot["attempts"][0]["failure_class"] == "canceled"
+    assert snapshot["execution"]["resource_state"] == expected_resource_state
+    resource = service_at(tmp_path)._store.resource_snapshot()
+    assert resource["state"] == expected_resource_state
+    if external:
+        assert resource["job_id"] == queued.job_id
+    else:
+        assert resource["job_id"] is None
+
+
+def test_canceled_allocated_attempt_reconciliation_reports_failed_finalization(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A false finalization result must surface as incomplete reconciliation."""
+    queued = service_at(tmp_path).enqueue(
+        "canceled-finalization-failure", request(), max_attempts=2
+    )
+    crash_worker(tmp_path, checkpoint="stage_written")
+    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+
+    service = service_at(tmp_path)
+    monkeypatch.setattr(service._store, "fail_execution", lambda *args, **kwargs: False)
+    report = service.reconcile()
+
+    assert report["status"] == "attention_required"
+    assert report["publications"][0]["error"]
+    snapshot = service.get_provenance(queued.job_id)
+    assert snapshot["attempts"][0]["status"] == "running"
+    assert snapshot["execution"]["resource_state"] == "claimed"
+
+
+def test_contained_recovery_reports_attention_when_finalization_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A contained crash is recovered only after durable attempt finalization."""
+    queued = service_at(tmp_path).enqueue("finalization-failure", request(), max_attempts=2)
+    crash_worker(tmp_path, checkpoint="stage_written")
+
+    service = service_at(tmp_path)
+    monkeypatch.setattr(service._store, "fail_execution", lambda *args, **kwargs: False)
+    report = service.recover()
+
+    assert report == {"status": "attention_required"}
+    snapshot = service.get_provenance(queued.job_id)
+    assert snapshot["attempts"][0]["status"] == "running"
+    assert snapshot["execution"]["resource_state"] == "claimed"

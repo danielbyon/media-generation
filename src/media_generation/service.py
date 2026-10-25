@@ -331,7 +331,7 @@ class GenerationService:
                 return {"status": "attention_required"}
             return {"status": "attention_required"}
         if contained:
-            self._store.fail_execution(
+            finalized = self._store.fail_execution(
                 job_id,
                 attempt_id,
                 "worker process ended; process-contained adapter invocation terminated",
@@ -341,6 +341,8 @@ class GenerationService:
                 failure_class="crash",
                 termination_proven=True,
             )
+            if not finalized:
+                return {"status": "attention_required"}
             return {"status": "complete"}
         self._store.fail_execution(
             job_id,
@@ -672,7 +674,7 @@ class GenerationService:
         return SubmissionResult(
             request_id=job.request_id,
             job_id=job.job_id,
-            status=job.status,
+            status=job.execution_status or job.status,
             output_slot_id=job.output_slot_id,
             artifact_id=job.artifact_id,
         )

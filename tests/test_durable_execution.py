@@ -7,11 +7,12 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from typing import BinaryIO
 
 import pytest
 
 from media_generation.adapters import DeterministicCpuAdapter, PROCESS_CONTAINED_CONTRACT
-from media_generation.domain import GenerationRequest
+from media_generation.domain import GenerationPlan, GenerationRequest
 from media_generation.errors import (
     GenerationError,
     IdempotencyConflictError,
@@ -364,7 +365,7 @@ def test_synchronous_contention_is_explicit_and_reuses_admitted_job(tmp_path: Pa
             with pytest.raises(ResourceBusyError) as failure:
                 synchronous.submit("contended", request())
             job_id = failure.value.job_id
-            assert synchronous.get_job(job_id).status == "queued"
+            assert synchronous.get_job(job_id).execution_status == "queued"
         finally:
             resume.set()
         running.result(timeout=10)
@@ -486,7 +487,7 @@ def test_cancel_at_publication_checkpoint_prevents_logical_artifact(
     restarted = service_at(tmp_path)
     restarted.recover()
     restarted.recover()
-    assert restarted.get_job(job.job_id).status == "canceled"
+    assert restarted.get_job(job.job_id).execution_status == "canceled"
     assert restarted.get_job(job.job_id).artifact_id is None
     with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM generation_artifacts").fetchone()[0] == 0
@@ -593,7 +594,7 @@ def test_worker_only_claims_matching_adapter_and_destination(tmp_path: Path) -> 
     assert GenerationService(
         tmp_path / "studio.sqlite3", other_root, DeterministicCpuAdapter()
     ).work()["status"] == "idle"
-    assert default.get_job(job.job_id).status == "queued"
+    assert default.get_job(job.job_id).execution_status == "queued"
     assert default.work()["status"] == "complete"
 
 
@@ -700,3 +701,114 @@ def test_canceled_referenced_child_preserves_parent_bytes_and_lineage(tmp_path: 
     assert current.get_lineage(parent_artifact.artifact_id)["children"] == []
     with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
         assert connection.execute("SELECT count(*) FROM artifact_edges").fetchone()[0] == 0
+
+
+def test_recover_cli_reports_resource_contention_as_failure(tmp_path: Path) -> None:
+    """A lock winner must make recovery visibly incomplete, not successful."""
+    service = service_at(tmp_path)
+    with service._resource_lock() as locked:
+        assert locked
+        result = cli(
+            tmp_path,
+            "recover",
+            "--output-dir",
+            str(tmp_path / "images"),
+        )
+
+    assert result.returncode == 1
+    error = json.loads(result.stderr)
+    assert error["error"]["code"] == "resource_busy"
+    assert result.stdout == ""
+
+
+def test_job_snapshot_preserves_generation_status_and_execution_status(tmp_path: Path) -> None:
+    """The legacy flat status remains distinct from durable execution state."""
+    service = service_at(tmp_path)
+    queued = service.enqueue("status-compatibility", request())
+
+    job = service.get_job(queued.job_id)
+    snapshot = job.to_dict()
+    provenance = service.get_provenance(queued.job_id)
+
+    assert job.status == "running"
+    assert job.execution_status == "queued"
+    assert snapshot["status"] == "running"
+    assert snapshot["execution_status"] == "queued"
+    assert provenance["status"] == "queued"
+
+    assert service.cancel(queued.job_id)["outcome"] == "acknowledged"
+    canceled = service.get_job(queued.job_id)
+    canceled_snapshot = canceled.to_dict()
+    canceled_provenance = service.get_provenance(queued.job_id)
+
+    assert canceled.status == "failed"
+    assert canceled.execution_status == "canceled"
+    assert canceled_snapshot["status"] == "failed"
+    assert canceled_snapshot["execution_status"] == "canceled"
+    assert canceled_provenance["status"] == "canceled"
+
+
+def test_queued_job_does_not_report_another_jobs_resource_state(tmp_path: Path) -> None:
+    """Resource occupancy belongs to provenance, with explicit ownership."""
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class PausedAdapter(DeterministicCpuAdapter):
+        def generate(
+            self, plan: GenerationPlan, destination: BinaryIO
+        ) -> tuple[str, int, int]:
+            entered.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("paused adapter was not released")
+            return super().generate(plan, destination)
+
+    service = service_at(tmp_path, adapter=PausedAdapter())
+    owner = service.enqueue("resource-owner", request("resource owner"))
+    other = service.enqueue("resource-other", request("resource other"))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        working = executor.submit(service.work)
+        assert entered.wait(timeout=10)
+        try:
+            queued = service.get_job(other.job_id)
+            snapshot = service.get_provenance(other.job_id)
+
+            assert not hasattr(queued, "resource_state")
+            assert "resource_state" not in queued.to_dict()
+            assert snapshot["execution"]["resource_state"] == "claimed"
+            assert snapshot["execution"]["resource_job_id"] == owner.job_id
+            assert snapshot["execution"]["resource_attempt_id"].startswith("att_")
+            assert snapshot["execution"]["resource_owner_id"].startswith("worker_")
+        finally:
+            release.set()
+
+    assert working.result(timeout=10)["status"] == "complete"
+
+
+def test_idempotency_rejects_different_non_null_containment_contract(
+    tmp_path: Path,
+) -> None:
+    """A trusted contract recorded at admission cannot later be replaced."""
+
+    class DifferentContainedAdapter(DeterministicCpuAdapter):
+        containment_contract = "different-contained/v1"
+
+    service_at(tmp_path).enqueue("contract-identity", request())
+    with pytest.raises(IdempotencyConflictError, match="containment contract"):
+        service_at(tmp_path, adapter=DifferentContainedAdapter()).enqueue(
+            "contract-identity", request()
+        )
+
+
+def test_idempotency_rejects_contract_for_existing_queued_null_job(
+    tmp_path: Path,
+) -> None:
+    """The legacy NULL exception is limited to persisted terminal failure."""
+
+    class ExternalAdapter(DeterministicCpuAdapter):
+        containment_contract = None
+
+    service_at(tmp_path, adapter=ExternalAdapter()).enqueue("external-queued", request())
+    with pytest.raises(IdempotencyConflictError, match="containment contract"):
+        service_at(tmp_path).enqueue("external-queued", request())

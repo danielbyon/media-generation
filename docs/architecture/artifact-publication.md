@@ -28,6 +28,29 @@ execute in one transaction; failure rolls back the entire upgrade. Older
 application versions must not write an upgraded database; migration remains
 compatibility-forward for database readers.
 
+The version 3 migration also installs a database write barrier for the legacy
+T01 and T03 tables. Every connection created by the current store registers a
+connection-local `media_generation_writer_epoch()` function, and `BEFORE
+INSERT/UPDATE` triggers on `generation_requests`, `generation_jobs`,
+`generation_attempts`, `generation_artifacts`, `artifact_edges`,
+`artifact_publications`, and `artifact_integrity` require that function to
+report version 3. An older binary does not register it, so its first guarded
+mutation aborts with `no such function: media_generation_writer_epoch` while
+`user_version` remains 3. Opening version 3 recreates a missing guard and
+rejects a same-name guard with a divergent definition. Opening also fails with
+an explicit diagnostic if a public job has no `execution_jobs` sidecar, because
+such a row was admitted after the migration boundary by a writer that bypassed
+the barrier.
+
+This barrier protects SQLite mutations made after migration commits. It is not
+a process supervisor or an authentication boundary. Operators must stop all
+T01/T03 workers and their adapter or inference children, wait for those
+processes to exit, and take a verified database and image-tree backup before
+migrating. Already-running older writers can still change files, and a
+deliberate process could register a matching function or remove triggers.
+Restore the pre-migration database before intentionally running an older binary;
+image files and publication journals must be restored with it.
+
 ## 2. Approved import boundary
 
 The local CLI is an operator interface. `import --approved-root DIR --source NAME`
@@ -74,11 +97,7 @@ Execution scheduling uses separate SQLite rows and transaction guards in the
 same database. All cooperating workers must use the database and output
 directory. Admission atomically stores one immutable request, job, output slot,
 fully resolved plan, adapter identity and configuration, ordered reference IDs
-and digests, destination, and persisted attempt budget. An omitted budget
-defaults to one only for a new job; reuse preserves the first admission's
-budget and an explicitly different value conflicts. A queued job has no attempt
-until a worker claim succeeds. The database contains one heavyweight resource
-row for the local execution domain.
+An omitted budget defaults to one only for a new job; reuse preserves the first admission's budget, and an explicitly different value conflicts. Reuse also requires a matching resolved destination and any containment contract recorded by a non-succeeded job. A terminal historical T01/T03 failure with a NULL migrated contract keeps the legacy NULL compatibility exception; queued, running, and differing non-NULL contracts fail closed. A queued job has no attempt until a worker claim succeeds. Each database contains one heavyweight resource row for its local execution domain.
 
 A claim atomically reserves that resource and creates the current attempt with a
 random owner, monotonically changing fence epoch, heartbeat, and lease. The
@@ -106,10 +125,7 @@ quarantined. A noncanceled failure without proof reports the durable job as
 `ambiguous`, retains its underlying failure classification, and cannot
 authorize replay.
 
-The public retry operation may acknowledge an eligible bounded retry while it
-is already queued. Repeated requests are idempotent and preserve the job,
-request, output slot, attempt history, and budget; only a worker claim starts
-the next attempt.
+The public retry operation may acknowledge an eligible bounded retry while it is already queued. Repeated requests are idempotent and preserve the job, request, output slot, attempt history, and budget while the job remains queued, within budget, and the resource is available. A later worker claim, recovery failure, or another job's resource claim can invalidate a subsequent retry acknowledgement; only a worker claim starts the next attempt. The singleton resource state appears in provenance's execution context with owner IDs where applicable. Individual job snapshots do not imply resource ownership.
 
 Cancellation of a queued job makes it terminal before any attempt exists. For a
 claimed attempt, cancellation fences the current owner and epoch immediately and

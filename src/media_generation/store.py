@@ -22,6 +22,21 @@ from .domain import (
 from .errors import IdempotencyConflictError, RecordNotFoundError, UnknownReferenceError
 
 _RESOLVED_OUTPUT_DIRECTORY_KEY = "_resolved_output_directory"
+_WRITER_EPOCH = 3
+_WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
+_WRITER_GUARDS = (
+    ("generation_requests", "INSERT"),
+    ("generation_jobs", "INSERT"),
+    ("generation_jobs", "UPDATE"),
+    ("generation_attempts", "INSERT"),
+    ("generation_attempts", "UPDATE"),
+    ("generation_artifacts", "INSERT"),
+    ("artifact_edges", "INSERT"),
+    ("artifact_publications", "INSERT"),
+    ("artifact_publications", "UPDATE"),
+    ("artifact_integrity", "INSERT"),
+    ("artifact_integrity", "UPDATE"),
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +105,9 @@ class SQLiteStore:
     def _connection(self, transaction: bool = False) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(str(self.database_path), timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
+        connection.create_function(
+            _WRITER_EPOCH_FUNCTION, 0, lambda: _WRITER_EPOCH, deterministic=True
+        )
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA synchronous = FULL")
         if transaction:
@@ -339,7 +357,7 @@ class SQLiteStore:
             missing = sorted(required - present)
             if missing:
                 raise RuntimeError(
-                "database schema version 3 is incomplete; missing: "
+                    "database schema version 3 is incomplete; missing: "
                     + ", ".join(missing)
                 )
             resource = connection.execute(
@@ -354,6 +372,8 @@ class SQLiteStore:
                     "database schema version 3 incomplete; "
                     "execution_resource singleton row is missing or invalid"
                 )
+            self._install_writer_guards(connection)
+            self._assert_all_jobs_have_execution_state(connection)
             return
 
         statements = (
@@ -398,7 +418,7 @@ class SQLiteStore:
                 ON execution_attempts(job_id, status)""",
             """CREATE TABLE execution_resource (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                state TEXT NOT NULL CHECK (state IN ("available",'claimed','quarantined')),
+                state TEXT NOT NULL CHECK (state IN ('available','claimed','quarantined')),
                 job_id TEXT,
                 attempt_id TEXT,
                 owner_id TEXT,
@@ -488,7 +508,62 @@ class SQLiteStore:
                WHERE state = 'committed'
                  AND job_id IS NOT NULL AND attempt_id IS NOT NULL"""
         )
+        self._install_writer_guards(connection)
+        self._assert_all_jobs_have_execution_state(connection)
         connection.execute("PRAGMA user_version = 3")
+
+    @staticmethod
+    def _writer_guard_sql(table: str, operation: str) -> tuple[str, str]:
+        """Return the stable trigger name and definition for one table write."""
+        name = f"t04_writer_guard_{table}_{operation.lower()}"
+        sql = f"""CREATE TRIGGER {name}
+BEFORE {operation} ON {table}
+WHEN {_WRITER_EPOCH_FUNCTION}() != {_WRITER_EPOCH}
+BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
+        return name, sql
+
+    @classmethod
+    def _install_writer_guards(cls, connection: sqlite3.Connection) -> None:
+        """Ensure every legacy mutation requires a current writer connection.
+
+        Version 3 sidecars do not prevent an older T01 or T03 process from
+        writing the legacy tables. Historical binaries open SQLite connections
+        without registering ``media_generation_writer_epoch``. The triggers
+        therefore abort their first data mutation while allowing connections
+        opened by this store. A missing trigger is recreated; a same-name
+        trigger with a different definition fails closed.
+        """
+        for table, operation in _WRITER_GUARDS:
+            name, expected_sql = cls._writer_guard_sql(table, operation)
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (name,),
+            ).fetchone()
+            if row is None:
+                connection.execute(expected_sql)
+                continue
+            current_sql = " ".join(str(row["sql"]).split()).rstrip(";")
+            normalized_expected = " ".join(expected_sql.split()).rstrip(";")
+            if current_sql != normalized_expected:
+                raise RuntimeError(f"database version 3 writer guard is divergent: {name}")
+
+    @staticmethod
+    def _assert_all_jobs_have_execution_state(connection: sqlite3.Connection) -> None:
+        """Reject rows admitted through the legacy tables without T04 sidecars."""
+        rows = connection.execute(
+            """SELECT jobs.job_id
+               FROM generation_jobs AS jobs
+               LEFT JOIN execution_jobs AS execution
+                 ON execution.job_id = jobs.job_id
+               WHERE execution.job_id IS NULL
+               ORDER BY jobs.created_at, jobs.job_id"""
+        ).fetchall()
+        if rows:
+            job_ids = ", ".join(str(row["job_id"]) for row in rows)
+            raise RuntimeError(
+                "database schema version 3 contains generation jobs without execution state: "
+                f"{job_ids}; stop older writers and restore or repair from a pre-migration backup"
+            )
 
     @staticmethod
     def _insert_sources(connection, artifact_id: str, sources: tuple[ArtifactSource, ...]) -> None:
@@ -599,7 +674,8 @@ class SQLiteStore:
             existing = connection.execute(
                 """SELECT jobs.*, execution.status AS execution_status,
                           execution.max_attempts AS execution_max_attempts,
-                          execution.containment_contract
+                          execution.containment_contract,
+                          execution.retry_eligible AS execution_retry_eligible
                    FROM generation_jobs AS jobs
                    JOIN execution_jobs AS execution ON execution.job_id = jobs.job_id
                    WHERE jobs.idempotency_key = ?""",
@@ -623,9 +699,15 @@ class SQLiteStore:
                     raise IdempotencyConflictError(
                         "idempotency key is already bound to a different attempt budget"
                     )
+                legacy_failed_without_contract = (
+                    existing["containment_contract"] is None
+                    and existing["execution_status"] == "failed"
+                    and not bool(existing["execution_retry_eligible"])
+                )
                 if (
                     existing["containment_contract"] != containment_contract
                     and existing["execution_status"] != "succeeded"
+                    and not legacy_failed_without_contract
                 ):
                     raise IdempotencyConflictError(
                         "idempotency key is already bound to a different containment contract"
@@ -1789,18 +1871,16 @@ class SQLiteStore:
         """Load job state and its associated artifact identity, if successful."""
         with self._connection() as connection:
             row = connection.execute(
-            """SELECT jobs.*, artifacts.artifact_id,
-                      execution.status AS execution_status,
-                      execution.max_attempts, execution.fence_epoch,
-                      execution.retry_eligible, execution.failure_message,
-                      resource.state AS resource_state
-               FROM generation_jobs AS jobs
-               LEFT JOIN generation_artifacts AS artifacts
-                 ON artifacts.job_id = jobs.job_id
-               LEFT JOIN execution_jobs AS execution
-                 ON execution.job_id = jobs.job_id
-               LEFT JOIN execution_resource AS resource ON resource.id = 1
-               WHERE jobs.job_id = ?""",
+                """SELECT jobs.*, artifacts.artifact_id,
+                          execution.status AS execution_status,
+                          execution.max_attempts, execution.fence_epoch,
+                          execution.retry_eligible, execution.failure_message
+                   FROM generation_jobs AS jobs
+                   LEFT JOIN generation_artifacts AS artifacts
+                     ON artifacts.job_id = jobs.job_id
+                   LEFT JOIN execution_jobs AS execution
+                     ON execution.job_id = jobs.job_id
+                   WHERE jobs.job_id = ?""",
                 (job_id,),
             ).fetchone()
         if row is None:
@@ -1872,7 +1952,7 @@ class SQLiteStore:
         return {
             "job_id": job.job_id,
             "request": request.to_dict(),
-            "status": job.status,
+            "status": job.execution_status or job.status,
             "adapter_id": job.adapter_id,
             "adapter_configuration": job_payload["adapter_configuration"],
             "resolved_prompt": job.resolved_prompt,
@@ -1894,7 +1974,10 @@ class SQLiteStore:
                           execution.max_attempts, execution.fence_epoch,
                           execution.retry_eligible, execution.failure_message,
                           execution.containment_contract,
-                          resource.state AS resource_state
+                          resource.state AS resource_state,
+                          resource.job_id AS resource_job_id,
+                          resource.attempt_id AS resource_attempt_id,
+                          resource.owner_id AS resource_owner_id
                    FROM generation_jobs AS jobs
                    LEFT JOIN generation_artifacts AS artifacts
                      ON artifacts.job_id = jobs.job_id
@@ -1966,6 +2049,9 @@ class SQLiteStore:
                     "failure_message": job_row["failure_message"],
                     "containment_contract": job_row["containment_contract"],
                     "resource_state": str(job_row["resource_state"] or "available"),
+                    "resource_job_id": job_row["resource_job_id"],
+                    "resource_attempt_id": job_row["resource_attempt_id"],
+                    "resource_owner_id": job_row["resource_owner_id"],
                 },
             }
 
@@ -2002,7 +2088,7 @@ class SQLiteStore:
         return GenerationJob(
             job_id=str(row["job_id"]),
             request_id=str(row["request_id"]),
-            status=execution_status,
+            status=str(row["status"]),
             adapter_id=str(row["adapter_id"]),
             adapter_configuration=json.loads(str(row["adapter_configuration_json"])),
             resolved_prompt=str(row["resolved_prompt"]),
@@ -2017,11 +2103,6 @@ class SQLiteStore:
             max_attempts=int(row["max_attempts"] or 1) if "max_attempts" in columns else 1,
             fence_epoch=int(row["fence_epoch"] or 0) if "fence_epoch" in columns else 0,
             execution_status=execution_status,
-            resource_state=(
-                str(row["resource_state"])
-                if "resource_state" in columns and row["resource_state"] is not None
-                else "available"
-            ),
             retry_eligible=(
                 bool(row["retry_eligible"])
                 if "retry_eligible" in columns and row["retry_eligible"] is not None

@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from media_generation.adapters import DeterministicCpuAdapter
+from media_generation.errors import GenerationError
 from media_generation.service import GenerationService
 from media_generation.store import SQLiteStore
 from test_artifact_migration import legacy_database
@@ -75,6 +76,28 @@ def historical_running(root: Path, version: str) -> tuple[Path, Path, str]:
                 ),
             )
     return database, images, ids[1]
+
+
+def historical_failed(root: Path, version: str) -> tuple[Path, Path, str]:
+    """Convert a frozen historical job and attempt into a terminal failure."""
+    database, images, job_id = historical_running(root, version)
+    timestamp = "2026-10-21T00:01:00+00:00"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE generation_jobs SET status = 'failed', updated_at = ? "
+            "WHERE job_id = ?",
+            (timestamp, job_id),
+        )
+        connection.execute(
+            "UPDATE generation_attempts SET status = 'failed', finished_at = ?, "
+            "error_message = 'historical adapter failure' WHERE job_id = ?",
+            (timestamp, job_id),
+        )
+        if version == "t03":
+            connection.execute(
+                "DELETE FROM artifact_publications WHERE job_id = ?", (job_id,)
+            )
+    return database, images, job_id
 
 
 @pytest.mark.parametrize("version", ("t01", "t03"))
@@ -315,3 +338,161 @@ def test_version_three_marker_without_singleton_resource_fails_closed(
         assert list(connection.iterdump()) == before
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone()[0] == jobs_before
+
+
+EXPECTED_WRITER_GUARDS = {
+    "t04_writer_guard_generation_requests_insert",
+    "t04_writer_guard_generation_jobs_insert",
+    "t04_writer_guard_generation_jobs_update",
+    "t04_writer_guard_generation_attempts_insert",
+    "t04_writer_guard_generation_attempts_update",
+    "t04_writer_guard_generation_artifacts_insert",
+    "t04_writer_guard_artifact_edges_insert",
+    "t04_writer_guard_artifact_publications_insert",
+    "t04_writer_guard_artifact_publications_update",
+    "t04_writer_guard_artifact_integrity_insert",
+    "t04_writer_guard_artifact_integrity_update",
+}
+
+
+@pytest.mark.parametrize("version", ("t01", "t03"))
+def test_historical_writer_dml_is_rejected_after_migration(
+    tmp_path: Path,
+    version: str,
+) -> None:
+    """A stale executable must fail at its first legacy-table mutation."""
+    database, images, _ = historical_running(tmp_path, version)
+    GenerationService(database, images)
+
+    with sqlite3.connect(database) as historical_writer:
+        before = list(historical_writer.iterdump())
+        with pytest.raises(sqlite3.OperationalError, match="no such function: media_generation_writer_epoch"):
+            historical_writer.execute(
+                "INSERT INTO generation_requests "
+                "(request_id, canonical_json, request_digest, created_at) VALUES (?, ?, ?, ?)",
+                (
+                    "req_stalewriter0000000000000000001",
+                    request().canonical_json(),
+                    request().digest(),
+                    "2026-10-24T00:00:00+00:00",
+                ),
+            )
+        assert list(historical_writer.iterdump()) == before
+        assert historical_writer.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_current_writer_passes_guards_and_missing_guard_is_recreated(
+    tmp_path: Path,
+) -> None:
+    database, images, _ = historical_running(tmp_path, "t03")
+    service = GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        guards = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND name LIKE 't04_writer_guard_%'"
+            )
+        }
+        assert guards == EXPECTED_WRITER_GUARDS
+        connection.execute("DROP TRIGGER t04_writer_guard_generation_jobs_insert")
+
+    restarted = GenerationService(database, images)
+    admitted = restarted.enqueue("after-migration", request())
+    assert admitted.status == "queued"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+            "AND name = 't04_writer_guard_generation_jobs_insert'"
+        ).fetchone() == (1,)
+
+
+def test_divergent_writer_guard_fails_closed(tmp_path: Path) -> None:
+    database, images, _ = historical_running(tmp_path, "t03")
+    GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER t04_writer_guard_generation_requests_insert")
+        connection.execute(
+            "CREATE TRIGGER t04_writer_guard_generation_requests_insert "
+            "BEFORE INSERT ON generation_requests BEGIN SELECT 1; END"
+        )
+
+    with pytest.raises(RuntimeError, match="writer guard.*divergent"):
+        GenerationService(database, images)
+
+
+def test_version_three_job_without_execution_state_fails_closed(tmp_path: Path) -> None:
+    """Rows admitted by an older writer cannot be silently left joinable."""
+    database, images, _ = historical_running(tmp_path, "t03")
+    GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("DROP TRIGGER t04_writer_guard_generation_jobs_insert")
+        connection.execute("DROP TRIGGER t04_writer_guard_generation_requests_insert")
+        request_id = "req_stalewriter00000000000000000"
+        digest = request().digest()
+        connection.execute(
+            "INSERT INTO generation_requests VALUES (?, ?, ?, ?)",
+            (
+                request_id,
+                request().canonical_json(),
+                digest,
+                "2026-10-24T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO generation_jobs ("
+            "job_id, request_id, idempotency_key, request_digest, status, "
+            "adapter_id, adapter_configuration_json, resolved_prompt, resolved_seed, "
+            "validated_reference_ids_json, output_slot, output_slot_id, "
+            "effective_parameters_json, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, 'succeeded', ?, ?, ?, 0, '[]', 'stale', ?, ?, ?, ?)",
+            (
+                "job_stalewriter000000000000000000",
+                request_id,
+                "stale-writer-job",
+                digest,
+                DeterministicCpuAdapter().adapter_id,
+                json.dumps(DeterministicCpuAdapter().configuration),
+                request().prompt,
+                "slot_stalewriter0000000000000000",
+                json.dumps({"width": 12, "height": 9}),
+                "2026-10-24T00:00:00+00:00",
+                "2026-10-24T00:00:00+00:00",
+            ),
+        )
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+    with pytest.raises(RuntimeError, match="without execution state"):
+        GenerationService(database, images)
+
+
+def test_failed_historical_job_replays_without_accepting_missing_contract(
+    tmp_path: Path,
+) -> None:
+    """Legacy NULL containment remains reusable without replaying failed work."""
+    database, images, job_id = historical_failed(tmp_path, "t03")
+    service = GenerationService(database, images, DeterministicCpuAdapter())
+
+    migrated = service.get_provenance(job_id)
+    assert migrated["execution"]["status"] == "failed"
+    assert migrated["execution"]["containment_contract"] is None
+    assert migrated["execution"]["retry_eligible"] is False
+    assert len(migrated["attempts"]) == 1
+
+    replayed = service.submit("unfinished", request())
+    after = service.get_provenance(job_id)
+
+    assert replayed.job_id == job_id
+    assert replayed.status == "failed"
+    assert after["execution"]["status"] == "failed"
+    assert after["execution"]["max_attempts"] == 1
+    assert after["execution"]["retry_eligible"] is False
+    assert after["execution"]["containment_contract"] is None
+    assert len(after["attempts"]) == 1
+    assert after["attempts"][0]["status"] == "failed"
+    assert after["attempts"][0]["failure_class"] == "terminal"
+    assert service.work() == {"status": "idle", "processed": 0}
+    assert service.get_provenance(job_id)["attempts"] == after["attempts"]
+    with pytest.raises(GenerationError, match="not eligible for retry"):
+        service.retry(job_id)

@@ -153,6 +153,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if options.command == "recover":
             service = GenerationService(options.db, options.output_dir)
             report = service.recover()
+            if report["status"] == "resource_busy":
+                return _write_error("resource_busy", "local generation resource is busy", 1)
             _write_json(report, sys.stdout)
             return 1 if report["status"] == "attention_required" else 0
 
