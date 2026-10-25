@@ -12,6 +12,9 @@ from typing import BinaryIO, Protocol
 from .domain import GenerationPlan
 
 
+PROCESS_CONTAINED_CONTRACT = "process-contained/v1"
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterCapabilities:
     """Limits the service checks before creating a job for an adapter."""
@@ -59,6 +62,10 @@ class DeterministicCpuAdapter:
     """
 
     adapter_id = "deterministic-cpu-png-v1"
+    containment_contract = PROCESS_CONTAINED_CONTRACT
+    # Retained for source compatibility. Worker admission trusts only the
+    # directly declared versioned contract above.
+    process_contained = True
     capabilities = AdapterCapabilities(
         max_width=256,
         max_height=256,
@@ -115,6 +122,22 @@ class DeterministicCpuAdapter:
         destination.truncate()
         destination.flush()
         return ImageMetadata("image/png", "PNG", plan.width, plan.height)
+
+
+def trusted_containment_contract(adapter: GenerationAdapter) -> str | None:
+    """Return a directly declared containment contract, if one is trusted.
+
+    Inheritance is deliberately excluded. A subclass that reuses the
+    deterministic adapter's identity, configuration, or ``process_contained``
+    boolean does not become process contained unless its concrete class or an
+    instance explicitly declares the versioned contract.
+    """
+    instance_values = getattr(adapter, "__dict__", {})
+    if "containment_contract" in instance_values:
+        declared = instance_values["containment_contract"]
+    else:
+        declared = type(adapter).__dict__.get("containment_contract")
+    return PROCESS_CONTAINED_CONTRACT if declared == PROCESS_CONTAINED_CONTRACT else None
 
 
 def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:

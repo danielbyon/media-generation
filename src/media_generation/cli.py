@@ -11,6 +11,7 @@ from typing import Sequence
 from .domain import GenerationRequest, ArtifactSource
 from .errors import (
     GenerationExecutionError,
+    GenerationError,
     IdempotencyConflictError,
     InputValidationError,
     RecordNotFoundError,
@@ -19,6 +20,7 @@ from .errors import (
     PublicationError,
     PublicationIncompleteError,
     ArtifactIntegrityError,
+    ResourceBusyError,
 )
 from .service import GenerationService
 
@@ -51,6 +53,37 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="engine-neutral JSON request; use - to read JSON from standard input",
     )
+
+    enqueue = commands.add_parser("enqueue", help="durably admit a generation request")
+    enqueue.add_argument("--db", required=True, type=Path)
+    enqueue.add_argument("--output-dir", required=True, type=Path)
+    enqueue.add_argument("--idempotency-key", required=True)
+    enqueue.add_argument("--request-json", required=True)
+    enqueue.add_argument(
+        "--max-attempts",
+        type=int,
+        default=None,
+        help="total attempts for a new admission; omit to use or preserve policy",
+    )
+
+    worker = commands.add_parser("worker", help="execute compatible queued jobs")
+    worker.add_argument("--db", required=True, type=Path)
+    worker.add_argument("--output-dir", required=True, type=Path)
+    worker.add_argument("--limit", type=int, default=1)
+
+    cancel = commands.add_parser("cancel", help="fence a queued or active job")
+    cancel.add_argument("--db", required=True, type=Path)
+    cancel.add_argument("--output-dir", type=Path, default=Path.cwd())
+    cancel.add_argument("--job-id", required=True)
+
+    retry = commands.add_parser("retry", help="requeue eligible failed work")
+    retry.add_argument("--db", required=True, type=Path)
+    retry.add_argument("--output-dir", type=Path, default=Path.cwd())
+    retry.add_argument("--job-id", required=True)
+
+    recover = commands.add_parser("recover", help="reconcile interrupted execution")
+    recover.add_argument("--db", required=True, type=Path)
+    recover.add_argument("--output-dir", required=True, type=Path)
 
     for name, help_text in (
         ("request", "retrieve an immutable request snapshot"),
@@ -96,6 +129,49 @@ def main(arguments: Sequence[str] | None = None) -> int:
             service = GenerationService(options.db, options.output_dir)
             result = service.submit(options.idempotency_key, request)
             _write_json(result.to_dict(), sys.stdout)
+            return 0
+
+        if options.command == "enqueue":
+            request = _parse_request(options.request_json)
+            service = GenerationService(options.db, options.output_dir)
+            result = service.enqueue(
+                options.idempotency_key,
+                request,
+                max_attempts=options.max_attempts,
+            )
+            _write_json(result.to_dict(), sys.stdout)
+            return 0
+
+        if options.command == "worker":
+            service = GenerationService(options.db, options.output_dir)
+            report = service.work(limit=options.limit)
+            if report["status"] == "resource_busy":
+                return _write_error(
+                    "resource_busy", "local generation resource is busy", 1,
+                    outcomes=report.get("outcomes", []),
+                )
+            _write_json(report, sys.stdout)
+            return int(any(
+                item["status"] != "succeeded" or not item["termination_proven"]
+                for item in report.get("outcomes", [])
+            ))
+
+        if options.command == "recover":
+            service = GenerationService(options.db, options.output_dir)
+            report = service.recover()
+            if report["status"] == "resource_busy":
+                return _write_error("resource_busy", "local generation resource is busy", 1)
+            _write_json(report, sys.stdout)
+            return 1 if report["status"] == "attention_required" else 0
+
+        if options.command == "cancel":
+            service = GenerationService(options.db, options.output_dir)
+            _write_json(service.cancel(options.job_id), sys.stdout)
+            return 0
+
+        if options.command == "retry":
+            service = GenerationService(options.db, options.output_dir)
+            _write_json(service.retry(options.job_id).to_dict(), sys.stdout)
             return 0
 
         if options.command in {"import", "reconcile"}:
@@ -145,6 +221,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("idempotency_conflict", str(error), 3)
     except RecordNotFoundError as error:
         return _write_error("not_found", str(error), 4)
+    except ResourceBusyError as error:
+        return _write_error("resource_busy", str(error), 1, job_id=error.job_id)
     except GenerationExecutionError as error:
         return _write_error("generation_failed", str(error), 1, job_id=error.job_id)
     except PublicationIncompleteError as error:
@@ -154,6 +232,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("publication_incomplete", str(error), 1)
     except ArtifactIntegrityError as error:
         return _write_error("artifact_integrity", str(error), 1)
+    except GenerationError as error:
+        return _write_error("generation_error", str(error), 1)
     except OSError as error:
         return _write_error("storage_error", str(error), 1)
     except (json.JSONDecodeError, UnicodeError, ValueError) as error:
@@ -191,7 +271,7 @@ def _write_json(value: object, output: object) -> None:
     output.write(json.dumps(value, ensure_ascii=True, sort_keys=True) + "\n")
 
 
-def _write_error(code: str, message: str, exit_code: int, **details: str) -> int:
+def _write_error(code: str, message: str, exit_code: int, **details: object) -> int:
     """Write a machine-readable failure to stderr without a success-shaped response."""
     _write_json({"error": {"code": code, "message": message, **details}}, sys.stderr)
     return exit_code

@@ -35,7 +35,11 @@ from PIL.PngImagePlugin import PngInfo
 
 from media_generation import publication as publication_module
 from media_generation import store as store_module
-from media_generation.adapters import DeterministicCpuAdapter, ImageMetadata
+from media_generation.adapters import (
+    PROCESS_CONTAINED_CONTRACT,
+    DeterministicCpuAdapter,
+    ImageMetadata,
+)
 from media_generation.domain import (
     ArtifactSource,
     GenerationArtifact,
@@ -48,6 +52,7 @@ from media_generation.errors import (
     PublicationError,
     PublicationIncompleteError,
     RecordNotFoundError,
+    ResourceBusyError,
 )
 from media_generation.service import GenerationService
 
@@ -796,6 +801,8 @@ def test_t03_recovery_owned_final_is_sufficient_when_stage_name_is_missing(
 
 
 class _FailingWriteAdapter(DeterministicCpuAdapter):
+
+    containment_contract = PROCESS_CONTAINED_CONTRACT
     """Write a real partial file before surfacing a device or capacity failure."""
 
     def __init__(self, error_number: int) -> None:
@@ -1074,16 +1081,27 @@ def test_t03_concurrency_same_output_label_and_bytes_keep_distinct_logical_ident
     workspace: _Workspace,
 ) -> None:
     """T03 identity: separate keys sharing output intent and content cannot overwrite one another."""
-    services = (workspace.service(), workspace.service())
-    start = Barrier(2)
+    entered, resume = Event(), Event()
 
-    def submit(index: int):
-        start.wait(timeout=WORKER_TIMEOUT)
-        return services[index].submit(f"parallel-{index}", _request())
+    def pause_before_commit(checkpoint: str) -> None:
+        if checkpoint == "before_commit":
+            entered.set()
+            assert resume.wait(WORKER_TIMEOUT)
 
-    with ThreadPoolExecutor(max_workers=2) as workers:
-        futures = [workers.submit(submit, index) for index in range(2)]
-        results = [future.result(timeout=WORKER_TIMEOUT) for future in futures]
+    services = (
+        workspace.service(publication_checkpoint=pause_before_commit),
+        workspace.service(),
+    )
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        first = workers.submit(services[0].submit, "parallel-0", _request())
+        assert entered.wait(WORKER_TIMEOUT)
+        with pytest.raises(ResourceBusyError) as busy:
+            services[1].submit("parallel-1", _request())
+        resume.set()
+        first_result = first.result(timeout=WORKER_TIMEOUT)
+    second_result = services[1].submit("parallel-1", _request())
+    assert busy.value.job_id == second_result.job_id
+    results = (first_result, second_result)
     assert all(result.status == "succeeded" for result in results)
     assert len({result.job_id for result in results}) == 2
     assert len({result.output_slot_id for result in results}) == 2
