@@ -1,0 +1,76 @@
+tests/test_store_schema.py
+  s_7968de91d99533::t_939ffb53a58de5 1-56
+src/media_generation/domain.py
+  s_7968de91d99533::t_2f9d1bb18b4b98 155-161
+tests/test_artifact_migration.py
+  s_7968de91d99533::t_857ac7064b4132 19-24,267,276,280
+  s_7968de91d99533::t_7b60cdb0243989 277-279
+  s_7968de91d99533::t_a343585ce2d65c 16
+  s_7968de91d99533::t_cb277b8527024a 17-18
+src/media_generation/publication.py
+  s_7968de91d99533::t_2a53938d90dc75 273-321,331-334,672-677
+src/media_generation/store.py
+  s_7968de91d99533::t_c9ae8eaa4d2612 2052-2054
+  s_7968de91d99533::t_ac08362efc7171 360,677-678,1874-1883,1977-1980
+  s_7968de91d99533::t_073b9163f4c065 1955,2091
+  s_7968de91d99533::t_8a0c4273783e93 25-39
+  s_7968de91d99533::t_b1c43f928ad852 375-376,511-512,515-566
+  s_7968de91d99533::t_c61808d7093762 421
+  s_7968de91d99533::t_bae3f1d4c6bc08 702-706,710
+  s_7968de91d99533::t_8ee5b4d0e46196 108-110
+  s_2cca8b6274fb19::t_26fc6dba7a3691 567
+docs/architecture/artifact-publication.md
+  s_7968de91d99533::t_d81f00129931ad 31-53
+  s_7968de91d99533::t_8a7341f3f2b436 100,128
+tests/test_durable_execution.py
+  s_7968de91d99533::t_42714fd193dab4 10,15,749-786
+  s_7968de91d99533::t_0a10116bf9db5f 368,490,597
+  s_7968de91d99533::t_5e7a05bd81a434 787-814
+  s_7968de91d99533::t_1345c17d7c1fef 722-748
+  s_7968de91d99533::t_218acea771d0c8 704-721
+README.md
+  s_7968de91d99533::t_d81f00129931ad 110-120
+  s_7968de91d99533::t_c602ac46df8e75 57-67,78-92
+  s_7968de91d99533::t_b1107694ea6498 169-179
+  s_7968de91d99533::t_75c654b15ac924 93
+tests/test_execution_migration.py
+  s_7968de91d99533::t_1c5f9602ffe949 431-442
+  s_7968de91d99533::t_1b924cfb5cb950 468-498
+  s_7968de91d99533::t_2329f8dba2700f 10,81-95,100
+  s_7968de91d99533::t_021626ee98f515 96-99
+  s_7968de91d99533::t_0b9b348f063a32 341-430,443-467
+  s_7968de91d99533::t_a43e2bd49eff18 101-102
+src/media_generation/cli.py
+  s_7968de91d99533::t_a5cdcdf0c07bcf 156-157
+tests/test_execution_recovery.py
+  s_7968de91d99533::t_f6789431ffaa77 640-643
+  s_7968de91d99533::t_fd6462b77eb619 602-639,644-665
+  s_7968de91d99533::t_37f26a9e6a2742 666-683
+src/media_generation/service.py
+  s_7968de91d99533::t_2d467b7bca2c19 334,344-345
+  s_7968de91d99533::t_073b9163f4c065 677
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "25b4867fcd636c084020cb947acbcd7aefbf6394",
+  "prompts": {},
+  "sessions": {
+    "s_2cca8b6274fb19": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1602a-b826-79e3-b09b-8f49f68d84e5",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_7968de91d99533": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16f92-cf04-7973-9837-c4d6490963b2",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
