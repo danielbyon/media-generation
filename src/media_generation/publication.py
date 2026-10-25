@@ -213,6 +213,13 @@ class PublicationManager:
         except FileNotFoundError:
             return False
 
+    def _assert_publication_authority(self, publication_id: str) -> None:
+        """Fail closed after every precommit boundary that can race cancel."""
+        if not self.store.publication_authority_current(publication_id):
+            raise PublicationError(
+                f"{publication_id}: attempt ownership or cancellation fenced publication"
+            )
+
     def _clean_stage(self, directory: int, record: dict[str, object]) -> str:
         """Capture into the private namespace before validating and removing.
 
@@ -263,15 +270,43 @@ class PublicationManager:
         except Exception as error:
             return f'cleanup_pending: {error}'
 
-    def _abandon(self, directory: int, record: dict[str, object], error: str) -> str:
+    def _abandon(
+        self,
+        directory: int,
+        record: dict[str, object],
+        error: str,
+        *,
+        finalize_attempt: bool = False,
+    ) -> str:
         self.store.abandon_publication(str(record['publication_id']), error)
-        if record['job_id'] is not None:
-            self.store.fail_execution(str(record['job_id']), str(record['attempt_id']), error, now())
+        if finalize_attempt and record.get('job_id') is not None:
+            job_id = str(record['job_id'])
+            attempt_id = str(record['attempt_id'])
+            attempt = self.store.current_attempt(job_id)
+            if attempt is not None and attempt['attempt_id'] == attempt_id:
+                owner_id = None if attempt['owner_id'] is None else str(attempt['owner_id'])
+                epoch = int(attempt['claim_epoch'])
+                contained = (
+                    attempt['containment_contract'] is not None
+                    and bool(attempt['process_contained'])
+                )
+                self.store.fail_execution(
+                    job_id,
+                    attempt_id,
+                    error,
+                    now(),
+                    attempt_owner_id=owner_id,
+                    claim_epoch=epoch,
+                    failure_class='crash' if contained else 'ambiguous',
+                    termination_proven=contained,
+                )
         return self._clean_stage(directory, record)
 
     def publish(self, writer: Callable[[Path, BinaryIO], object], factory: Callable[[ImageInfo, Path], Artifact],
                 *, artifact_id: str, sources: tuple[ArtifactSource, ...] = (),
-                job_id: str | None = None, attempt_id: str | None = None) -> Artifact:
+               job_id: str | None = None, attempt_id: str | None = None,
+               attempt_owner_id: str | None = None,
+               claim_epoch: int | None = None) -> Artifact:
         """Write and publish one image, retaining any uncertain durable publication.
 
         The writer receives a preallocated private file. It must write that file
@@ -291,9 +326,14 @@ class PublicationManager:
                 'sources_json': json.dumps([source.to_dict() for source in sources]),
                 'created_at': now(),
             }
-            self.store.create_publication(record)
+            self.store.create_publication(
+                record,
+                attempt_owner_id=attempt_owner_id,
+                claim_epoch=claim_epoch,
+            )
             try:
                 self.checkpoint('intent_committed')
+                self._assert_publication_authority(publication_id)
                 descriptor = os.open(str(record['stage_name']),
                     os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=directory)
                 with os.fdopen(descriptor, 'r+b') as staged:
@@ -305,28 +345,36 @@ class PublicationManager:
                     os.fsync(directory)
                     record = self.store.publication(publication_id)
                     self.checkpoint('stage_created')
+                    self._assert_publication_authority(publication_id)
                     self.checkpoint('before_stage_write')
+                    self._assert_publication_authority(publication_id)
                     writer(self.root / str(record['stage_name']), staged)
                     staged.flush()
                     self.checkpoint('stage_written')
+                    self._assert_publication_authority(publication_id)
                     if not self._owned(directory, str(record['stage_name']), record):
                         raise PublicationError('writer replaced its private staging file')
                     self.checkpoint('before_validation')
+                    self._assert_publication_authority(publication_id)
                     info = validate_image(staged)
                     self.checkpoint('validated')
+                    self._assert_publication_authority(publication_id)
                     artifact = factory(info, self.root / (artifact_id + (
                         '.png' if info.image_format == 'PNG' else '.jpg')))
                     if artifact.artifact_id != artifact_id:
                         raise PublicationError('artifact identity changed during publication')
                     self.checkpoint('before_file_sync')
+                    self._assert_publication_authority(publication_id)
                     os.fsync(staged.fileno())
                     self.checkpoint('file_synced')
+                    self._assert_publication_authority(publication_id)
                     self.store.mark_publication_ready(
                         publication_id,
                         Path(artifact.path).name,
                         json.dumps(artifact.to_dict(), sort_keys=True),
                     )
                     self.checkpoint('ready_committed')
+                    self._assert_publication_authority(publication_id)
                     record = self.store.publication(publication_id)
                     self._finish(directory, record)
                 self.checkpoint('after_commit')
@@ -405,6 +453,7 @@ class PublicationManager:
         if final_name != Path(artifact.path).name or Path(artifact.path).parent != self.root:
             raise PublicationError('publication path is not its authoritative destination')
         self.checkpoint('before_publish')
+        self._assert_publication_authority(str(record['publication_id']))
         try:
             os.stat(final_name, dir_fd=directory, follow_symlinks=False)
         except FileNotFoundError:
@@ -415,6 +464,7 @@ class PublicationManager:
         if not self._owned(directory, final_name, record):
             raise PublicationError('final path collision: existing content is not owned by publication')
         self.checkpoint('file_published')
+        self._assert_publication_authority(str(record['publication_id']))
         # Decode and hash the final inode too, including on every recovery.
         with self._verified_image(
             directory,
@@ -425,9 +475,12 @@ class PublicationManager:
         ) as (content, observed):
             os.fsync(content.fileno())
             self.checkpoint('before_directory_sync')
+            self._assert_publication_authority(str(record['publication_id']))
             os.fsync(directory)
             self.checkpoint('directory_synced')
+            self._assert_publication_authority(str(record['publication_id']))
             self.checkpoint('before_commit')
+            self._assert_publication_authority(str(record['publication_id']))
             self._assert_root(directory)
             current = os.fstat(content.fileno())
             if (not self._owned(directory, final_name, record) or any(
@@ -438,8 +491,22 @@ class PublicationManager:
             sources = tuple(ArtifactSource(**source) for source in json.loads(str(record['sources_json'])))
             # Keep the validated inode pinned until SQLite commits its identity.
             if isinstance(artifact, GenerationArtifact):
-                self.store.complete_execution(artifact, now(),
-                    publication_id=str(record['publication_id']), sources=sources)
+                self.store.complete_execution(
+                    artifact,
+                    now(),
+                    publication_id=str(record['publication_id']),
+                    sources=sources,
+                    attempt_owner_id=(
+                        None
+                        if record.get('attempt_owner_id') is None
+                        else str(record['attempt_owner_id'])
+                    ),
+                    claim_epoch=(
+                        None
+                        if record.get('attempt_claim_epoch') is None
+                        else int(record['attempt_claim_epoch'])
+                    ),
+                )
             else:
                 self.store.complete_import(artifact, str(record['publication_id']), sources)
 
@@ -548,7 +615,10 @@ class PublicationManager:
             known = {'.artifact-publication.lock'}
             for record in self.store.publications(str(self.root)):
                 known.add(str(record['stage_name']))
-                if record['final_name']:
+                # A final inode from an abandoned ready publication is retained
+                # by T03, but it is not a registered artifact. Leaving it out of
+                # ``known`` reports it for operator inspection.
+                if record['final_name'] and record['state'] != 'abandoned':
                     known.add(str(record['final_name']))
                 result = {'publication_id': record['publication_id'], 'artifact_id': record['artifact_id']}
                 try:
@@ -558,7 +628,12 @@ class PublicationManager:
                         self._finish(directory, record)
                         record = self.store.publication(str(record['publication_id']))
                     if record['state'] == 'allocated':
-                        cleanup = self._abandon(directory, record, 'interrupted before validated publication')
+                        cleanup = self._abandon(
+                            directory,
+                            record,
+                            'interrupted before validated publication',
+                            finalize_attempt=True,
+                        )
                         record = self.store.publication(str(record['publication_id']))
                     else:
                         cleanup = self._clean_stage(directory, record)

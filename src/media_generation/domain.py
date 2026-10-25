@@ -168,6 +168,12 @@ class GenerationJob:
     created_at: str
     updated_at: str
     artifact_id: str | None = None
+    max_attempts: int = 1
+    fence_epoch: int = 0
+    execution_status: str | None = None
+    resource_state: str = "available"
+    retry_eligible: bool = False
+    failure_message: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "adapter_configuration", _freeze(self.adapter_configuration))
@@ -190,6 +196,12 @@ class GenerationJob:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "artifact_id": self.artifact_id,
+            "max_attempts": self.max_attempts,
+            "fence_epoch": self.fence_epoch,
+            "execution_status": self.execution_status or self.status,
+            "resource_state": self.resource_state,
+            "retry_eligible": self.retry_eligible,
+            "failure_message": self.failure_message,
         }
 
 
@@ -205,6 +217,14 @@ class GenerationAttempt:
     started_at: str
     finished_at: str | None
     error_message: str | None
+    owner_id: str | None = None
+    claim_epoch: int = 0
+    heartbeat_at: str | None = None
+    lease_expires_at: str | None = None
+    process_contained: bool | None = None
+    containment_contract: str | None = None
+    failure_class: str | None = None
+    termination_proven: bool = False
 
     def to_dict(self) -> dict[str, object]:
         """Return an inspectable execution-attempt snapshot."""
@@ -217,6 +237,14 @@ class GenerationAttempt:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "error_message": self.error_message,
+            "owner_id": self.owner_id,
+            "claim_epoch": self.claim_epoch,
+            "heartbeat_at": self.heartbeat_at,
+            "lease_expires_at": self.lease_expires_at,
+            "process_contained": self.process_contained,
+            "containment_contract": self.containment_contract,
+            "failure_class": self.failure_class,
+            "termination_proven": self.termination_proven,
         }
 
 

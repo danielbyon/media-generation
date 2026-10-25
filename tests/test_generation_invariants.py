@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from typing import BinaryIO
-from threading import Barrier
+from threading import Barrier, Event
 
 import pytest
 
-from media_generation.adapters import AdapterCapabilities, DeterministicCpuAdapter
+from media_generation.adapters import (
+    PROCESS_CONTAINED_CONTRACT,
+    AdapterCapabilities,
+    DeterministicCpuAdapter,
+)
 from media_generation.domain import (
     GenerationArtifact,
     GenerationJob,
@@ -339,6 +344,72 @@ def test_concurrent_same_key_submissions_check_persisted_adapter_configuration(
     else:
         assert submissions[0].job_id == submissions[1].job_id  # type: ignore[union-attr]
         assert submissions[0].request_id == submissions[1].request_id  # type: ignore[union-attr]
+        snapshot = GenerationService(database, output_directory).get_provenance(
+            submissions[0].job_id  # type: ignore[union-attr]
+        )
+        assert len(snapshot["attempts"]) == 1
+        assert snapshot["artifact"] is not None
+
+
+def test_matching_submit_while_adapter_is_paused_returns_existing_running_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-key reuse reports the active job without claiming a second attempt."""
+    database = tmp_path / "studio.sqlite3"
+    output_directory = tmp_path / "artifacts"
+    request = GenerationRequest(
+        prompt="A paused glass greenhouse",
+        seed=19,
+        width=48,
+        height=48,
+    )
+    entered = Event()
+    release = Event()
+
+    class PausedAdapter(DeterministicCpuAdapter):
+        def generate(self, plan: GenerationPlan, destination: BinaryIO):
+            entered.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("paused adapter was not released")
+            return super().generate(plan, destination)
+
+    first_service = GenerationService(database, output_directory, adapter=PausedAdapter())
+    matching_service = GenerationService(database, output_directory, adapter=PausedAdapter())
+    monkeypatch.setattr(first_service._store, "renew_attempt", lambda *args, **kwargs: False)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(first_service.submit, "paused-reuse", request)
+        assert entered.wait(timeout=10)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE execution_attempts "
+                "SET lease_expires_at = '1970-01-01T00:00:00+00:00' "
+                "WHERE status = 'running'"
+            )
+        try:
+            matching = executor.submit(
+                matching_service.submit,
+                "paused-reuse",
+                request,
+            )
+            reused = matching.result(timeout=2)
+            snapshot = matching_service.get_provenance(reused.job_id)
+
+            assert reused.status == "running"
+            assert reused.artifact_id is None
+            assert snapshot["status"] == "running"
+            assert len(snapshot["attempts"]) == 1
+            assert snapshot["execution"]["resource_state"] == "claimed"
+        finally:
+            release.set()
+        completed = first.result(timeout=10)
+
+    final = matching_service.get_provenance(completed.job_id)
+    assert completed.status == "succeeded"
+    assert completed.job_id == reused.job_id
+    assert len(final["attempts"]) == 1
+    assert final["artifact"] is not None
 
 
 def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> None:
@@ -379,6 +450,8 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
 
 
 class _FailAfterWritingAdapter:
+
+    containment_contract = PROCESS_CONTAINED_CONTRACT
     """Leave a partial file to verify service cleanup and durable failure state."""
 
     adapter_id = "test-failure-adapter"

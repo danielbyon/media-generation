@@ -1,9 +1,10 @@
 # media-generation
 
-`media-generation` is a small, local image-generation service with a synchronous
-CLI and SQLite persistence. It provides an engine-neutral request contract and
-a deterministic CPU adapter so application and adapter work can be exercised
-without a GPU, model download, or network service.
+`media-generation` is a small, local image-generation service with synchronous
+submission, an opt-in durable worker CLI, and SQLite persistence. It provides an
+engine-neutral request contract and a deterministic CPU adapter so application
+and adapter work can be exercised without a GPU, model download, or network
+service.
 
 ## Setup
 
@@ -51,14 +52,24 @@ adapter capability produces a structured error and a nonzero exit status. Before
 execution, the service verifies that every referenced file still exists and
 matches the SHA-256 value stored with its artifact record.
 
-Repeating a submission reuses its existing job only when the canonical request
+Repeating a submission reuses the existing job when the canonical request
 intent, adapter identity, adapter configuration, and resolved output directory
 all match the values stored for that idempotency key. A changed request intent,
 adapter identity or configuration, or output directory produces an explicit
-`idempotency_conflict`. A matching succeeded job returns its existing artifact
-identity; a matching failed job remains inspectable as failed. If no seed is
-supplied, the service resolves one from the canonical request digest and
-persists it before adapter execution.
+`idempotency_conflict`. A matching queued job retains its persisted attempt
+budget; a matching succeeded job returns its existing artifact identity; and a
+matching failed or ambiguous job remains inspectable. An omitted `max_attempts`
+does not rewrite the budget chosen by the first admission, while an explicitly
+different budget conflicts. If no seed is supplied, the service resolves one
+from the canonical request digest and persists it before adapter execution.
+
+`submit` atomically admits a job and then attempts one synchronous execution.
+It omits admission policy, so it reuses an existing job's persisted budget
+without changing it. If another attempt owns the database's single heavyweight
+resource, the command returns a structured `resource_busy` error containing
+the durable `job_id`; it does not report a queue entry as a completed image.
+Repeating `submit` after the resource is free executes the same queued job
+without creating a second job, output slot, or attempt budget.
 
 ## Persistence and adapter boundary
 
@@ -75,6 +86,65 @@ reopening a pathname or closing the stream. The bundled
 Python standard library. Its output is reproducible for the same prompt, seed,
 dimensions, and reference contents. Artifact retrieval reports the file path,
 PNG dimensions, media type, byte count, and content hash.
+
+## Durable execution
+
+Use `enqueue` when admission and execution occur in separate processes:
+
+```sh
+media-generation enqueue --db ./studio.sqlite3 --output-dir ./artifacts \
+  --idempotency-key portrait-study-002 --max-attempts 2 \
+  --request-json '{"prompt":"A copper fox beneath a violet moon","seed":731,"width":64,"height":64,"reference_ids":[],"output_slot":"hero"}'
+
+media-generation worker --db ./studio.sqlite3 --output-dir ./artifacts --limit 1
+media-generation provenance --db ./studio.sqlite3 --job-id <job-id>
+```
+
+Admission stores the immutable request intent, the complete resolved execution
+plan, adapter identity and configuration, reference IDs and hashes, output-slot
+identity, and resolved destination before any attempt exists. A queued job has no
+attempt until a worker claims it atomically. Workers sharing a database use one
+heavyweight reservation, an owner and fence epoch, and a 30-second lease with a
+five-second heartbeat while the adapter runs. `--limit` bounds how many queued
+jobs one worker invocation considers; it does not permit concurrent heavyweight
+attempts in the same database.
+
+`--max-attempts` applies when a new job is admitted and defaults to one total
+attempt. Reusing a matching job never resets its persisted budget; supplying
+an explicitly different value conflicts. An automatic retry requires an
+eligible failure classification, proof that the previous execution terminated,
+successful publication recovery, an available resource, and remaining
+persisted budget. An unknown outcome is quarantined and is never replayed
+automatically. Restarting a worker does not reset the budget.
+
+Termination proof comes only from a containment contract declared directly by
+the adapter. Adapter identity, configuration, or a subclassed adapter's
+inherited behavior is not proof. A valid artifact produced without that proof
+remains committed and inspectable, while its attempt records
+`termination_proven=false` and the heavyweight resource remains quarantined.
+A noncanceled failure without proof is reported as `ambiguous`, retains its
+failure classification, and cannot authorize replay.
+
+Inspect or control durable work with:
+
+```sh
+media-generation cancel --db ./studio.sqlite3 --job-id <job-id>
+media-generation retry --db ./studio.sqlite3 --job-id <job-id>
+media-generation recover --db ./studio.sqlite3 --output-dir ./artifacts
+```
+
+`retry` acknowledges an eligible bounded retry that is already queued. Repeated
+retry requests are idempotent and preserve the job, request, output slot, attempt
+history, and immutable budget; a later worker claim creates the next attempt.
+
+Cancellation of a never-claimed job is terminal and creates no attempt. An
+active attempt is fenced immediately, but cancel returns `accepted` while the
+adapter may still be running. Releasing the heavyweight resource requires
+evidence that execution stopped. A cancel after the artifact transaction commits
+returns `too_late`; the successful artifact remains authoritative. Run `recover`
+after an interrupted worker stops. It reconciles interrupted publication state
+and reports `attention_required` when a process outcome or retained file cannot
+be proven safe for further execution.
 
 ## Import, lineage, and recovery
 
@@ -114,10 +184,12 @@ ordering, migration, source authority, graph roles, and filesystem limitations.
 
 This slice proves the local request-to-image and provenance path. The bundled
 adapter creates a deterministic test image, not a production model result.
-There is no HTTP API, background worker, retry or lease system, attempt fencing,
-or benchmark orchestration. T04 orchestration remains a separate slice.
-APEX hardware, real GPU inference, engine behavior, model quality, and hardware
-reliability are unverified.
+There is no HTTP API, graphical interface, distributed worker pool, or benchmark
+orchestration. All cooperating workers must use the same SQLite database and
+local output directory; the database enforces one heavyweight attempt at a time.
+The bundled deterministic CPU adapter is the only real adapter in this context.
+APEX hardware, real GPU inference, model quality, and hardware reliability are
+unverified.
 
 ## Validation and generated outputs
 

@@ -21,6 +21,23 @@ class IdempotencyConflictError(GenerationError):
     """An idempotency key is already bound to different request intent."""
 
 
+class ResourceBusyError(GenerationError):
+    """The single local heavyweight resource is occupied by another attempt.
+
+    The job identified by ``job_id`` remains durably admitted and can be
+    inspected or executed later. Resource contention never grants a second
+    execution authority.
+    """
+
+    def __init__(self, job_id: str, message: str = "local generation resource is busy") -> None:
+        super().__init__(message)
+        self.job_id = job_id
+
+
+class RetryableGenerationError(GenerationError):
+    """An adapter has identified a known, process-contained transient failure."""
+
+
 class RecordNotFoundError(GenerationError):
     """A requested persisted record does not exist."""
 
