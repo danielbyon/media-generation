@@ -16,12 +16,15 @@ source is copied unchanged, including metadata and orientation. Subsequent edits
 to the source file cannot change the stored artifact. Migration backfills ordered
 reference edges from historical jobs and leaves their rows and image bytes intact.
 
-The current schema uses `user_version = 3`. Version 3 adds execution and
+The current schema uses `user_version = 4`. Version 3 added execution and
 publication-authority sidecar tables while leaving the T01 and T03 record tables,
 JSON, identities, image bytes, and lineage unchanged. Publication authority is
 backfilled only for historical publications whose journal state is `committed`.
+Version 4 adds nullable privacy-compliance evidence to execution jobs. Historical
+rows remain NULL and are exposed as unverified; migration never assigns a
+retrospective privacy pass.
 An unfinished historical journal has no trustworthy owner, epoch, lease, or
-containment evidence, so it remains quarantined. Opening a version-3 database
+containment evidence, so it remains quarantined. Opening a version-4 database
 requires all four sidecar tables and the valid singleton `execution_resource`
 row; an incomplete schema fails closed before admission. Migration and backfill
 execute in one transaction; failure rolls back the entire upgrade. Older
@@ -34,10 +37,10 @@ connection-local `media_generation_writer_epoch()` function, and `BEFORE
 INSERT/UPDATE` triggers on `generation_requests`, `generation_jobs`,
 `generation_attempts`, `generation_artifacts`, `artifact_edges`,
 `artifact_publications`, and `artifact_integrity` require that function to
-report version 3. An older binary does not register it, so its first guarded
-mutation aborts with `no such function: media_generation_writer_epoch` while
-`user_version` remains 3. Opening version 3 recreates a missing guard and
-rejects a same-name guard with a divergent definition. Opening also fails with
+report epoch 4. A pre-v4 writer either lacks that function or reports epoch 3,
+so its first guarded mutation aborts while `user_version` remains 4. Opening
+version 4 recreates a missing guard and upgrades a recognized epoch-3 guard; it
+rejects any other same-name guard with a divergent definition. Opening also fails with
 an explicit diagnostic if a public job has no `execution_jobs` sidecar, because
 such a row was admitted after the migration boundary by a writer that bypassed
 the barrier.

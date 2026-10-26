@@ -108,16 +108,49 @@ Python standard library. Its output is reproducible for the same prompt, seed,
 dimensions, and reference contents. Artifact retrieval reports the file path,
 PNG dimensions, media type, byte count, and content hash.
 
+## Local inference privacy configuration
+
+Each inference adapter has a versioned effective configuration. An
+application-owned privacy profile binds the exact adapter identity,
+configuration version, tool identity and version to required local-only setting
+values. The evaluator checks external APIs, hosted/cloud inference, telemetry,
+content upload, automatic network fetch or update, remote endpoints or proxies,
+and cloud fallback. Missing settings or unrecognized values produce
+`unverified`; a known
+prohibited value produces `fail`; only a complete match produces `pass`.
+
+The machine-readable result records the profile and configuration fingerprints,
+control evidence, stable reason codes, and fixed assurance limitations. It never
+contains raw adapter configuration and never claims network isolation or APEX
+qualification. Credential-like and model-acquisition settings are rejected from
+runtime configuration because credentials and acquisition concerns must remain
+separate from inference settings.
+
+The service rejects `fail` configuration. A matching compliance-capable profile
+also rejects `unverified` values automatically. Callers can set
+`require_privacy_pass=True` to reject an adapter that has no trusted profile at
+all. The bundled deterministic CPU adapter retains its legacy execution behavior
+under the default admission mode, but its provenance is explicitly `unverified`
+for real-tool privacy. A job's
+stored privacy evidence and exact configuration are required to match before an
+idempotent submission is reused or a worker claims the job.
+
+See [privacy compliance architecture](docs/architecture/privacy-compliance.md)
+for the profile contract,
+redaction rules, migration behavior, and real-tool integration responsibilities.
+
 Before opening an existing T01 or T03 database with this release, stop every
 older CLI worker, adapter process, and inference child that can write the
 database or image tree; wait for them to exit. Back up the database with the
 SQLite backup API or while it is offline, and preserve the image tree and
-publication roots with it. The version 3 migration installs database guards
+publication roots with it. The version 4 migration adds nullable privacy
+evidence to execution jobs and preserves earlier rows as explicitly unverified.
+The migration also installs database guards
 that reject later writes from binaries that do not identify themselves as
 current, but a trigger cannot prove that an already-running process stopped or
 prevent it from changing files before its database commit fails. Restore the
 pre-migration database before intentionally running an older binary again; a
-version 3 database is not safely downgradeable in place.
+version 4 database is not safely downgradeable in place.
 
 ## Durable execution
 
@@ -242,8 +275,9 @@ There is no HTTP API, graphical interface, distributed worker pool, or benchmark
 orchestration. All cooperating workers must use the same SQLite database and
 local output directory; the database enforces one heavyweight attempt at a time.
 The bundled deterministic CPU adapter is the only real adapter in this context.
-APEX hardware, real GPU inference, model quality, and hardware reliability are
-unverified.
+Its privacy evidence is configuration-unverified and does not qualify a real
+inference tool. APEX hardware, real GPU inference, model quality, network
+confinement, and hardware reliability are unverified.
 
 ## Validation and generated outputs
 

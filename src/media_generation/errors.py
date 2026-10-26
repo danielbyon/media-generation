@@ -13,6 +13,25 @@ class UnsupportedCapabilityError(GenerationError):
     """The selected adapter cannot provide a requested capability."""
 
 
+class PrivacyComplianceError(GenerationError):
+    """An adapter's effective configuration cannot be admitted for execution.
+
+    A failure identifies a known prohibited setting. Strict admission also
+    rejects unverified configuration because missing evidence is not a privacy
+    pass. The attached result contains the versioned, redacted evidence operators
+    need to diagnose the decision.
+    """
+
+    def __init__(self, result: object) -> None:
+        status = getattr(result, "status", "unknown")
+        status_value = getattr(status, "value", str(status))
+        self.result = result
+        super().__init__(
+            f"adapter privacy configuration is {status_value}; "
+            "configuration-only compliance did not admit this execution"
+        )
+
+
 class UnknownReferenceError(GenerationError):
     """A reference ID does not identify a persisted logical artifact."""
 
