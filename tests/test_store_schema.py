@@ -2,22 +2,12 @@
 
 from __future__ import annotations
 
-import inspect
 from pathlib import Path
 import sqlite3
-import textwrap
 
 import pytest
 
-from media_generation.store import SQLiteStore
-
-
-def _execution_resource_ddl() -> str:
-    """Read the actual resource schema statement for independent SQL execution."""
-    source = inspect.getsource(SQLiteStore._migrate_execution)
-    start = source.index("CREATE TABLE execution_resource (")
-    end = source.index(')"""', start) + 1
-    return textwrap.dedent(source[start:end])
+from media_generation.store import _EXECUTION_RESOURCE_DDL
 
 
 @pytest.mark.parametrize("disable_dqs", (False, True))
@@ -36,7 +26,7 @@ def test_execution_resource_schema_uses_portable_string_literals(
         if disable_dqs:
             connection.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
             connection.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
-        connection.execute(_execution_resource_ddl())
+        connection.execute(_EXECUTION_RESOURCE_DDL)
         connection.execute(
             "INSERT INTO execution_resource(id, state, updated_at) VALUES (1, 'available', 'now')"
         )

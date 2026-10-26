@@ -34,10 +34,17 @@ from .errors import (
     IdempotencyConflictError,
     InputValidationError,
     PublicationIncompleteError,
+    PrivacyComplianceError,
     RecordNotFoundError,
     ResourceBusyError,
     RetryableGenerationError,
     UnsupportedCapabilityError,
+)
+from .privacy import (
+    DEFAULT_PRIVACY_POLICY,
+    PrivacyComplianceResult,
+    PrivacyCompliancePolicy,
+    PrivacyComplianceStatus,
 )
 from .store import ExecutionClaim, QueuedExecution, SQLiteStore
 from .images import ImageInfo, open_approved_source, copy_source
@@ -65,11 +72,19 @@ class SubmissionResult:
         }
 
 
+# Strict JSON validation must finish before privacy evaluation inspects caller
+# data. This non-serializable marker lets the policy return its canonical,
+# redacted configuration_not_json evidence without traversing a cyclic adapter
+# configuration.
+_NON_JSON_PRIVACY_CONFIGURATION: dict[str, object] = {"marker": object()}
+
+
 class GenerationService:
     """Validate, persist, execute, and expose one local generation request.
 
-    A job and its first attempt are committed before calling the configured
-    adapter. Execution is synchronous in the submitting process; SQLite and
+    The service captures adapter configuration, evaluates it against an
+    application-owned privacy profile, and persists redacted evidence with the
+    queued job. Execution is synchronous in the submitting process; SQLite and
     artifact files remain available to later CLI processes.
     """
 
@@ -82,12 +97,25 @@ class GenerationService:
         publication_checkpoint: Checkpoint | None = None,
         lease_seconds: float = 30.0,
         heartbeat_seconds: float = 5.0,
+        privacy_policy: PrivacyCompliancePolicy | None = None,
+        require_privacy_pass: bool = False,
     ) -> None:
         if lease_seconds <= 0 or heartbeat_seconds <= 0 or heartbeat_seconds >= lease_seconds:
             raise ValueError("heartbeat interval must be positive and shorter than the lease")
+        self.adapter: GenerationAdapter = (
+            adapter if adapter is not None else DeterministicCpuAdapter()
+        )
+        if not isinstance(require_privacy_pass, bool):
+            raise ValueError("require_privacy_pass must be a boolean")
+        if privacy_policy is not None and not isinstance(
+            privacy_policy, PrivacyCompliancePolicy
+        ):
+            raise ValueError("privacy_policy must be a PrivacyCompliancePolicy")
+        self._privacy_policy = privacy_policy or DEFAULT_PRIVACY_POLICY
+        self._require_privacy_pass = require_privacy_pass
+        self._current_privacy_snapshot()
         self._store = SQLiteStore(database_path)
         self.output_directory = output_directory.expanduser().resolve()
-        self.adapter: GenerationAdapter = adapter or DeterministicCpuAdapter()
         self._lease = timedelta(seconds=lease_seconds)
         self._heartbeat_seconds = heartbeat_seconds
         self._publication = PublicationManager(self._store, self.output_directory, publication_checkpoint)
@@ -109,6 +137,52 @@ class GenerationService:
         queued = self._admit(idempotency_key, request, max_attempts=max_attempts)
         return self._submission_for_job(queued.job_id)
 
+    def _current_privacy_snapshot(
+        self,
+    ) -> tuple[dict[str, object], str, PrivacyComplianceResult, str]:
+        """Evaluate current adapter settings and reject an inadmissible state.
+
+        Configuration values that cannot be represented as strict JSON are
+        rejected with redacted privacy evidence before admission is persisted.
+        """
+        raw_adapter_configuration = self.adapter.configuration
+        try:
+            adapter_configuration_json = _canonical_json(raw_adapter_configuration)
+            adapter_configuration = json.loads(adapter_configuration_json)
+        except (TypeError, ValueError, RecursionError):
+            privacy_compliance = self._privacy_policy.evaluate(
+                self.adapter.adapter_id,
+                _NON_JSON_PRIVACY_CONFIGURATION,
+            )
+            raise PrivacyComplianceError(privacy_compliance) from None
+        if not isinstance(adapter_configuration, dict):
+            privacy_compliance = self._privacy_policy.evaluate(
+                self.adapter.adapter_id,
+                raw_adapter_configuration,
+            )
+            raise PrivacyComplianceError(privacy_compliance) from None
+        privacy_compliance = self._privacy_policy.evaluate(
+            self.adapter.adapter_id,
+            adapter_configuration,
+        )
+        if (
+            privacy_compliance.status is PrivacyComplianceStatus.FAIL
+            or (
+                (
+                    self._require_privacy_pass
+                    or privacy_compliance.supports_configuration_compliance
+                )
+                and privacy_compliance.status is not PrivacyComplianceStatus.PASS
+            )
+        ):
+            raise PrivacyComplianceError(privacy_compliance)
+        return (
+            adapter_configuration,
+            adapter_configuration_json,
+            privacy_compliance,
+            _canonical_json(privacy_compliance.to_dict()),
+        )
+
     def _admit(
         self,
         idempotency_key: str,
@@ -117,6 +191,9 @@ class GenerationService:
         max_attempts: int | None,
     ) -> QueuedExecution:
         """Atomically admit or reuse one request and report whether it is new."""
+        _, adapter_configuration_json, _, privacy_compliance_json = (
+            self._current_privacy_snapshot()
+        )
         requested_max_attempts = max_attempts
         if max_attempts is None:
             max_attempts = 1
@@ -141,7 +218,8 @@ class GenerationService:
             output_slot_id=_new_id("slot"),
             resolved_seed=resolved_seed,
             adapter_id=self.adapter.adapter_id,
-            adapter_configuration_json=_canonical_json(self.adapter.configuration),
+            adapter_configuration_json=adapter_configuration_json,
+            privacy_compliance_json=privacy_compliance_json,
             effective_parameters_json=_canonical_json(
                 {"width": request.width, "height": request.height}
             ),
@@ -382,12 +460,23 @@ class GenerationService:
                         "processed": processed,
                         "outcomes": outcomes,
                     }
+                (
+                    _,
+                    adapter_configuration_json,
+                    privacy_compliance,
+                    privacy_compliance_json,
+                ) = self._current_privacy_snapshot()
                 timestamp = _now()
                 claim = self._store.claim_next_execution(
                     attempt_id=_new_id("att"),
                     owner_id=_new_id("worker"),
                     adapter_id=self.adapter.adapter_id,
-                    adapter_configuration_json=_canonical_json(self.adapter.configuration),
+                    adapter_configuration_json=adapter_configuration_json,
+                    privacy_compliance_json=privacy_compliance_json,
+                    allow_unrecorded_privacy=(
+                        privacy_compliance.status
+                        is PrivacyComplianceStatus.UNVERIFIED
+                    ),
                     resolved_output_directory=str(self.output_directory),
                     process_contained=trusted_containment_contract(self.adapter) is not None,
                     containment_contract=trusted_containment_contract(self.adapter),
@@ -735,5 +824,15 @@ def _lease_deadline(lease: timedelta) -> str:
 
 
 def _canonical_json(value: object) -> str:
-    """Serialize adapter settings and effective parameters deterministically."""
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    """Serialize values deterministically as strict JSON.
+
+    Non-finite numbers and unsupported object types are rejected so admission
+    can fail before writing partial persisted state.
+    """
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )

@@ -23,7 +23,12 @@ from media_generation.domain import (
     GenerationPlan,
     GenerationRequest,
 )
-from media_generation.errors import IdempotencyConflictError, UnsupportedCapabilityError
+from media_generation.errors import (
+    GenerationError,
+    IdempotencyConflictError,
+    PrivacyComplianceError,
+    UnsupportedCapabilityError,
+)
 from media_generation.service import GenerationExecutionError, GenerationService
 
 
@@ -48,6 +53,235 @@ class _VariantCpuAdapter(DeterministicCpuAdapter):
     def configuration(self) -> dict[str, object]:
         """Return the configuration variant used by this test adapter."""
         return dict(self._configuration)
+
+
+@pytest.mark.parametrize(
+    "unsupported_value",
+    ({"set-member"}, float("nan"), object()),
+    ids=("set", "nan", "custom-object"),
+)
+def test_non_json_adapter_configuration_fails_before_admission_without_leaking_values(
+    tmp_path: Path,
+    unsupported_value: object,
+) -> None:
+    """Non-JSON settings fail with redacted privacy evidence and persist no job."""
+    configuration = {"configuration_version": 1}
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    service = GenerationService(
+        database_path,
+        tmp_path / "artifacts",
+        adapter=adapter,
+    )
+    sensitive_value = "private-configuration-value"
+    configuration.update(
+        {
+            "api_key": sensitive_value,
+            "unsupported": unsupported_value,
+        }
+    )
+
+    with pytest.raises(
+        PrivacyComplianceError,
+        match=(
+            r"^adapter privacy configuration is unverified; "
+            r"configuration-only compliance did not admit this execution$"
+        ),
+    ) as raised:
+        service.enqueue(
+            "non-json-adapter-configuration",
+            GenerationRequest("A non-JSON configuration", seed=19),
+        )
+
+    evidence = raised.value.result.to_dict()
+    assert evidence["reasons"] == [
+        {
+            "code": "configuration_not_json",
+            "detail": "Configuration is not valid JSON.",
+        }
+    ]
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert "RecursionError" not in str(raised.value)
+    with sqlite3.connect(database_path) as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "generation_attempts",
+            "execution_jobs",
+            "execution_attempts",
+        ):
+            assert connection.execute(
+                f"SELECT count(*) FROM {table}"
+            ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("cycle_kind", ("mapping", "list"))
+def test_cyclic_adapter_configuration_fails_before_admission_without_recursion(
+    tmp_path: Path,
+    cycle_kind: str,
+) -> None:
+    """Cyclic settings fail with redacted evidence before persistence."""
+    configuration: dict[str, object] = {"configuration_version": 1}
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    service = GenerationService(
+        database_path,
+        tmp_path / "artifacts",
+        adapter=adapter,
+    )
+
+    sensitive_value = "private-cyclic-configuration-value"
+    configuration["api_key"] = sensitive_value
+    if cycle_kind == "mapping":
+        configuration["cycle"] = configuration
+    else:
+        recursive_list: list[object] = []
+        recursive_list.append(recursive_list)
+        configuration["cycle"] = recursive_list
+
+    with pytest.raises(
+        PrivacyComplianceError,
+        match=(
+            r"^adapter privacy configuration is unverified; "
+            r"configuration-only compliance did not admit this execution$"
+        ),
+    ) as raised:
+        service.enqueue(
+            "cyclic-adapter-configuration",
+            GenerationRequest("A cyclic configuration", seed=19),
+        )
+
+    evidence = raised.value.result.to_dict()
+    assert evidence["reasons"] == [
+        {
+            "code": "configuration_not_json",
+            "detail": "Configuration is not valid JSON.",
+        }
+    ]
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert "RecursionError" not in str(raised.value)
+
+    with sqlite3.connect(database_path) as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "generation_attempts",
+            "execution_jobs",
+            "execution_attempts",
+        ):
+            assert connection.execute(
+                f"SELECT count(*) FROM {table}"
+            ).fetchone() == (0,)
+
+
+def test_nested_adapter_configuration_with_credential_fails_before_admission_without_leak(
+    tmp_path: Path,
+) -> None:
+    """Nested credential settings fail redacted without persisting admission."""
+    sensitive_value = "private-deep-configuration-value"
+    nested: dict[str, object] = {"api_key": sensitive_value}
+    for _ in range(64):
+        nested = {"nested": nested}
+
+    configuration: dict[str, object] = {
+        "configuration_version": 1,
+        "nested": nested,
+    }
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    with pytest.raises(
+        PrivacyComplianceError,
+        match=(
+            r"^adapter privacy configuration is fail; "
+            r"configuration-only compliance did not admit this execution$"
+        ),
+    ) as raised:
+        GenerationService(
+            database_path,
+            tmp_path / "artifacts",
+            adapter=adapter,
+        )
+
+    evidence = raised.value.result.to_dict()
+    assert evidence["status"] == "fail"
+    assert evidence["reasons"] == [
+        {
+            "code": "credential_material_present",
+            "detail": "Credentials must remain outside runtime inference settings.",
+        },
+        {
+            "code": "unqualified_configuration",
+            "detail": "This profile cannot establish real inference-tool privacy.",
+        },
+    ]
+    assert raised.value.__cause__ is None
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert not database_path.exists()
+
+
+def test_raw_configuration_serialization_recursion_fails_before_admission_without_leak(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Simulated raw settings recursion fails redacted before admission."""
+    sensitive_value = "private-serialization-recursion-value"
+    serialization_probe = object()
+    configuration: dict[str, object] = {
+        "configuration_version": 1,
+        "serialization_probe": serialization_probe,
+        "credential": {"api_key": sensitive_value},
+    }
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    original_dumps = json.dumps
+    rejected_raw_configuration = False
+
+    def reject_raw_configuration(value, *args, **kwargs):
+        nonlocal rejected_raw_configuration
+        if (
+            isinstance(value, dict)
+            and value.get("serialization_probe") is serialization_probe
+        ):
+            rejected_raw_configuration = True
+            raise RecursionError("simulated raw configuration serialization depth")
+        return original_dumps(value, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            json,
+            "dumps",
+            reject_raw_configuration,
+        )
+        with pytest.raises(
+            PrivacyComplianceError,
+            match=(
+                r"^adapter privacy configuration is unverified; "
+                r"configuration-only compliance did not admit this execution$"
+            ),
+        ) as raised:
+            GenerationService(
+                database_path,
+                tmp_path / "artifacts",
+                adapter=adapter,
+            )
+
+    assert rejected_raw_configuration
+    evidence = raised.value.result.to_dict()
+    assert evidence["status"] == "unverified"
+    assert evidence["reasons"] == [
+        {
+            "code": "configuration_not_json",
+            "detail": "Configuration is not valid JSON.",
+        }
+    ]
+    assert raised.value.__cause__ is None
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert "RecursionError" not in str(raised.value)
+    assert not database_path.exists()
 
 
 def test_generation_request_intent_cannot_be_mutated() -> None:
@@ -162,6 +396,37 @@ def test_retired_pending_admission_cannot_create_sidecarless_jobs(tmp_path: Path
     GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
 
 
+def test_direct_claim_without_privacy_evidence_rejects_protected_execution(
+    tmp_path: Path,
+) -> None:
+    """Omitted evidence cannot claim a job with durable privacy evidence."""
+    service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+    queued = service.enqueue(
+        "legacy-direct-claim", GenerationRequest("Legacy direct claim", seed=9)
+    )
+
+    with pytest.raises(
+        GenerationError,
+        match="protected execution claim requires exact privacy-compliance evidence",
+    ):
+        service._store.claim_next_execution(
+            attempt_id="att_fedcba9876543210fedcba9876543210",
+            owner_id="worker_legacy",
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=json.dumps(
+                service.adapter.configuration, sort_keys=True, separators=(",", ":")
+            ),
+            resolved_output_directory=str(tmp_path / "artifacts"),
+            process_contained=True,
+            containment_contract=PROCESS_CONTAINED_CONTRACT,
+            timestamp="2026-10-26T00:00:00+00:00",
+            lease_expires_at="2026-10-26T00:01:00+00:00",
+            job_id=queued.job_id,
+        )
+
+    assert service.get_provenance(queued.job_id)["status"] == "queued"
+
+
 def test_artifact_attempt_must_belong_to_the_job_being_completed(
     tmp_path: Path,
 ) -> None:
@@ -170,10 +435,14 @@ def test_artifact_attempt_must_belong_to_the_job_being_completed(
 
     first = service.enqueue("first", GenerationRequest("Request first", seed=9))
     second = service.enqueue("second", GenerationRequest("Request second", seed=9))
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
     first_claim = service._store.claim_next_execution(
         attempt_id="att_0123456789abcdef0123456789abcdef",
         owner_id="worker_first", adapter_id=service.adapter.adapter_id,
-        adapter_configuration_json=json.dumps(service.adapter.configuration, sort_keys=True, separators=(",", ":")),
+        adapter_configuration_json=adapter_configuration_json,
+        privacy_compliance_json=privacy_compliance_json,
         resolved_output_directory=str(tmp_path / "artifacts"),
         process_contained=True, containment_contract=PROCESS_CONTAINED_CONTRACT,
         timestamp="2026-10-21T00:00:00+00:00",
@@ -503,6 +772,66 @@ class _TrackingCpuAdapter(DeterministicCpuAdapter):
     def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
         self.calls += 1
         return super().generate(plan, destination)
+
+
+class _FalseyTrackingCpuAdapter(_TrackingCpuAdapter):
+    """Expose false truthiness while retaining valid CPU adapter behavior."""
+
+    adapter_id = "falsey-tracking-cpu-v1"
+
+    @property
+    def configuration(self) -> dict[str, object]:
+        """Return configuration that distinguishes this adapter from the default."""
+        return {"configuration_version": 1, "profile": "falsey-tracking"}
+
+    def __bool__(self) -> bool:
+        return False
+
+
+def test_falsey_adapter_is_selected_and_used(tmp_path: Path) -> None:
+    """Adapter selection distinguishes a supplied falsey adapter from omission."""
+    adapter = _FalseyTrackingCpuAdapter()
+    service = GenerationService(
+        database_path=tmp_path / "studio.sqlite3",
+        output_directory=tmp_path / "artifacts",
+        adapter=adapter,
+    )
+
+    assert service.adapter is adapter
+    assert service.adapter.adapter_id == "falsey-tracking-cpu-v1"
+    assert service.adapter.configuration == {
+        "configuration_version": 1,
+        "profile": "falsey-tracking",
+    }
+
+    submission = service.submit(
+        idempotency_key="falsey-adapter",
+        request=GenerationRequest(
+            prompt="A falsey tracking adapter",
+            seed=19,
+            width=48,
+            height=48,
+            output_slot="cover",
+        ),
+    )
+    job = service.get_job(submission.job_id)
+
+    assert adapter.calls == 1
+    assert job.adapter_id == "falsey-tracking-cpu-v1"
+    assert job.adapter_configuration == {
+        "configuration_version": 1,
+        "profile": "falsey-tracking",
+    }
+
+
+def test_omitted_adapter_uses_deterministic_cpu_default(tmp_path: Path) -> None:
+    """Omitting the adapter selects the deterministic CPU implementation."""
+    service = GenerationService(
+        database_path=tmp_path / "studio.sqlite3",
+        output_directory=tmp_path / "artifacts",
+    )
+
+    assert type(service.adapter) is DeterministicCpuAdapter
 
 
 def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(

@@ -43,7 +43,13 @@ class GenerationAdapter(Protocol):
 
     @property
     def configuration(self) -> dict[str, object]:
-        """Return the stable, JSON-compatible configuration to persist per job."""
+        """Return stable JSON settings persisted with each job.
+
+        A real adapter includes its exact effective privacy settings here so an
+        application-owned profile can verify them before admission. Credentials,
+        model acquisition configuration, and the adapter's own compliance claims
+        do not belong in this mapping.
+        """
 
     def generate(self, plan: GenerationPlan, destination: BinaryIO) -> ImageMetadata:
         """Write to the publisher's open staging stream without closing it.

@@ -6,10 +6,23 @@ import sqlite3
 
 import pytest
 
-from media_generation.adapters import DeterministicCpuAdapter
+from media_generation.adapters import (
+    PROCESS_CONTAINED_CONTRACT,
+    DeterministicCpuAdapter,
+)
 from media_generation.errors import GenerationError
 from media_generation.service import GenerationService
-from media_generation.store import SQLiteStore
+from media_generation.store import (
+    SQLiteStore,
+    _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
+    _EXECUTION_ATTEMPTS_DDL,
+    _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
+    _EXECUTION_JOBS_QUEUED_INDEX_DDL,
+    _EXECUTION_JOBS_V3_DDL,
+    _EXECUTION_RESOURCE_DDL,
+    _WRITER_EPOCH,
+    _WRITER_EPOCH_FUNCTION,
+)
 from test_artifact_migration import legacy_database
 from test_durable_execution import request
 
@@ -113,6 +126,10 @@ def test_unfinished_historical_work_is_quarantined_without_row_mutation(
     snapshot = service.get_provenance(job_id)
     assert snapshot["execution"]["resource_state"] == "quarantined"
     assert snapshot["attempts"][0]["termination_proven"] is False
+    assert snapshot["privacy_compliance"]["status"] == "unverified"
+    assert "historical_record_unverified" in {
+        reason["code"] for reason in snapshot["privacy_compliance"]["reasons"]
+    }
     assert service.work()["status"] == "resource_busy"
 
     with sqlite3.connect(database) as connection:
@@ -211,7 +228,7 @@ def test_t01_successful_rows_bytes_and_lineage_survive_execution_upgrade(
         assert service.get_lineage(artifact["artifact_id"]) == before_lineage[artifact["artifact_id"]]
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for name, rows in before_rows.items():
             assert connection.execute(f"SELECT * FROM {name}").fetchall() == rows
@@ -228,7 +245,7 @@ def test_t03_allocated_journal_and_attempt_rows_survive_upgrade(tmp_path: Path) 
     GenerationService(database, images)
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("SELECT * FROM artifact_publications").fetchall() == publications_before
         assert connection.execute("SELECT * FROM generation_attempts").fetchall() == attempts_before
@@ -245,6 +262,265 @@ def test_execution_migration_is_idempotent_after_success(tmp_path: Path) -> None
     assert second == first
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == after_first
+
+
+def test_valid_version_three_schema_advances_to_version_four(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A complete v3 schema remains upgradeable even when the column exists."""
+    database, images, _ = historical_running(tmp_path, "t03")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SQLiteStore,
+            "_migrate_privacy",
+            staticmethod(lambda connection: None),
+        )
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert "privacy_compliance_json" in {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(execution_jobs)")
+        }
+        attempts_before = connection.execute(
+            "SELECT * FROM generation_attempts"
+        ).fetchall()
+        publications_before = connection.execute(
+            "SELECT * FROM artifact_publications"
+        ).fetchall()
+
+    GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute(
+            "SELECT * FROM generation_attempts"
+        ).fetchall() == attempts_before
+        assert connection.execute(
+            "SELECT * FROM artifact_publications"
+        ).fetchall() == publications_before
+
+
+def test_privacy_migration_accepts_alter_table_definition(tmp_path: Path) -> None:
+    """The additive ALTER TABLE path remains a valid historical v4 variant."""
+    database = tmp_path / "version-three.sqlite3"
+    with sqlite3.connect(database) as connection:
+        for statement in (
+            _EXECUTION_JOBS_V3_DDL,
+            _EXECUTION_JOBS_QUEUED_INDEX_DDL,
+            _EXECUTION_ATTEMPTS_DDL,
+            _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
+            _EXECUTION_RESOURCE_DDL,
+            _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
+        ):
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 3")
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        SQLiteStore._migrate_privacy(connection)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert "privacy_compliance_json" in {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(execution_jobs)")
+        }
+
+
+def test_version_three_weakened_check_retains_fragment_but_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A weakened CHECK cannot pass by retaining the expected SQL text."""
+    database, images, _ = historical_running(tmp_path, "t03")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SQLiteStore,
+            "_migrate_privacy",
+            staticmethod(lambda connection: None),
+        )
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        original_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("execution_jobs",),
+        ).fetchone()[0]
+        weakened_sql = original_sql.replace(
+            "CHECK (max_attempts >= 1)",
+            "CHECK (max_attempts >= 1 OR 1)",
+        )
+        assert weakened_sql != original_sql
+        assert "max_attempts>=1" in "".join(weakened_sql.split())
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+            (weakened_sql, "execution_jobs"),
+        )
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.commit()
+
+    with sqlite3.connect(database) as connection:
+        before = list(connection.iterdump())
+
+    with pytest.raises(
+        RuntimeError,
+        match="execution_jobs has a divergent table definition",
+    ):
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize(
+    ("definition_change", "table_name", "expected_message"),
+    (
+        (
+            "foreign-key-action",
+            "execution_jobs",
+            "execution_jobs has a divergent table definition",
+        ),
+        (
+            "table-option",
+            "execution_resource",
+            "execution_resource has a divergent table definition",
+        ),
+    ),
+)
+def test_version_three_table_definition_is_compared_in_full(
+    tmp_path: Path,
+    monkeypatch,
+    definition_change: str,
+    table_name: str,
+    expected_message: str,
+) -> None:
+    """Foreign-key actions and table options are part of the DDL contract."""
+    database, images, _ = historical_running(tmp_path, "t03")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SQLiteStore,
+            "_migrate_privacy",
+            staticmethod(lambda connection: None),
+        )
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        original_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table_name,),
+        ).fetchone()[0]
+        if definition_change == "foreign-key-action":
+            changed_sql = original_sql.replace(
+                "REFERENCES generation_jobs(job_id)",
+                "REFERENCES generation_jobs(job_id) ON DELETE CASCADE",
+                1,
+            )
+        else:
+            changed_sql = original_sql + " STRICT"
+        assert changed_sql != original_sql
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_master SET sql = ? WHERE type = 'table' AND name = ?",
+            (changed_sql, table_name),
+        )
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.commit()
+
+    with sqlite3.connect(database) as connection:
+        before = list(connection.iterdump())
+
+    with pytest.raises(
+        RuntimeError,
+        match=expected_message,
+    ):
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+def test_version_three_missing_execution_index_fails_without_privacy_advance(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The version marker cannot hide a removed execution ordering constraint."""
+    database, images, _ = historical_running(tmp_path, "t03")
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            SQLiteStore,
+            "_migrate_privacy",
+            staticmethod(lambda connection: None),
+        )
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP INDEX execution_attempts_running_idx")
+        before = list(connection.iterdump())
+
+    with pytest.raises(RuntimeError, match="missing index execution_attempts_running_idx"):
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+
+
+@pytest.mark.parametrize(
+    ("version", "has_privacy_column"),
+    ((3, False), (4, True)),
+)
+def test_partial_execution_schema_preserves_existing_schema_version(
+    tmp_path: Path,
+    version: int,
+    has_privacy_column: bool,
+) -> None:
+    """Table names and the privacy marker do not substitute for schema structure."""
+    database = tmp_path / "partial.sqlite3"
+    privacy_column = ",\n    privacy_compliance_json TEXT" if has_privacy_column else ""
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            f"""
+            CREATE TABLE execution_jobs (
+                job_id TEXT PRIMARY KEY{privacy_column}
+            );
+            CREATE TABLE execution_attempts (
+                attempt_id TEXT PRIMARY KEY
+            );
+            CREATE TABLE execution_resource (
+                id INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE artifact_publication_authority (
+                publication_id TEXT PRIMARY KEY
+            );
+            INSERT INTO execution_resource VALUES (
+                1, 'available', '2026-10-26T00:00:00+00:00'
+            );
+            PRAGMA user_version = {version};
+            """
+        )
+
+    with sqlite3.connect(database) as connection:
+        before = list(connection.iterdump())
+
+    with pytest.raises(RuntimeError, match=rf"schema version {version} incomplete"):
+        GenerationService(database, tmp_path / "images")
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == version
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(execution_jobs)")
+        }
+        assert ("privacy_compliance_json" in columns) is has_privacy_column
 
 
 def test_t03_ready_journal_without_attempt_authority_stays_quarantined(
@@ -286,7 +562,14 @@ def test_version_three_marker_without_execution_sidecars_fails_closed(
         connection.execute("PRAGMA user_version = 3")
         before = list(connection.iterdump())
 
-    with pytest.raises(RuntimeError, match="schema version 3 is incomplete"):
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            r"^database schema version 3 incomplete; missing tables: "
+            r"artifact_publication_authority, execution_attempts, "
+            r"execution_jobs, execution_resource$"
+        ),
+    ):
         GenerationService(database, images)
 
     with sqlite3.connect(database) as connection:
@@ -310,7 +593,7 @@ def test_version_three_marker_without_singleton_resource_fails_closed(
 
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone()[0] == jobs_before
 
 
@@ -352,7 +635,7 @@ def test_historical_writer_dml_is_rejected_after_migration(
                 ),
             )
         assert list(historical_writer.iterdump()) == before
-        assert historical_writer.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert historical_writer.execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_current_writer_passes_guards_and_missing_guard_is_recreated(
@@ -379,6 +662,47 @@ def test_current_writer_passes_guards_and_missing_guard_is_recreated(
             "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
             "AND name = 't04_writer_guard_generation_jobs_insert'"
         ).fetchone() == (1,)
+
+
+def test_pre_v4_writer_epoch_is_rejected_after_upgrade(tmp_path: Path) -> None:
+    database, images, _ = historical_running(tmp_path, "t03")
+    GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        for name in EXPECTED_WRITER_GUARDS:
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (name,),
+            ).fetchone()
+            assert row is not None
+            legacy_sql = str(row[0]).replace(f"!= {_WRITER_EPOCH}", "!= 3")
+            connection.execute(f"DROP TRIGGER {name}")
+            connection.execute(legacy_sql)
+        connection.execute("PRAGMA user_version = 3")
+
+    GenerationService(database, images)
+
+    with sqlite3.connect(database) as stale_writer:
+        stale_writer.create_function(_WRITER_EPOCH_FUNCTION, 0, lambda: 3)
+        job_row = stale_writer.execute(
+            "SELECT job_id FROM generation_jobs LIMIT 1"
+        ).fetchone()
+        assert job_row is not None
+        before = list(stale_writer.iterdump())
+        with pytest.raises(sqlite3.IntegrityError, match="stale media-generation writer"):
+            stale_writer.execute(
+                """UPDATE generation_jobs
+                   SET updated_at = updated_at
+                   WHERE job_id = ?""",
+                (job_row[0],),
+            )
+        assert list(stale_writer.iterdump()) == before
+        assert stale_writer.execute("PRAGMA user_version").fetchone()[0] == 4
+        trigger_sql = stale_writer.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type = 'trigger'
+                 AND name = 't04_writer_guard_generation_requests_insert'"""
+        ).fetchone()[0]
+        assert f"!= {_WRITER_EPOCH}" in trigger_sql
 
 
 def test_divergent_writer_guard_fails_closed(tmp_path: Path) -> None:
@@ -435,7 +759,7 @@ def test_version_three_job_without_execution_state_fails_closed(tmp_path: Path) 
                 "2026-10-24T00:00:00+00:00",
             ),
         )
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
 
     with pytest.raises(RuntimeError, match="without execution state"):
         GenerationService(database, images)
@@ -514,3 +838,138 @@ def test_ownerless_historical_attempt_cannot_authorize_finalization(
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
     assert service.get_provenance(job_id)["execution"]["resource_state"] == "quarantined"
+
+
+def test_historical_null_privacy_evidence_remains_unverified_and_reusable(
+    tmp_path: Path,
+) -> None:
+    """NULL evidence identifies a version-3 row without inventing qualification."""
+    database, images, job_id = historical_failed(tmp_path, "t03")
+    service = GenerationService(database, images, DeterministicCpuAdapter())
+
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT privacy_compliance_json FROM execution_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0]
+    assert stored is None
+
+    provenance = service.get_provenance(job_id)
+    assert provenance["privacy_compliance"]["status"] == "unverified"
+    assert "historical_record_unverified" in {
+        reason["code"] for reason in provenance["privacy_compliance"]["reasons"]
+    }
+
+    replayed = service.submit("unfinished", request())
+    assert replayed.job_id == job_id
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT privacy_compliance_json FROM execution_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0] is None
+
+
+def test_direct_claim_cannot_omit_protected_privacy_evidence(
+    tmp_path: Path,
+) -> None:
+    """A direct caller cannot claim protected work without matching evidence."""
+    database = tmp_path / "studio.sqlite3"
+    images = tmp_path / "artifacts"
+    service = GenerationService(database, images)
+    queued = service.enqueue(
+        "protected-direct-claim",
+        request(),
+    )
+
+    with sqlite3.connect(database) as connection:
+        protected_evidence = connection.execute(
+            "SELECT privacy_compliance_json FROM execution_jobs WHERE job_id = ?",
+            (queued.job_id,),
+        ).fetchone()[0]
+    assert isinstance(protected_evidence, str)
+    assert json.loads(protected_evidence)["status"] == "unverified"
+
+    with pytest.raises(
+        GenerationError,
+        match="protected execution claim requires exact privacy-compliance evidence",
+    ):
+        service._store.claim_next_execution(
+            attempt_id="att_22222222222222222222222222222222",
+            owner_id="worker_protected_direct",
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=json.dumps(
+                service.adapter.configuration,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            resolved_output_directory=str(images),
+            process_contained=True,
+            containment_contract=PROCESS_CONTAINED_CONTRACT,
+            timestamp="2026-10-26T00:00:00+00:00",
+            lease_expires_at="2026-10-26T00:01:00+00:00",
+            job_id=queued.job_id,
+        )
+
+    with pytest.raises(
+        GenerationError,
+        match="protected execution claim requires exact adapter-configuration evidence",
+    ):
+        service._store.claim_next_execution(
+            attempt_id="att_22222222222222222222222222222222",
+            owner_id="worker_protected_direct",
+            adapter_id=service.adapter.adapter_id,
+            privacy_compliance_json=protected_evidence,
+            resolved_output_directory=str(images),
+            process_contained=True,
+            containment_contract=PROCESS_CONTAINED_CONTRACT,
+            timestamp="2026-10-26T00:00:00+00:00",
+            lease_expires_at="2026-10-26T00:01:00+00:00",
+            job_id=queued.job_id,
+        )
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM generation_attempts"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM execution_attempts"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT current_attempt_id, status FROM execution_jobs WHERE job_id = ?",
+            (queued.job_id,),
+        ).fetchone() == (None, "queued")
+        assert connection.execute(
+            "SELECT state, job_id, attempt_id FROM execution_resource WHERE id = 1"
+        ).fetchone() == ("available", None, None)
+
+
+@pytest.mark.parametrize(
+    "stored_evidence",
+    ("not-json", '{"adapter_id":"incomplete-record"}'),
+)
+def test_malformed_non_null_privacy_evidence_fails_closed(
+    tmp_path: Path,
+    stored_evidence: str,
+) -> None:
+    """Malformed v4 evidence must not be presented or reused as historical."""
+    database, images, job_id = historical_failed(tmp_path, "t03")
+    service = GenerationService(database, images, DeterministicCpuAdapter())
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE execution_jobs SET privacy_compliance_json = ? WHERE job_id = ?",
+            (stored_evidence, job_id),
+        )
+        before = list(connection.iterdump())
+
+    expected = "stored privacy-compliance evidence is malformed"
+    with pytest.raises(GenerationError, match=expected):
+        service.submit("unfinished", request())
+    with pytest.raises(GenerationError, match=expected):
+        service.get_provenance(job_id)
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute(
+            "SELECT privacy_compliance_json FROM execution_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()[0] == stored_evidence
