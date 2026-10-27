@@ -1,0 +1,65 @@
+docs/architecture/inventory.md
+  s_353618c23d87ca::t_ebb907e0e761af 308-312
+  s_353618c23d87ca::t_345d7b27877f96 300-303
+  s_353618c23d87ca::t_f9d78fda4fe24f 305-307,402-405
+  s_2cca8b6274fb19::t_8f80606ecbb89a 304,406
+tests/test_inventory_probes.py
+  s_353618c23d87ca::t_7ceb984aea68ea 177-180
+  s_353618c23d87ca::t_5158a980147af4 265-279
+  s_353618c23d87ca::t_3c492d5851eac8 18,207,209-213,218-226,263-264,280-282
+  s_353618c23d87ca::t_9ca7cf49c9e06e 254-257
+  s_353618c23d87ca::t_c2456de53fdd50 193
+  s_353618c23d87ca::t_eae3942703743d 287,317-318
+  s_353618c23d87ca::t_6e054b9be27299 285-286,288-316,319-343
+  s_353618c23d87ca::t_c51cd4a170f62e 202-206,208,214-217,227-253,258-262
+  s_353618c23d87ca::t_d48de1baeb646b 169-176,181-192,194-201,390-436
+  s_5115ca474bf205::t_e44654248e0952 283-284,437-438
+src/media_generation/inventory/components.py
+  s_353618c23d87ca::t_ebb907e0e761af 269,429
+src/media_generation/inventory/probes.py
+  s_353618c23d87ca::t_4318094cf528a0 25,395,398-402,435-440,554
+  s_353618c23d87ca::t_487ec38904d948 44,700-701,737-744
+  s_353618c23d87ca::t_0a923e2f2631d9 29,394
+  s_353618c23d87ca::t_9ca7cf49c9e06e 48-49,707-712,724,729
+  s_353618c23d87ca::t_ebb907e0e761af 18,50-117,704,715,718,730,745-748,750-757,759-761,795-804
+  s_353618c23d87ca::t_32a983305c0223 703,713-714,717,720-723,725-728,731-734
+  s_353618c23d87ca::t_329367e6858acc 673-677
+  s_353618c23d87ca::t_3608e54e465eb7 397,404-408,412,416-434,441-477,482,486-550,553
+  s_353618c23d87ca::t_828fabdb71198a 778,780-782
+tests/test_inventory_models.py
+  s_353618c23d87ca::t_6e054b9be27299 88-101,820-846,861
+  s_353618c23d87ca::t_c51cd4a170f62e 73-87,807-815,847-860
+  s_353618c23d87ca::t_bcbb04e0062f49 816-819
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "266feac89000babd7d39bad7ca14a5b590cefe7c",
+  "prompts": {},
+  "sessions": {
+    "s_2cca8b6274fb19": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1602a-b826-79e3-b09b-8f49f68d84e5",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_353618c23d87ca": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a17a62-8123-7d40-adb8-a489a7b672dd",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    },
+    "s_5115ca474bf205": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a16d28-a945-7353-921f-e3c95a755ed6",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
