@@ -15,6 +15,7 @@ import pytest
 from media_generation.inventory.catalog import RUNTIME_CATALOG
 from media_generation.inventory.discovery import _candidate, _python_distribution
 from media_generation.inventory.probes import (
+    DEFAULT_OUTPUT_LIMIT,
     MAX_REPLAY_BYTES,
     LocalObservationSource,
     ProbeLedger,
@@ -165,6 +166,181 @@ def test_run_uses_argv_without_a_shell() -> None:
     assert missing.reason == "binary_not_found"
 
 
+def test_run_rejects_negative_output_limit_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A negative byte cap is invalid and cannot start a child process."""
+
+    def unexpected_popen(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Popen must not be called for an invalid limit")
+
+    monkeypatch.setattr(
+        "media_generation.inventory.probes.subprocess.Popen",
+        unexpected_popen,
+    )
+
+    observation = LocalObservationSource().run(
+        ["unused"], timeout_seconds=5, output_limit=-1
+    )
+
+    assert observation.status == "error"
+    assert observation.reason == "invalid_output_limit"
+
+
+def test_run_accepts_zero_output_limit() -> None:
+    """A zero byte cap remains valid and retains no child output."""
+    observation = LocalObservationSource().run(
+        [sys.executable, "-c", "pass"],
+        timeout_seconds=5,
+        output_limit=0,
+    )
+
+    assert observation.status == "ok"
+    assert observation.text == ""
+
+
+@pytest.mark.parametrize("stream_order", [("stdout", "stderr"), ("stderr", "stdout")])
+def test_run_shares_output_limit_across_stdout_and_stderr(
+    stream_order: tuple[str, str],
+) -> None:
+    """Either output ordering draws from one aggregate retained-byte budget."""
+    source = LocalObservationSource()
+    first, second = stream_order
+    observation = source.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, time; "
+                f"sys.{first}.write('o' * 64); sys.{first}.flush(); "
+                "time.sleep(0.05); "
+                f"sys.{second}.write('e' * 64); sys.{second}.flush()"
+            ),
+        ],
+        timeout_seconds=5,
+        output_limit=96,
+    )
+
+    retained = len(observation.text.encode("utf-8"))
+    retained += len((observation.detail or "").encode("utf-8"))
+    assert observation.truncated is True
+    assert retained == 96
+
+
+def test_run_finalizes_pipe_readers_when_descendant_retains_them(
+    tmp_path: Path,
+) -> None:
+    """A descendant holding inherited pipes cannot hide the child's final output."""
+    source = LocalObservationSource()
+    descendant_pid_path = tmp_path / "descendant.pid"
+    script = (
+        "import subprocess, sys; "
+        "descendant = subprocess.Popen("
+        "[sys.executable, '-c', 'import time; time.sleep(10)'], "
+        "stdin=subprocess.DEVNULL, stdout=sys.stdout, stderr=sys.stderr); "
+        f"open({str(descendant_pid_path)!r}, 'w').write(str(descendant.pid)); "
+        "sys.stdout.write('parent-out\\n'); sys.stdout.flush(); "
+        "sys.stderr.write('parent-err\\n'); sys.stderr.flush()"
+    )
+
+    try:
+        observation = source.run(
+            [sys.executable, "-c", script],
+            timeout_seconds=5,
+            output_limit=1024,
+        )
+    finally:
+        if descendant_pid_path.exists():
+            try:
+                os.kill(int(descendant_pid_path.read_text(encoding="utf-8")), 9)
+            except ProcessLookupError:
+                pass
+
+    assert observation.status == "ok"
+    assert observation.text == "parent-out\n"
+    assert observation.detail == "parent-err"
+    assert observation.truncated is False
+
+
+def test_run_does_not_truncate_stdout_when_it_exactly_fills_limit() -> None:
+    """A single stream at the byte limit is complete rather than truncated."""
+    source = LocalObservationSource()
+    observation = source.run(
+        [sys.executable, "-c", "import sys; sys.stdout.write('x' * 64)"],
+        timeout_seconds=5,
+        output_limit=64,
+    )
+
+    assert observation.status == "ok"
+    assert observation.truncated is False
+    assert observation.text == "x" * 64
+    assert observation.detail is None
+
+
+def test_default_inventory_output_limit_is_32_kib() -> None:
+    """Host inventory probes use the documented 32 KiB default output budget."""
+    assert DEFAULT_OUTPUT_LIMIT == 32 * 1024
+
+
+def test_run_reports_pipe_waiter_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed pipe waiter becomes an explicit collection error."""
+    from media_generation.inventory import probes
+
+    class BrokenSelector:
+        def register(self, descriptor: int, events: int) -> None:
+            pass
+
+        def select(self, timeout: float | None = None) -> list[tuple[object, int]]:
+            raise OSError(24, "Too many open files")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(probes, "_IS_WINDOWS", False)
+    monkeypatch.setattr(probes.selectors, "DefaultSelector", BrokenSelector)
+
+    observation = LocalObservationSource().run(
+        [sys.executable, "-c", "print('unobservable')"],
+        timeout_seconds=5,
+        output_limit=1024,
+    )
+
+    assert observation.status == "error"
+    assert observation.reason == "output_capture_failed"
+    assert "Too many open files" in (observation.detail or "")
+
+
+def test_run_uses_windows_pipe_availability_before_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Windows reads occur only after PeekNamedPipe reports buffered bytes."""
+    from media_generation.inventory import probes
+
+    real_read = probes.os.read
+    reads: list[int] = []
+
+    def available(descriptor: int) -> int:
+        return 1
+
+    def read(descriptor: int, count: int) -> bytes:
+        reads.append(descriptor)
+        return real_read(descriptor, count)
+
+    monkeypatch.setattr(probes, "_IS_WINDOWS", True)
+    monkeypatch.setattr(probes, "_windows_pipe_available_bytes", available)
+    monkeypatch.setattr(probes.os, "read", read)
+
+    observation = LocalObservationSource().run(
+        [sys.executable, "-c", "print('windows-output')"],
+        timeout_seconds=5,
+        output_limit=1024,
+    )
+
+    assert observation.status == "ok"
+    assert observation.text == "windows-output\n"
+    assert reads
+
+
 def test_nonzero_exit_timeout_and_output_cap_are_distinct() -> None:
     """Process failures carry separate statuses and bounded output."""
     source = LocalObservationSource()
@@ -209,6 +385,55 @@ def test_sha256_streams_and_respects_the_limit(tmp_path: Path) -> None:
     assert skipped.status == "skipped"
     assert skipped.reason == "hash_limit_exceeded"
     assert no_digest is None
+
+
+@pytest.mark.parametrize(
+    ("case", "allowed_reasons"),
+    [
+        ("lexical", {"containment_path_changed"}),
+        ("parent", {"containment_path_changed"}),
+        (
+            "ancestor_link",
+            {"symlink_not_followed", "containment_path_changed"},
+        ),
+        ("final_link", {"symlink_not_followed"}),
+    ],
+)
+def test_sha256_with_root_rejects_outside_paths_before_metadata(
+    tmp_path: Path,
+    case: str,
+    allowed_reasons: set[str],
+) -> None:
+    """Containment failures cannot expose outside size or file bytes."""
+    root = tmp_path / "models"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.bin"
+    secret.write_bytes(b"x" * 128)
+
+    if case == "lexical":
+        path = secret
+    elif case == "parent":
+        path = root / ".." / outside.name / secret.name
+    elif case == "ancestor_link":
+        (root / "linked").symlink_to(outside, target_is_directory=True)
+        path = root / "linked" / secret.name
+    else:
+        (root / "linked.bin").symlink_to(secret)
+        path = root / "linked.bin"
+
+    observation, digest = LocalObservationSource().sha256(
+        path,
+        limit=8,
+        follow_final_symlink=True,
+        root=root,
+    )
+
+    assert observation.status == "skipped"
+    assert observation.reason in allowed_reasons
+    assert observation.reason != "hash_limit_exceeded"
+    assert digest is None
 
 
 def test_replay_requires_synthetic_declaration_and_reports_missing_keys(

@@ -15,16 +15,18 @@ import importlib.metadata
 import json
 import os
 import platform as platform_module
+import selectors
 import shutil
 import stat as stat_module
 import subprocess
 import sys
 import threading
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import BinaryIO, Protocol, Sequence
 
 from .schema import (
     Observation,
@@ -39,10 +41,80 @@ from .schema import (
 )
 
 
-DEFAULT_OUTPUT_LIMIT = 64 * 1024
+DEFAULT_OUTPUT_LIMIT = 32 * 1024
 DEFAULT_TIMEOUT_SECONDS = 5.0
 TRANSCRIPT_EXCERPT_LIMIT = 8 * 1024
 MAX_REPLAY_BYTES = 4 * 1024 * 1024
+_READER_POLL_INTERVAL_SECONDS = 0.05
+_READER_FINALIZE_SECONDS = 0.1
+_IS_WINDOWS = os.name == "nt"
+
+
+def _windows_pipe_available_bytes(descriptor: int) -> int:
+    """Return bytes buffered in an anonymous Windows pipe."""
+    import ctypes
+    import msvcrt
+
+    handle = ctypes.c_void_p(msvcrt.get_osfhandle(descriptor))
+    available = ctypes.c_ulong()
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    peek_named_pipe = kernel32.PeekNamedPipe
+    peek_named_pipe.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.c_void_p,
+    ]
+    peek_named_pipe.restype = ctypes.c_int
+    succeeded = peek_named_pipe(
+        handle,
+        None,
+        0,
+        None,
+        ctypes.byref(available),
+        None,
+    )
+    if not succeeded:
+        error = ctypes.get_last_error()
+        if error in {109, 232}:
+            return 0
+        raise OSError(error, ctypes.FormatError(error))
+    return int(available.value)
+
+
+def _wait_for_windows_pipe(descriptor: int, timeout_seconds: float) -> bool:
+    """Poll whether Windows has bytes without blocking on an open writer."""
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    while True:
+        if _windows_pipe_available_bytes(descriptor) > 0:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, _READER_POLL_INTERVAL_SECONDS))
+
+
+class _PipeWaiter:
+    """Wait for pipe readiness with a file-descriptor-safe host primitive."""
+
+    def __init__(self, descriptor: int) -> None:
+        self._descriptor = descriptor
+        self._selector: selectors.BaseSelector | None = None
+        if not _IS_WINDOWS:
+            selector = selectors.DefaultSelector()
+            selector.register(descriptor, selectors.EVENT_READ)
+            self._selector = selector
+
+    def wait(self, timeout_seconds: float) -> bool:
+        if self._selector is not None:
+            return bool(self._selector.select(timeout_seconds))
+        return _wait_for_windows_pipe(self._descriptor, timeout_seconds)
+
+    def close(self) -> None:
+        if self._selector is not None:
+            self._selector.close()
 
 
 class _ContainmentUnavailable(OSError):
@@ -319,148 +391,167 @@ class LocalObservationSource:
         root: Path | None = None,
     ) -> tuple[Observation, str | None]:
         """Stream a bounded SHA-256 digest in 1 MiB chunks."""
+        handle: BinaryIO | None = None
+        stack = ExitStack()
         try:
-            before = path.stat() if follow_final_symlink else path.lstat()
-        except OSError as error:
-            return _error_observation(error), None
-        if not follow_final_symlink and stat_module.S_ISLNK(before.st_mode):
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="symlink_not_followed",
-                ),
-                None,
-            )
-        if not stat_module.S_ISREG(before.st_mode):
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="not_regular_file",
-                    detail=f"kind {_kind(before.st_mode)}",
-                ),
-                None,
-            )
-        if before.st_size > limit:
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="hash_limit_exceeded",
-                    detail=f"file size {before.st_size} exceeds limit {limit}",
-                ),
-                None,
-            )
-        digest = hashlib.sha256()
-        total = 0
-        try:
-            with self._open_read(
-                path,
-                follow_final_symlink=follow_final_symlink,
-                root=root,
-            ) as handle:
-                opened = os.fstat(handle.fileno())
-                if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            if root is not None:
+                handle = stack.enter_context(
+                    self._open_read(
+                        path,
+                        follow_final_symlink=follow_final_symlink,
+                        root=root,
+                    )
+                )
+                before = os.fstat(handle.fileno())
+            else:
+                before = path.stat() if follow_final_symlink else path.lstat()
+                if not follow_final_symlink and stat_module.S_ISLNK(before.st_mode):
                     return (
                         Observation(
                             status=ProbeStatus.SKIPPED.value,
-                            reason="file_replaced_during_hash",
-                            detail="file identity changed before hashing",
+                            reason="symlink_not_followed",
                         ),
                         None,
                     )
-                if not stat_module.S_ISREG(opened.st_mode):
-                    return (
-                        Observation(
-                            status=ProbeStatus.SKIPPED.value,
-                            reason="not_regular_file",
-                            detail=f"kind {_kind(opened.st_mode)}",
-                        ),
-                        None,
+            if not stat_module.S_ISREG(before.st_mode):
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="not_regular_file",
+                        detail=f"kind {_kind(before.st_mode)}",
+                    ),
+                    None,
+                )
+            if before.st_size > limit:
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="hash_limit_exceeded",
+                        detail=f"file size {before.st_size} exceeds limit {limit}",
+                    ),
+                    None,
+                )
+            if handle is None:
+                handle = stack.enter_context(
+                    self._open_read(
+                        path,
+                        follow_final_symlink=follow_final_symlink,
+                        root=root,
                     )
-                if opened.st_size > limit:
+                )
+            opened = os.fstat(handle.fileno())
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="file_replaced_during_hash",
+                        detail="file identity changed before hashing",
+                    ),
+                    None,
+                )
+            if not stat_module.S_ISREG(opened.st_mode):
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="not_regular_file",
+                        detail=f"kind {_kind(opened.st_mode)}",
+                    ),
+                    None,
+                )
+            if opened.st_size > limit:
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="hash_limit_exceeded",
+                        detail=f"opened file size {opened.st_size} exceeds limit {limit}",
+                    ),
+                    None,
+                )
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
                     return (
                         Observation(
                             status=ProbeStatus.SKIPPED.value,
                             reason="hash_limit_exceeded",
-                            detail=f"opened file size {opened.st_size} exceeds limit {limit}",
+                            detail=f"file grew beyond limit {limit} during hashing",
                         ),
                         None,
                     )
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if total > limit:
-                        return (
-                            Observation(
-                                status=ProbeStatus.SKIPPED.value,
-                                reason="hash_limit_exceeded",
-                                detail=f"file grew beyond limit {limit} during hashing",
-                            ),
-                            None,
-                        )
-                    digest.update(chunk)
-                after = os.fstat(handle.fileno())
+                digest.update(chunk)
+            after = os.fstat(handle.fileno())
+            if root is not None:
+                with self._open_read(
+                    path,
+                    follow_final_symlink=follow_final_symlink,
+                    root=root,
+                ) as final_handle:
+                    final = os.fstat(final_handle.fileno())
+            else:
+                final = path.stat() if follow_final_symlink else path.lstat()
+            if (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino):
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="file_replaced_during_hash",
+                        detail="file identity changed during hashing",
+                    ),
+                    None,
+                )
+            if after.st_size > limit:
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="hash_limit_exceeded",
+                        detail=f"file grew beyond limit {limit} during hashing",
+                    ),
+                    None,
+                )
+            if after.st_size != total:
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="file_changed_during_hash",
+                        detail=f"read {total} bytes but file reports {after.st_size}",
+                    ),
+                    None,
+                )
+            if (
+                after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or after.st_ctime_ns != opened.st_ctime_ns
+            ):
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="file_changed_during_hash",
+                        detail="file metadata changed while hashing",
+                    ),
+                    None,
+                )
+            if (
+                final.st_size != after.st_size
+                or final.st_mtime_ns != after.st_mtime_ns
+                or final.st_ctime_ns != after.st_ctime_ns
+            ):
+                return (
+                    Observation(
+                        status=ProbeStatus.SKIPPED.value,
+                        reason="file_changed_during_hash",
+                        detail="file metadata changed after hashing",
+                    ),
+                    None,
+                )
+            return Observation(status=ProbeStatus.OK.value), "sha256:" + digest.hexdigest()
         except OSError as error:
             return _error_observation(error), None
-        try:
-            final = path.stat() if follow_final_symlink else path.lstat()
-        except OSError as error:
-            return _error_observation(error), None
-        if (final.st_dev, final.st_ino) != (opened.st_dev, opened.st_ino):
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="file_replaced_during_hash",
-                    detail="file identity changed during hashing",
-                ),
-                None,
-            )
-        if after.st_size > limit:
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="hash_limit_exceeded",
-                    detail=f"file grew beyond limit {limit} during hashing",
-                ),
-                None,
-            )
-        if after.st_size != total:
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="file_changed_during_hash",
-                    detail=f"read {total} bytes but file reports {after.st_size}",
-                ),
-                None,
-            )
-        if (
-            after.st_size != opened.st_size
-            or after.st_mtime_ns != opened.st_mtime_ns
-            or after.st_ctime_ns != opened.st_ctime_ns
-        ):
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="file_changed_during_hash",
-                    detail="file metadata changed while hashing",
-                ),
-                None,
-            )
-        if (
-            final.st_size != after.st_size
-            or final.st_mtime_ns != after.st_mtime_ns
-            or final.st_ctime_ns != after.st_ctime_ns
-        ):
-            return (
-                Observation(
-                    status=ProbeStatus.SKIPPED.value,
-                    reason="file_changed_during_hash",
-                    detail="file metadata changed after hashing",
-                ),
-                None,
-            )
-        return Observation(status=ProbeStatus.OK.value), "sha256:" + digest.hexdigest()
+        finally:
+            stack.close()
 
     def stat(self, path: Path) -> Observation:
         """Return lstat facts without following symlinks or reading content."""
@@ -579,6 +670,11 @@ class LocalObservationSource:
         """Run one fixed argv vector without a shell, environment hooks, or retries."""
         if not argv:
             return Observation(status=ProbeStatus.ERROR.value, reason="empty_command")
+        if output_limit < 0:
+            return Observation(
+                status=ProbeStatus.ERROR.value,
+                reason="invalid_output_limit",
+            )
         environment = {
             "PATH": os.environ.get("PATH", ""),
             "LANG": "C",
@@ -601,27 +697,68 @@ class LocalObservationSource:
 
         stdout = bytearray()
         stderr = bytearray()
+        remaining_output = [output_limit]
+        output_lock = threading.Lock()
         truncated = [False]
+        reader_stop = threading.Event()
+        reader_errors: list[BaseException] = []
 
         def drain(stream: object, buffer: bytearray) -> None:
-            """Read one pipe up to the shared cap, then stop the process."""
+            """Drain one pipe without waiting for inherited handles to close.
+
+            A short nonblocking final drain lets the caller join both readers
+            before constructing the observation, even when a descendant still
+            holds the child's stdout or stderr pipe open.
+            """
+            finalizing = False
+            final_deadline = 0.0
+            waiter: _PipeWaiter | None = None
             try:
+                descriptor = stream.fileno()  # type: ignore[attr-defined]
+                waiter = _PipeWaiter(descriptor)
                 while True:
-                    chunk = stream.read(8192)  # type: ignore[attr-defined]
+                    now = time.monotonic()
+                    if reader_stop.is_set():
+                        if not finalizing:
+                            finalizing = True
+                            final_deadline = now + _READER_FINALIZE_SECONDS
+                        if now >= final_deadline:
+                            return
+                        poll_timeout = 0.0
+                    else:
+                        poll_timeout = _READER_POLL_INTERVAL_SECONDS
+                    if not waiter.wait(poll_timeout):
+                        if finalizing:
+                            return
+                        continue
+                    chunk = os.read(descriptor, 8192)
                     if not chunk:
                         return
-                    if len(buffer) >= output_limit:
-                        truncated[0] = True
-                        process.kill()
+                    with output_lock:
+                        room = max(0, min(len(chunk), remaining_output[0]))
+                        buffer.extend(chunk[:room])
+                        remaining_output[0] -= room
+                        over_limit = len(chunk) > room
+                        if over_limit:
+                            truncated[0] = True
+                    if over_limit:
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
                         return
-                    room = output_limit - len(buffer)
-                    buffer.extend(chunk[:room])
-                    if len(chunk) > room:
-                        truncated[0] = True
-                        process.kill()
-                        return
-            except (OSError, ValueError):
+            except (OSError, ValueError) as error:
+                with output_lock:
+                    if not reader_errors:
+                        reader_errors.append(error)
+                try:
+                    process.kill()
+                except OSError:
+                    pass
                 return
+            finally:
+                if waiter is not None:
+                    waiter.close()
 
         assert process.stdout is not None
         assert process.stderr is not None
@@ -638,8 +775,11 @@ class LocalObservationSource:
             timeout_status = True
             process.kill()
             process.wait()
+        reader_stop.set()
         for reader in readers:
-            reader.join(timeout=1.0)
+            reader.join()
+        process.stdout.close()
+        process.stderr.close()
         exit_code = process.returncode
         duration_ms = int((time.monotonic() - started) * 1000)
         if timeout_status:
@@ -652,6 +792,16 @@ class LocalObservationSource:
             )
         text = bytes(stdout).decode("utf-8", errors="replace")
         error_text = bytes(stderr).decode("utf-8", errors="replace")
+        if reader_errors and not timeout_status:
+            error = reader_errors[0]
+            return Observation(
+                status=ProbeStatus.ERROR.value,
+                text=text,
+                reason="output_capture_failed",
+                detail=f"{type(error).__name__}: {error}"[:500],
+                exit_code=exit_code,
+                truncated=truncated[0],
+            )
         if exit_code != 0:
             return Observation(
                 status=ProbeStatus.ERROR.value,

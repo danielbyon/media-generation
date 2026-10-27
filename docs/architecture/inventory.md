@@ -297,9 +297,19 @@ version probe is disabled.
 Passive discovery does not execute a runtime. A manifest entry with
 `"probe_version": true` opts in to one fixed version or help command from the
 catalog. The command has a timeout from `probe_policy.timeout_seconds` (1 to 30
-seconds) and a 32 KiB output cap. The stdout excerpt is retained in the bounded
-transcript; the JSON report records the command, status, exit code, output size,
-truncation flag, reason, and parsed version when available.
+seconds) and a 32 KiB output cap shared by stdout and stderr. The stdout excerpt
+is retained in the bounded transcript; the JSON report records the command,
+status, exit code, output size, truncation flag, reason, and parsed version when
+available.
+
+A negative output cap is rejected before process creation with
+`invalid_output_limit`. A zero cap is valid and retains no command output.
+
+Pipe readers use selector-backed readiness on POSIX and `PeekNamedPipe`
+availability checks on Windows. Reader setup or wait failures are reported as
+`output_capture_failed`. Windows behavior is covered with mocked unit tests;
+repository CI runs Linux and macOS only, so it is not continuously validated on
+Windows.
 
 Device-inventory commands are also opt-in. With
 `probe_policy.device_queries: false`, the collector records a single skipped
@@ -388,6 +398,11 @@ are hashed; FIFOs, sockets, devices, and directories are rejected with
 limit remains present with an explicit `skipped` digest state. A bundle
 identity becomes `complete` only when its recipe and all component digests
 were actually computed.
+
+Root-provided hashes open beneath the declared root before reading size or
+identity metadata. The final identity recheck also uses a contained descriptor,
+so lexical escapes, `..` components, and links below the root cannot expose an
+outside file's metadata or contents.
 
 ## 10. Environment fingerprint
 

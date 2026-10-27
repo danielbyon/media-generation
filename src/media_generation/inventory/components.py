@@ -266,7 +266,7 @@ def inspect_safetensors(data: bytes, *, file_truncated: bool) -> dict[str, objec
         }
     try:
         header = json.loads(data[8 : 8 + header_length].decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         return {"status": "malformed", "format": "safetensors", "reason": "invalid_header_json"}
     if not isinstance(header, dict):
         return {"status": "malformed", "format": "safetensors", "reason": "header_not_object"}
@@ -426,7 +426,7 @@ def _read_sidecar(
         return {"path": str(path), "status": "truncated", "reason": "sidecar_limit_reached"}
     try:
         payload = json.loads(observation.text)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, RecursionError, ValueError):
         return {"path": str(path), "status": "malformed", "reason": "invalid_json"}
     if not isinstance(payload, dict):
         return {"path": str(path), "status": "malformed", "reason": "not_an_object"}

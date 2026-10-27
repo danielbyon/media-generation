@@ -70,6 +70,35 @@ def test_safetensors_rejects_short_or_oversized_headers() -> None:
     assert inspect_safetensors(invalid, file_truncated=False)["reason"] == "invalid_header_json"
 
 
+def test_safetensors_treats_deep_json_as_invalid_header_json() -> None:
+    """Recursive metadata becomes a malformed header instead of an exception."""
+    nested = "[" * 100_000 + "0" + "]" * 100_000
+    header = ('{"unused":' + nested + "}").encode("utf-8")
+    data = len(header).to_bytes(8, "little") + header
+
+    result = inspect_safetensors(data, file_truncated=False)
+
+    assert result == {
+        "status": "malformed",
+        "format": "safetensors",
+        "reason": "invalid_header_json",
+    }
+
+
+def test_safetensors_treats_integer_limit_json_as_invalid_header_json() -> None:
+    """Integer conversion failures become malformed Safetensors metadata."""
+    header = ('{"unused":' + "9" * 5_000 + "}").encode("utf-8")
+    data = len(header).to_bytes(8, "little") + header
+
+    result = inspect_safetensors(data, file_truncated=False)
+
+    assert result == {
+        "status": "malformed",
+        "format": "safetensors",
+        "reason": "invalid_header_json",
+    }
+
+
 def test_safetensors_truncated_prefix_is_distinguished_from_malformed() -> None:
     """A file larger than the inspected prefix is truncated, not necessarily corrupt."""
     data = (1000).to_bytes(8, "little") + b"{}"
@@ -774,4 +803,59 @@ def test_malformed_sidecar_stat_is_explicitly_degraded() -> None:
         "path": str(path),
         "status": "malformed",
         "reason": "sidecar_stat_malformed",
+    }
+
+
+def test_sidecar_treats_deep_json_as_invalid_json(tmp_path: Path) -> None:
+    """Recursive sidecar metadata becomes malformed instead of an exception."""
+    path = tmp_path / "model_index.json"
+    nested = "[" * 100_000 + "0" + "]" * 100_000
+    path.write_text(nested, encoding="utf-8")
+    source = ReplayObservationSource(
+        {
+            f"stat:{path}": Observation(
+                status="ok", text=json.dumps(stat_payload(size_bytes=len(nested)))
+            ),
+            f"read:{path}": Observation(status="ok", text=nested),
+        }
+    )
+
+    record = _read_sidecar(
+        ProbeLedger(source),
+        component_id="bundle/model",
+        path=path,
+        roots=(ModelRoot(id="models", path=tmp_path),),
+    )
+
+    assert record == {
+        "path": str(path),
+        "status": "malformed",
+        "reason": "invalid_json",
+    }
+
+
+def test_sidecar_treats_integer_limit_json_as_invalid_json(tmp_path: Path) -> None:
+    """Integer conversion failures become malformed sidecar metadata."""
+    path = tmp_path / "model_index.json"
+    payload = '{"unused":' + "9" * 5_000 + "}"
+    source = ReplayObservationSource(
+        {
+            f"stat:{path}": Observation(
+                status="ok", text=json.dumps(stat_payload(size_bytes=len(payload)))
+            ),
+            f"read:{path}": Observation(status="ok", text=payload),
+        }
+    )
+
+    record = _read_sidecar(
+        ProbeLedger(source),
+        component_id="bundle/model",
+        path=path,
+        roots=(ModelRoot(id="models", path=tmp_path),),
+    )
+
+    assert record == {
+        "path": str(path),
+        "status": "malformed",
+        "reason": "invalid_json",
     }
