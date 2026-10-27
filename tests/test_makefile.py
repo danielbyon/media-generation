@@ -152,7 +152,7 @@ def test_ci_matrix_runs_each_make_gate_and_preserves_entrypoint_smoke() -> None:
         ("macos-latest", "3.14.4"),
         ("macos-latest", "3.14"),
     ):
-        assert f'- os: {os}\\n            python-version: "{version}"' in workflow
+        assert f'- os: {os}\n            python-version: "{version}"' in workflow
     for command in ["make install", "make test", "make smoke", "make check", "make clean-dry-run"]:
         assert f"run: {command}" in workflow
     assert "media-generation --help" in workflow
