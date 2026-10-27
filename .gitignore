@@ -1,4 +1,5 @@
 AGENTS.local.md
+.DS_Store
 .chatgpt
 __pycache__/
 *.py[cod]

@@ -3,21 +3,32 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from threading import Barrier
+from typing import BinaryIO
+from threading import Barrier, Event
 
 import pytest
 
-from media_generation.adapters import AdapterCapabilities, DeterministicCpuAdapter
+from media_generation.adapters import (
+    PROCESS_CONTAINED_CONTRACT,
+    AdapterCapabilities,
+    DeterministicCpuAdapter,
+)
 from media_generation.domain import (
     GenerationArtifact,
     GenerationJob,
     GenerationPlan,
     GenerationRequest,
 )
-from media_generation.errors import IdempotencyConflictError, UnsupportedCapabilityError
+from media_generation.errors import (
+    GenerationError,
+    IdempotencyConflictError,
+    PrivacyComplianceError,
+    UnsupportedCapabilityError,
+)
 from media_generation.service import GenerationExecutionError, GenerationService
 
 
@@ -42,6 +53,235 @@ class _VariantCpuAdapter(DeterministicCpuAdapter):
     def configuration(self) -> dict[str, object]:
         """Return the configuration variant used by this test adapter."""
         return dict(self._configuration)
+
+
+@pytest.mark.parametrize(
+    "unsupported_value",
+    ({"set-member"}, float("nan"), object()),
+    ids=("set", "nan", "custom-object"),
+)
+def test_non_json_adapter_configuration_fails_before_admission_without_leaking_values(
+    tmp_path: Path,
+    unsupported_value: object,
+) -> None:
+    """Non-JSON settings fail with redacted privacy evidence and persist no job."""
+    configuration = {"configuration_version": 1}
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    service = GenerationService(
+        database_path,
+        tmp_path / "artifacts",
+        adapter=adapter,
+    )
+    sensitive_value = "private-configuration-value"
+    configuration.update(
+        {
+            "api_key": sensitive_value,
+            "unsupported": unsupported_value,
+        }
+    )
+
+    with pytest.raises(
+        PrivacyComplianceError,
+        match=(
+            r"^adapter privacy configuration is unverified; "
+            r"configuration-only compliance did not admit this execution$"
+        ),
+    ) as raised:
+        service.enqueue(
+            "non-json-adapter-configuration",
+            GenerationRequest("A non-JSON configuration", seed=19),
+        )
+
+    evidence = raised.value.result.to_dict()
+    assert evidence["reasons"] == [
+        {
+            "code": "configuration_not_json",
+            "detail": "Configuration is not valid JSON.",
+        }
+    ]
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert "RecursionError" not in str(raised.value)
+    with sqlite3.connect(database_path) as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "generation_attempts",
+            "execution_jobs",
+            "execution_attempts",
+        ):
+            assert connection.execute(
+                f"SELECT count(*) FROM {table}"
+            ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("cycle_kind", ("mapping", "list"))
+def test_cyclic_adapter_configuration_fails_before_admission_without_recursion(
+    tmp_path: Path,
+    cycle_kind: str,
+) -> None:
+    """Cyclic settings fail with redacted evidence before persistence."""
+    configuration: dict[str, object] = {"configuration_version": 1}
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    service = GenerationService(
+        database_path,
+        tmp_path / "artifacts",
+        adapter=adapter,
+    )
+
+    sensitive_value = "private-cyclic-configuration-value"
+    configuration["api_key"] = sensitive_value
+    if cycle_kind == "mapping":
+        configuration["cycle"] = configuration
+    else:
+        recursive_list: list[object] = []
+        recursive_list.append(recursive_list)
+        configuration["cycle"] = recursive_list
+
+    with pytest.raises(
+        PrivacyComplianceError,
+        match=(
+            r"^adapter privacy configuration is unverified; "
+            r"configuration-only compliance did not admit this execution$"
+        ),
+    ) as raised:
+        service.enqueue(
+            "cyclic-adapter-configuration",
+            GenerationRequest("A cyclic configuration", seed=19),
+        )
+
+    evidence = raised.value.result.to_dict()
+    assert evidence["reasons"] == [
+        {
+            "code": "configuration_not_json",
+            "detail": "Configuration is not valid JSON.",
+        }
+    ]
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert "RecursionError" not in str(raised.value)
+
+    with sqlite3.connect(database_path) as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "generation_attempts",
+            "execution_jobs",
+            "execution_attempts",
+        ):
+            assert connection.execute(
+                f"SELECT count(*) FROM {table}"
+            ).fetchone() == (0,)
+
+
+def test_nested_adapter_configuration_with_credential_fails_before_admission_without_leak(
+    tmp_path: Path,
+) -> None:
+    """Nested credential settings fail redacted without persisting admission."""
+    sensitive_value = "private-deep-configuration-value"
+    nested: dict[str, object] = {"api_key": sensitive_value}
+    for _ in range(64):
+        nested = {"nested": nested}
+
+    configuration: dict[str, object] = {
+        "configuration_version": 1,
+        "nested": nested,
+    }
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    with pytest.raises(
+        PrivacyComplianceError,
+        match=(
+            r"^adapter privacy configuration is fail; "
+            r"configuration-only compliance did not admit this execution$"
+        ),
+    ) as raised:
+        GenerationService(
+            database_path,
+            tmp_path / "artifacts",
+            adapter=adapter,
+        )
+
+    evidence = raised.value.result.to_dict()
+    assert evidence["status"] == "fail"
+    assert evidence["reasons"] == [
+        {
+            "code": "credential_material_present",
+            "detail": "Credentials must remain outside runtime inference settings.",
+        },
+        {
+            "code": "unqualified_configuration",
+            "detail": "This profile cannot establish real inference-tool privacy.",
+        },
+    ]
+    assert raised.value.__cause__ is None
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert not database_path.exists()
+
+
+def test_raw_configuration_serialization_recursion_fails_before_admission_without_leak(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Simulated raw settings recursion fails redacted before admission."""
+    sensitive_value = "private-serialization-recursion-value"
+    serialization_probe = object()
+    configuration: dict[str, object] = {
+        "configuration_version": 1,
+        "serialization_probe": serialization_probe,
+        "credential": {"api_key": sensitive_value},
+    }
+    adapter = _VariantCpuAdapter(configuration=configuration)
+    database_path = tmp_path / "studio.sqlite3"
+    original_dumps = json.dumps
+    rejected_raw_configuration = False
+
+    def reject_raw_configuration(value, *args, **kwargs):
+        nonlocal rejected_raw_configuration
+        if (
+            isinstance(value, dict)
+            and value.get("serialization_probe") is serialization_probe
+        ):
+            rejected_raw_configuration = True
+            raise RecursionError("simulated raw configuration serialization depth")
+        return original_dumps(value, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            json,
+            "dumps",
+            reject_raw_configuration,
+        )
+        with pytest.raises(
+            PrivacyComplianceError,
+            match=(
+                r"^adapter privacy configuration is unverified; "
+                r"configuration-only compliance did not admit this execution$"
+            ),
+        ) as raised:
+            GenerationService(
+                database_path,
+                tmp_path / "artifacts",
+                adapter=adapter,
+            )
+
+    assert rejected_raw_configuration
+    evidence = raised.value.result.to_dict()
+    assert evidence["status"] == "unverified"
+    assert evidence["reasons"] == [
+        {
+            "code": "configuration_not_json",
+            "detail": "Configuration is not valid JSON.",
+        }
+    ]
+    assert raised.value.__cause__ is None
+    assert sensitive_value not in str(raised.value)
+    assert sensitive_value not in json.dumps(evidence, sort_keys=True)
+    assert "RecursionError" not in str(raised.value)
+    assert not database_path.exists()
 
 
 def test_generation_request_intent_cannot_be_mutated() -> None:
@@ -136,37 +376,84 @@ def test_provenance_with_nested_adapter_configuration_is_json_serializable(
     assert json.loads(encoded)["adapter_configuration"] == configuration
 
 
+def test_retired_pending_admission_cannot_create_sidecarless_jobs(tmp_path: Path) -> None:
+    """Unsupported legacy admission must fail before changing the database."""
+    service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+    request = GenerationRequest("retired pending", seed=9)
+    with pytest.raises(RuntimeError, match="queued admission"):
+        service._store.create_pending_execution(
+            request=request, request_digest=request.digest(), idempotency_key="retired",
+            request_id="req_" + "a" * 32, job_id="job_" + "a" * 32,
+            attempt_id="att_" + "a" * 32, output_slot_id="slot_" + "a" * 32,
+            resolved_seed=9, adapter_id="retired", adapter_configuration_json="{}",
+            effective_parameters_json='{"width":64,"height":64}',
+            resolved_output_directory=str(tmp_path / "artifacts"),
+            timestamp="2026-10-25T00:00:00+00:00",
+        )
+    with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+        assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone() == (0,)
+        assert connection.execute("SELECT count(*) FROM generation_requests").fetchone() == (0,)
+    GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+
+
+def test_direct_claim_without_privacy_evidence_rejects_protected_execution(
+    tmp_path: Path,
+) -> None:
+    """Omitted evidence cannot claim a job with durable privacy evidence."""
+    service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
+    queued = service.enqueue(
+        "legacy-direct-claim", GenerationRequest("Legacy direct claim", seed=9)
+    )
+
+    with pytest.raises(
+        GenerationError,
+        match="protected execution claim requires exact privacy-compliance evidence",
+    ):
+        service._store.claim_next_execution(
+            attempt_id="att_fedcba9876543210fedcba9876543210",
+            owner_id="worker_legacy",
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=json.dumps(
+                service.adapter.configuration, sort_keys=True, separators=(",", ":")
+            ),
+            resolved_output_directory=str(tmp_path / "artifacts"),
+            process_contained=True,
+            containment_contract=PROCESS_CONTAINED_CONTRACT,
+            timestamp="2026-10-26T00:00:00+00:00",
+            lease_expires_at="2026-10-26T00:01:00+00:00",
+            job_id=queued.job_id,
+        )
+
+    assert service.get_provenance(queued.job_id)["status"] == "queued"
+
+
 def test_artifact_attempt_must_belong_to_the_job_being_completed(
     tmp_path: Path,
 ) -> None:
     """A cross-job attempt cannot publish an artifact or transition either job."""
     service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
 
-    def pending(key: str, suffix: str):
-        request = GenerationRequest(prompt=f"Request {key}", seed=9)
-        return service._store.create_pending_execution(
-            request=request,
-            request_digest=request.digest(),
-            idempotency_key=key,
-            request_id=f"req_{suffix}",
-            job_id=f"job_{suffix}",
-            attempt_id=f"att_{suffix}",
-            output_slot_id=f"slot_{suffix}",
-            resolved_seed=9,
-            adapter_id="test-adapter",
-            adapter_configuration_json="{}",
-            effective_parameters_json='{"width":64,"height":64}',
-            resolved_output_directory=str(tmp_path / "artifacts"),
-            timestamp="2026-10-21T00:00:00+00:00",
-        )
-
-    first = pending("first", "0123456789abcdef0123456789abcdef")
-    second = pending("second", "abcdef0123456789abcdef0123456789")
+    first = service.enqueue("first", GenerationRequest("Request first", seed=9))
+    second = service.enqueue("second", GenerationRequest("Request second", seed=9))
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+    first_claim = service._store.claim_next_execution(
+        attempt_id="att_0123456789abcdef0123456789abcdef",
+        owner_id="worker_first", adapter_id=service.adapter.adapter_id,
+        adapter_configuration_json=adapter_configuration_json,
+        privacy_compliance_json=privacy_compliance_json,
+        resolved_output_directory=str(tmp_path / "artifacts"),
+        process_contained=True, containment_contract=PROCESS_CONTAINED_CONTRACT,
+        timestamp="2026-10-21T00:00:00+00:00",
+        lease_expires_at="2026-10-21T00:01:00+00:00", job_id=first.job_id,
+    )
+    assert first_claim is not None
     artifact = GenerationArtifact(
         artifact_id="art_0123456789abcdef0123456789abcdef",
-        job_id=first.job_id,
-        attempt_id=second.attempt_id,
-        output_slot_id=first.output_slot_id,
+        job_id=second.job_id,
+        attempt_id=first_claim.attempt_id,
+        output_slot_id=second.output_slot_id,
         path=str(tmp_path / "artifacts" / "cross-job.png"),
         media_type="image/png",
         image_format="PNG",
@@ -180,11 +467,11 @@ def test_artifact_attempt_must_belong_to_the_job_being_completed(
     with pytest.raises(RuntimeError, match="attempt.*job"):
         service._store.complete_execution(artifact, "2026-10-21T00:00:01+00:00")
 
+    assert service.get_provenance(first.job_id)["attempt"]["status"] == "running"
+    assert service.get_provenance(second.job_id)["status"] == "queued"
+    assert service.get_provenance(second.job_id)["attempt"] is None
     for job_id in (first.job_id, second.job_id):
-        assert service.get_job(job_id).status == "running"
-        provenance = service.get_provenance(job_id)
-        assert provenance["attempt"]["status"] == "running"
-        assert provenance["artifact"] is None
+        assert service.get_provenance(job_id)["artifact"] is None
 
 
 def test_idempotent_reuse_checks_current_adapter_capabilities(tmp_path: Path) -> None:
@@ -338,6 +625,72 @@ def test_concurrent_same_key_submissions_check_persisted_adapter_configuration(
     else:
         assert submissions[0].job_id == submissions[1].job_id  # type: ignore[union-attr]
         assert submissions[0].request_id == submissions[1].request_id  # type: ignore[union-attr]
+        snapshot = GenerationService(database, output_directory).get_provenance(
+            submissions[0].job_id  # type: ignore[union-attr]
+        )
+        assert len(snapshot["attempts"]) == 1
+        assert snapshot["artifact"] is not None
+
+
+def test_matching_submit_while_adapter_is_paused_returns_existing_running_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same-key reuse reports the active job without claiming a second attempt."""
+    database = tmp_path / "studio.sqlite3"
+    output_directory = tmp_path / "artifacts"
+    request = GenerationRequest(
+        prompt="A paused glass greenhouse",
+        seed=19,
+        width=48,
+        height=48,
+    )
+    entered = Event()
+    release = Event()
+
+    class PausedAdapter(DeterministicCpuAdapter):
+        def generate(self, plan: GenerationPlan, destination: BinaryIO):
+            entered.set()
+            if not release.wait(timeout=10):
+                raise RuntimeError("paused adapter was not released")
+            return super().generate(plan, destination)
+
+    first_service = GenerationService(database, output_directory, adapter=PausedAdapter())
+    matching_service = GenerationService(database, output_directory, adapter=PausedAdapter())
+    monkeypatch.setattr(first_service._store, "renew_attempt", lambda *args, **kwargs: False)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(first_service.submit, "paused-reuse", request)
+        assert entered.wait(timeout=10)
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE execution_attempts "
+                "SET lease_expires_at = '1970-01-01T00:00:00+00:00' "
+                "WHERE status = 'running'"
+            )
+        try:
+            matching = executor.submit(
+                matching_service.submit,
+                "paused-reuse",
+                request,
+            )
+            reused = matching.result(timeout=2)
+            snapshot = matching_service.get_provenance(reused.job_id)
+
+            assert reused.status == "running"
+            assert reused.artifact_id is None
+            assert snapshot["status"] == "running"
+            assert len(snapshot["attempts"]) == 1
+            assert snapshot["execution"]["resource_state"] == "claimed"
+        finally:
+            release.set()
+        completed = first.result(timeout=10)
+
+    final = matching_service.get_provenance(completed.job_id)
+    assert completed.status == "succeeded"
+    assert completed.job_id == reused.job_id
+    assert len(final["attempts"]) == 1
+    assert final["artifact"] is not None
 
 
 def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> None:
@@ -378,6 +731,8 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
 
 
 class _FailAfterWritingAdapter:
+
+    containment_contract = PROCESS_CONTAINED_CONTRACT
     """Leave a partial file to verify service cleanup and durable failure state."""
 
     adapter_id = "test-failure-adapter"
@@ -396,7 +751,7 @@ class _FailAfterWritingAdapter:
         self.persisted_attempt = None
         self.persisted_output_directory: str | None = None
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> object:
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
         assert self.service is not None
         self.persisted_job = self.service.get_job(plan.job_id)
         self.persisted_output_directory = self.service._store.get_resolved_output_directory(
@@ -404,7 +759,7 @@ class _FailAfterWritingAdapter:
         )
         self.persisted_request = self.service.get_request(self.persisted_job.request_id)
         self.persisted_attempt = self.service.get_provenance(plan.job_id)["attempt"]
-        destination.write_bytes(b"partial image that must not become an artifact")
+        destination.write(b"partial image that must not become an artifact")
         raise RuntimeError("controlled adapter failure")
 
 
@@ -414,9 +769,69 @@ class _TrackingCpuAdapter(DeterministicCpuAdapter):
     def __init__(self) -> None:
         self.calls = 0
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> object:
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
         self.calls += 1
         return super().generate(plan, destination)
+
+
+class _FalseyTrackingCpuAdapter(_TrackingCpuAdapter):
+    """Expose false truthiness while retaining valid CPU adapter behavior."""
+
+    adapter_id = "falsey-tracking-cpu-v1"
+
+    @property
+    def configuration(self) -> dict[str, object]:
+        """Return configuration that distinguishes this adapter from the default."""
+        return {"configuration_version": 1, "profile": "falsey-tracking"}
+
+    def __bool__(self) -> bool:
+        return False
+
+
+def test_falsey_adapter_is_selected_and_used(tmp_path: Path) -> None:
+    """Adapter selection distinguishes a supplied falsey adapter from omission."""
+    adapter = _FalseyTrackingCpuAdapter()
+    service = GenerationService(
+        database_path=tmp_path / "studio.sqlite3",
+        output_directory=tmp_path / "artifacts",
+        adapter=adapter,
+    )
+
+    assert service.adapter is adapter
+    assert service.adapter.adapter_id == "falsey-tracking-cpu-v1"
+    assert service.adapter.configuration == {
+        "configuration_version": 1,
+        "profile": "falsey-tracking",
+    }
+
+    submission = service.submit(
+        idempotency_key="falsey-adapter",
+        request=GenerationRequest(
+            prompt="A falsey tracking adapter",
+            seed=19,
+            width=48,
+            height=48,
+            output_slot="cover",
+        ),
+    )
+    job = service.get_job(submission.job_id)
+
+    assert adapter.calls == 1
+    assert job.adapter_id == "falsey-tracking-cpu-v1"
+    assert job.adapter_configuration == {
+        "configuration_version": 1,
+        "profile": "falsey-tracking",
+    }
+
+
+def test_omitted_adapter_uses_deterministic_cpu_default(tmp_path: Path) -> None:
+    """Omitting the adapter selects the deterministic CPU implementation."""
+    service = GenerationService(
+        database_path=tmp_path / "studio.sqlite3",
+        output_directory=tmp_path / "artifacts",
+    )
+
+    assert type(service.adapter) is DeterministicCpuAdapter
 
 
 def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
@@ -464,7 +879,11 @@ def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
     assert job.status == "failed"
     assert provenance["attempt"]["status"] == "failed"
     assert provenance["artifact"] is None
-    assert list((tmp_path / "artifacts").iterdir()) == []
+    # The permanent storage mutex survives cleanup so another process cannot
+    # lock a different inode while reconciliation is active.
+    assert {path.name for path in (tmp_path / "artifacts").iterdir()} == {
+        ".artifact-publication.lock", ".artifact-cleanup"
+    }
 
 
 def test_output_directory_file_does_not_mask_durable_execution_failure(

@@ -7,10 +7,12 @@ import json
 import struct
 import zlib
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from .domain import GenerationPlan
+
+
+PROCESS_CONTAINED_CONTRACT = "process-contained/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,10 +43,20 @@ class GenerationAdapter(Protocol):
 
     @property
     def configuration(self) -> dict[str, object]:
-        """Return the stable, JSON-compatible configuration to persist per job."""
+        """Return stable JSON settings persisted with each job.
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> ImageMetadata:
-        """Write one image file for a previously persisted plan."""
+        A real adapter includes its exact effective privacy settings here so an
+        application-owned profile can verify them before admission. Credentials,
+        model acquisition configuration, and the adapter's own compliance claims
+        do not belong in this mapping.
+        """
+
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> ImageMetadata:
+        """Write to the publisher's open staging stream without closing it.
+
+        Adapters must not reopen or replace its pathname. The publisher owns
+        validation, flush/sync ordering, and final filesystem publication.
+        """
 
 
 class DeterministicCpuAdapter:
@@ -56,6 +68,10 @@ class DeterministicCpuAdapter:
     """
 
     adapter_id = "deterministic-cpu-png-v1"
+    containment_contract = PROCESS_CONTAINED_CONTRACT
+    # Retained for source compatibility. Worker admission trusts only the
+    # directly declared versioned contract above.
+    process_contained = True
     capabilities = AdapterCapabilities(
         max_width=256,
         max_height=256,
@@ -68,7 +84,7 @@ class DeterministicCpuAdapter:
         """Describe the implementation version retained in job provenance."""
         return {"configuration_version": 1, "image_format": "PNG", "pattern_version": 1}
 
-    def generate(self, plan: GenerationPlan, destination: Path) -> ImageMetadata:
+    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> ImageMetadata:
         """Write a valid RGB PNG whose bytes are stable for equivalent plan input."""
         material = json.dumps(
             {
@@ -107,9 +123,27 @@ class DeterministicCpuAdapter:
         png.extend(_png_chunk(b"tEXt", f"GenerationSeed\x00{plan.seed}".encode("ascii")))
         png.extend(_png_chunk(b"IDAT", zlib.compress(bytes(scanlines), level=9)))
         png.extend(_png_chunk(b"IEND", b""))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(png)
+        destination.seek(0)
+        destination.write(png)
+        destination.truncate()
+        destination.flush()
         return ImageMetadata("image/png", "PNG", plan.width, plan.height)
+
+
+def trusted_containment_contract(adapter: GenerationAdapter) -> str | None:
+    """Return a directly declared containment contract, if one is trusted.
+
+    Inheritance is deliberately excluded. A subclass that reuses the
+    deterministic adapter's identity, configuration, or ``process_contained``
+    boolean does not become process contained unless its concrete class or an
+    instance explicitly declares the versioned contract.
+    """
+    instance_values = getattr(adapter, "__dict__", {})
+    if "containment_contract" in instance_values:
+        declared = instance_values["containment_contract"]
+    else:
+        declared = type(adapter).__dict__.get("containment_contract")
+    return PROCESS_CONTAINED_CONTRACT if declared == PROCESS_CONTAINED_CONTRACT else None
 
 
 def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
