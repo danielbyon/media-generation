@@ -8,6 +8,30 @@ service.
 
 ## Setup
 
+### Development commands
+
+The root `Makefile` is the canonical development interface. Run `make help` to
+see the complete target list. The first and default target only prints help, so
+an accidental `make` cannot install packages or remove files.
+
+1. `make setup` creates or refreshes the local `.venv` with `PYTHON`.
+2. `make install` installs the package and test dependencies into the selected
+   interpreter. Activate `.venv` first, or pass an explicit interpreter such as
+   `make install PYTHON=.venv/bin/python`.
+3. `make test` runs the full pytest suite under the shared worktree lock.
+4. `make smoke` runs the `media-generation --help` entry point installed beside
+   the selected `PYTHON`; set `CLI` only to override that location explicitly.
+5. `make check` runs the test and smoke gates together.
+6. `make clean-dry-run` validates and prints the exact cleanup plan without
+   changing any file.
+7. `make clean` runs that same cleanup engine and removes only the verified
+   regenerable outputs described below.
+8. `make clean-deep` is a separate, interactive action. It requires an explicit
+   confirmation before removing a validated local `.venv`.
+
+See [development cleanup](docs/architecture/development-cleanup.md) for the
+ownership checks, protected paths, lock limitations, and report fields.
+
 Use Python 3.11 or later. Create an isolated environment and install the package
 with its test dependency:
 
@@ -281,10 +305,16 @@ confinement, and hardware reliability are unverified.
 
 ## Validation and generated outputs
 
-Run the full test suite with `python3 -m pytest`. The tests generate real PNG
+Run the full test suite with `make test`. The tests generate real PNG
 images, SQLite job/artifact records, and provenance snapshots in temporary
 directories, and exercise retrieval through independent installed CLI processes.
 Temporary test outputs are not committed to the repository.
+
+Before reclaiming local build and test output, run `make clean-dry-run`. Its
+human report contains the same candidate decisions and byte estimates as
+`make clean`; the actual cleanup report adds filesystem free-space observations.
+The cleanup command never replaces `media-generation recover` or `reconcile`,
+which own application recovery and publication state.
 
 GitHub Actions runs the same suite on Ubuntu and macOS with supported Python
 versions for pull requests and pushes to `main`. The run logs provide validation
@@ -295,3 +325,13 @@ remain in your chosen local directory.
 Generated evidence bundles, screenshots, validation transcripts, and database
 snapshots are not version-controlled. Retain specific outputs outside the
 repository only when they are needed for a review or investigation.
+
+### Idle-checkout cleanup
+
+Run cleanup manually only while no build, test, install, generation or other
+cleanup process writes the checkout. Hostile/concurrent writers are outside
+this utility's contract. `make clean-dry-run` is read-only; `make clean` preserves
+protected application data and `.venv`. Separately confirmed `make clean-deep`
+deletes **all** verified local `.venv` contents, including custom files. See
+[development cleanup](docs/architecture/development-cleanup.md) for boundaries,
+reports, exclusions, and the standalone `python3 scripts/clean.py` fallback.
