@@ -1,0 +1,101 @@
+src/media_generation/cli.py
+  s_353618c23d87ca::t_61e4294641abeb 11,14,20-23,64-94,99-100,105-110,146-157,175-240,247-250,265-266,269-279,336
+.github/workflows/python-tests.yml
+  s_353618c23d87ca::t_79577f388e3185 26,28,30-35
+.gitignore
+  s_353618c23d87ca::t_892832ba50a965 2
+Makefile
+  s_353618c23d87ca::t_8bda9866c9fa81 1-51
+README.md
+  s_353618c23d87ca::t_a84fa8ceec54f3 3-7,11-34,44-45,79,81-117,127-129,135-294,298-304,343,348-353,363-372
+docs/architecture/artifact-publication.md
+  s_353618c23d87ca::t_f2b93736c66027 1-303
+docs/architecture/development-cleanup.md
+  s_353618c23d87ca::t_d13c411f713d02 1-97
+docs/architecture/privacy-compliance.md
+  s_353618c23d87ca::t_51f089400f6890 1-153
+pyproject.toml
+  s_353618c23d87ca::t_56d1c8f73965c2 10
+scripts/clean.py
+  s_353618c23d87ca::t_8d60b92879722b 1-165
+scripts/cleanup_engine.py
+  s_353618c23d87ca::t_c88e4e6e1d0f41 1-319
+scripts/cleanup_fs.py
+  s_353618c23d87ca::t_10edaeb2fee32d 1-745
+scripts/cleanup_model.py
+  s_353618c23d87ca::t_b2579173884062 1-90
+scripts/cleanup_scope.py
+  s_353618c23d87ca::t_2a7842fdecab62 1-231
+scripts/with_worktree_lock.py
+  s_353618c23d87ca::t_9381e640e40b92 1-51
+src/media_generation/adapters.py
+  s_353618c23d87ca::t_ce2d9d60d3852e 10,15-17,46-55,57-59,71-74,87,126-129,133-148
+src/media_generation/domain.py
+  s_353618c23d87ca::t_4c207e759ee08e 155-161,177-181,204-208,224-231,244-251,288-339
+src/media_generation/errors.py
+  s_353618c23d87ca::t_08c9ba5bd31d26 16-34,43-59,64-87
+src/media_generation/images.py
+  s_353618c23d87ca::t_3fabf579036864 1-338
+src/media_generation/ownership.py
+  s_353618c23d87ca::t_77c88e2b935165 1-62
+src/media_generation/privacy.py
+  s_353618c23d87ca::t_4a4cecd65e4496 1-1081
+src/media_generation/publication.py
+  s_353618c23d87ca::t_235688b4a11ec2 1-728
+src/media_generation/service.py
+  s_353618c23d87ca::t_4894c3565e9b95 6-8,10,12,14,16-20,23-24,32-33,36-37,39-40,43-51,75-81,85-87,96-101,103-116,119-121,123-138,140-146,148-173,175-184,186-206,208,212,216-218,222-225,227-250,252-262,264-371,374-381,383-527,529-669,671-686,689-753,762,795,821-824,826-827,829-838
+src/media_generation/store.py
+  s_353618c23d87ca::t_ffaaf39359500b 7,14-15,22-28,31-274,289-326,343-345,347,362-365,452-1077,1087,1099,1102-1103,1105-1124,1127-1134,1142-1174,1176-1178,1181,1183,1188,1190,1192,1196,1198-1199,1202-1204,1207,1232,1237-1240,1242-1329,1331-1520,1523-1695,1701-1702,1704-1705,1717-1725,1729-1730,1765-2097,2099-2123,2136-2306,2327-2330,2332-2335,2358,2368,2408,2411-2413,2424-2516,2541-2546,2562-2574,2579,2584-2588,2593-2632,2636-2642,2659-2685
+tests/cleanup_fixtures.py
+  s_353618c23d87ca::t_3035f38b89acf4 1-231
+tests/fixtures/t01-schema.sql
+  s_353618c23d87ca::t_f5e6e050b8c8eb 1-85
+tests/fixtures/t03-schema.sql
+  s_353618c23d87ca::t_af907fa07192c3 1-142
+tests/test_artifact_cli.py
+  s_353618c23d87ca::t_26f0014fed6797 1-305
+tests/test_artifact_migration.py
+  s_353618c23d87ca::t_acfc2d22a355b3 1-338
+tests/test_artifact_publication.py
+  s_353618c23d87ca::t_c1bddb0ca4f384 1-1883
+tests/test_cleanup.py
+  s_353618c23d87ca::t_8f9e27533cdb05 1-504
+tests/test_cleanup_deep.py
+  s_353618c23d87ca::t_2d3ce2ea13886f 1-398
+tests/test_cleanup_safety.py
+  s_353618c23d87ca::t_f3fe1f6676ca76 1-494
+tests/test_durable_execution.py
+  s_353618c23d87ca::t_67e905c941012c 1-915
+tests/test_execution_migration.py
+  s_353618c23d87ca::t_717872f937dd9b 1-975
+tests/test_execution_recovery.py
+  s_353618c23d87ca::t_77d207c1be3447 1-862
+tests/test_generation_invariants.py
+  s_353618c23d87ca::t_87f3152fb73c1c 6,10-11,15-19,26-31,58-286,379-399,402,404-406,408-418,420-424,427-451,454-456,470-472,474,628-693,734-735,754,762,772,777-836,882-886
+tests/test_image_ingest.py
+  s_353618c23d87ca::t_eb8fe0beb7df60 1-852
+tests/test_makefile.py
+  s_353618c23d87ca::t_20c14d9d61d468 1-172
+tests/test_ownership.py
+  s_353618c23d87ca::t_36d35cf2dc528c 1-264
+tests/test_privacy_compliance.py
+  s_353618c23d87ca::t_dd3c642b07408f 1-1519
+tests/test_store_schema.py
+  s_353618c23d87ca::t_098a905974e3a8 1-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9d2cec8455998eb88ef14ebc6507e3394c50fab7",
+  "prompts": {},
+  "sessions": {
+    "s_353618c23d87ca": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a17a62-8123-7d40-adb8-a489a7b672dd",
+        "model": "gpt-5.6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
