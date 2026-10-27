@@ -32,11 +32,12 @@ an accidental `make` cannot install packages or remove files.
 See [development cleanup](docs/architecture/development-cleanup.md) for the
 ownership checks, protected paths, lock limitations, and report fields.
 
-Use Python 3.11 or later. Create an isolated environment and install the package
+Use Python 3.14.4 or later in the 3.14 series. Python 3.11-3.13 and 3.15
+are not supported. Create an isolated environment and install the package
 with its test dependency:
 
 ```sh
-python3 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -e '.[test]'
 ```

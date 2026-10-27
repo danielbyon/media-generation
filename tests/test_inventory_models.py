@@ -13,6 +13,7 @@ import pytest
 
 from media_generation.inventory.components import (
     MAX_DIRECTORY_ENTRIES,
+    MAX_JSON_DEPTH,
     _bundle_identity,
     _inspect_component,
     _read_sidecar,
@@ -83,6 +84,41 @@ def test_safetensors_treats_deep_json_as_invalid_header_json() -> None:
         "format": "safetensors",
         "reason": "invalid_header_json",
     }
+
+
+@pytest.mark.parametrize(
+    ("array_depth", "expected_status"),
+    [(MAX_JSON_DEPTH - 1, "observed"), (MAX_JSON_DEPTH, "malformed")],
+)
+def test_safetensors_json_depth_limit_is_explicit(
+    array_depth: int, expected_status: str
+) -> None:
+    """A fixed depth bound is enforced regardless of Python's JSON decoder."""
+    nested = "[" * array_depth + "0" + "]" * array_depth
+    header = ('{"unused":' + nested + "}").encode("utf-8")
+    data = len(header).to_bytes(8, "little") + header
+
+    result = inspect_safetensors(data, file_truncated=False)
+
+    if expected_status == "malformed":
+        assert result == {
+            "status": "malformed",
+            "format": "safetensors",
+            "reason": "invalid_header_json",
+        }
+    else:
+        assert result["status"] == "observed"
+
+
+def test_safetensors_json_brackets_inside_escaped_strings_are_not_depth() -> None:
+    """Quoted delimiters and escaped quotes cannot consume the nesting budget."""
+    value = ('[]{}"\\\\' * (MAX_JSON_DEPTH + 1))
+    data = build_safetensors({"__metadata__": {"architecture": value}})
+
+    result = inspect_safetensors(data, file_truncated=False)
+
+    assert result["status"] == "observed"
+    assert result["architecture"] == value[:128]
 
 
 def test_safetensors_treats_integer_limit_json_as_invalid_header_json() -> None:
@@ -832,6 +868,41 @@ def test_sidecar_treats_deep_json_as_invalid_json(tmp_path: Path) -> None:
         "status": "malformed",
         "reason": "invalid_json",
     }
+
+
+@pytest.mark.parametrize(
+    ("array_depth", "expected_status"),
+    [(MAX_JSON_DEPTH - 1, "observed"), (MAX_JSON_DEPTH, "malformed")],
+)
+def test_sidecar_json_depth_limit_is_explicit(
+    tmp_path: Path, array_depth: int, expected_status: str
+) -> None:
+    """Sidecar nesting is bounded consistently across Python versions."""
+    path = tmp_path / "model_index.json"
+    nested = "[" * array_depth + "0" + "]" * array_depth
+    payload = '{"unused":' + nested + "}"
+    path.write_text(payload, encoding="utf-8")
+    source = ReplayObservationSource(
+        {
+            f"stat:{path}": Observation(
+                status="ok", text=json.dumps(stat_payload(size_bytes=len(payload)))
+            ),
+            f"read:{path}": Observation(status="ok", text=payload),
+        }
+    )
+
+    record = _read_sidecar(
+        ProbeLedger(source),
+        component_id="bundle/model",
+        path=path,
+        roots=(ModelRoot(id="models", path=tmp_path),),
+    )
+
+    assert record["status"] == expected_status
+    if expected_status == "malformed":
+        assert record["reason"] == "invalid_json"
+    else:
+        assert record["selected_keys"] == {}
 
 
 def test_sidecar_treats_integer_limit_json_as_invalid_json(tmp_path: Path) -> None:

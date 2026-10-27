@@ -34,6 +34,7 @@ MAX_DIRECTORY_ENTRIES = 100
 MAX_TENSOR_ENTRIES = 100_000
 MAX_GGUF_ARRAY_ITEMS = 4096
 MAX_GGUF_DEPTH = 3
+MAX_JSON_DEPTH = 128
 MAX_RECIPE_BYTES = 256 * 1024
 MAX_MODEL_PATH_LINKS = 64
 
@@ -247,6 +248,37 @@ def inspect_gguf(data: bytes, *, file_truncated: bool) -> dict[str, object]:
     }
 
 
+def _bounded_json_loads(text: str) -> Any:
+    """Limit JSON container depth independently of interpreter recursion limits.
+
+    The input is already byte-capped by the caller. Scan its lexical structure
+    before decoding so strings (including escaped quotes) do not contribute
+    bracket depth; json.loads remains responsible for syntax validation.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "{[":
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("json_nesting_limit_exceeded")
+        elif char in "}]":
+            depth -= 1
+            if depth < 0:
+                raise ValueError("invalid_json_nesting")
+    return json.loads(text)
+
+
 def inspect_safetensors(data: bytes, *, file_truncated: bool) -> dict[str, object]:
     """Parse a bounded safetensors header, retaining dtype counts and safe metadata."""
     if len(data) < 8:
@@ -265,7 +297,7 @@ def inspect_safetensors(data: bytes, *, file_truncated: bool) -> dict[str, objec
             "reason": "metadata_limit_reached" if file_truncated else "header_truncated",
         }
     try:
-        header = json.loads(data[8 : 8 + header_length].decode("utf-8"))
+        header = _bounded_json_loads(data[8 : 8 + header_length].decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         return {"status": "malformed", "format": "safetensors", "reason": "invalid_header_json"}
     if not isinstance(header, dict):
@@ -425,7 +457,7 @@ def _read_sidecar(
     if observation.truncated:
         return {"path": str(path), "status": "truncated", "reason": "sidecar_limit_reached"}
     try:
-        payload = json.loads(observation.text)
+        payload = _bounded_json_loads(observation.text)
     except (json.JSONDecodeError, RecursionError, ValueError):
         return {"path": str(path), "status": "malformed", "reason": "invalid_json"}
     if not isinstance(payload, dict):
