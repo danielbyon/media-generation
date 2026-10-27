@@ -8,3 +8,7 @@ __pycache__/
 
 *.egg-info/
 .playwright-cli/
+/inventory-runs/
+
+# Operator APEX deployment copies are local evidence staging, not repository content.
+/apexi/

@@ -32,11 +32,12 @@ an accidental `make` cannot install packages or remove files.
 See [development cleanup](docs/architecture/development-cleanup.md) for the
 ownership checks, protected paths, lock limitations, and report fields.
 
-Use Python 3.11 or later. Create an isolated environment and install the package
+Use Python 3.14.4 or later in the 3.14 series. Python 3.11-3.13 and 3.15
+are not supported. Create an isolated environment and install the package
 with its test dependency:
 
 ```sh
-python3 -m venv .venv
+python3.14 -m venv .venv
 source .venv/bin/activate
 python3 -m pip install -e '.[test]'
 ```
@@ -302,6 +303,41 @@ The bundled deterministic CPU adapter is the only real adapter in this context.
 Its privacy evidence is configuration-unverified and does not qualify a real
 inference tool. APEX hardware, real GPU inference, model quality, network
 confinement, and hardware reliability are unverified.
+
+## Read-only host inventory
+
+Collect a bounded local snapshot without a GPU, model inference, installs, or
+network access:
+
+```sh
+PYTHONPATH=src python3 -m media_generation inventory \
+  --output /path/outside-the-repository/inventory-run
+```
+
+Collection is read-only unless version or device probes are explicitly enabled.
+Before staging, the command snapshots existing destinations without following
+final links. Missing paths, regular files up to 32 MiB, and symlink entries are
+supported. Unreadable, non-regular, oversized, or changing destinations abort
+before either file is replaced. The command stages `inventory.json` and
+`transcript.txt` through exclusive temporary files in the output directory,
+publishes the transcript first and the inventory second, and attempts a
+best-effort rollback if the second replacement fails. The two replacements are
+not crash-atomic; concurrent writers or a failed rollback can leave a mixed
+pair. Both files carry the same run identifier.
+Add `--manifest PATH`
+to declare model roots, runtime paths, bundles, recipes, capabilities, and probe
+policy. Version probes and device queries are opt-in. Full component hashing is
+opt-in with `--hash-components`.
+
+Exit status `0` means a complete host inventory, `4` means `partial`, and `5`
+means `blocked`; all three write a report. Validation failures exit `2` and
+output failures exit `3`. A written report is not APEX verification or
+capability qualification. Generated inventories and transcripts must stay
+outside Git.
+
+See [the inventory architecture guide](docs/architecture/inventory.md) for the
+manifest format, memory semantics, bounded header limits, fingerprint inputs,
+and the operator workflow for running on a target host.
 
 ## Validation and generated outputs
 
