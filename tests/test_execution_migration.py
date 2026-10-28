@@ -228,7 +228,7 @@ def test_t01_successful_rows_bytes_and_lineage_survive_execution_upgrade(
         assert service.get_lineage(artifact["artifact_id"]) == before_lineage[artifact["artifact_id"]]
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         for name, rows in before_rows.items():
             assert connection.execute(f"SELECT * FROM {name}").fetchall() == rows
@@ -245,7 +245,7 @@ def test_t03_allocated_journal_and_attempt_rows_survive_upgrade(tmp_path: Path) 
     GenerationService(database, images)
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
         assert connection.execute("SELECT * FROM artifact_publications").fetchall() == publications_before
         assert connection.execute("SELECT * FROM generation_attempts").fetchall() == attempts_before
@@ -264,7 +264,351 @@ def test_execution_migration_is_idempotent_after_success(tmp_path: Path) -> None
         assert list(connection.iterdump()) == after_first
 
 
-def test_valid_version_three_schema_advances_to_version_four(
+def test_version_four_migrates_to_admission_schema_without_rewriting_history(
+    tmp_path: Path,
+) -> None:
+    """Admission migration is additive and leaves every historical execution row intact."""
+    database, images, job_id = historical_running(tmp_path, "t03")
+    GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        before = {
+            table: connection.execute(f"SELECT * FROM {table}").fetchall()
+            for table in (
+                "generation_requests",
+                "generation_jobs",
+                "generation_attempts",
+                "execution_jobs",
+                "execution_attempts",
+                "execution_resource",
+            )
+        }
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_insert")
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_update")
+        connection.execute("DROP TABLE execution_admissions")
+        connection.execute("PRAGMA user_version = 4")
+
+    GenerationService(database, images).get_provenance(job_id)
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        for table, rows in before.items():
+            assert connection.execute(f"SELECT * FROM {table}").fetchall() == rows
+        assert connection.execute("SELECT count(*) FROM execution_admissions").fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'execution_admissions'"
+        ).fetchone()[0] == 1
+
+
+def test_version_four_queued_execution_requires_readmission_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    """A pre-admission queue reuses its identity only after typed re-admission."""
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    database, images = tmp_path / "studio.sqlite3", tmp_path / "images"
+    queued = GenerationService(database, images).enqueue(
+        "migrated-t04-queued", request(), max_attempts=2
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_insert")
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_update")
+        connection.execute("DROP TABLE execution_admissions")
+        connection.execute("PRAGMA user_version = 4")
+
+    migrated = GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert connection.execute("SELECT count(*) FROM execution_admissions").fetchone()[0] == 0
+
+    assert migrated.work()["processed"] == 0
+    snapshot = migrated.get_provenance(queued.job_id)
+    assert snapshot["status"] == "queued"
+    assert snapshot["attempts"] == []
+    assert snapshot["admission"]["decision"] == "unrecorded"
+    assert snapshot["admission"]["profile"] is None
+    assert snapshot["admission"]["demand"] is None
+    assert snapshot["admission"]["required_bytes"] == {}
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    demand = parse_workload_demand(workload_demand())
+    readmitted = GenerationService(database, images, admission_profile=profile)
+    reused = readmitted.enqueue(
+        "migrated-t04-queued", request(), workload_demand=demand
+    )
+
+    assert reused.job_id == queued.job_id
+    assert reused.status == "queued"
+    inspection = readmitted.inspect_admission(queued.job_id)
+    assert inspection is not None
+    assert inspection.admission.decision == "queued"
+    assert inspection.admission.profile_fingerprint == profile.fingerprint
+    assert inspection.admission.demand == demand.to_dict()
+    assert inspection.admission.required_bytes == {"system_ram": 48 * GIB}
+    assert readmitted.work()["processed"] == 1
+    completed = readmitted.get_provenance(queued.job_id)
+    assert completed["status"] == "succeeded"
+    assert completed["admission"]["decision"] == "released"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT count(*) FROM execution_admissions").fetchone()[0] == 1
+
+
+def test_version_four_queued_readmission_rejects_missing_or_conflicting_evidence(
+    tmp_path: Path,
+) -> None:
+    """Historical reuse cannot attach partial or different admission evidence."""
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from media_generation.errors import IdempotencyConflictError
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    database, images = tmp_path / "studio.sqlite3", tmp_path / "images"
+    service = GenerationService(database, images)
+    queued = service.enqueue("migrated-t04-conflict", request(), max_attempts=2)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_insert")
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_update")
+        connection.execute("DROP TABLE execution_admissions")
+        connection.execute("PRAGMA user_version = 4")
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    demand = parse_workload_demand(workload_demand())
+    profile_only = GenerationService(database, images, admission_profile=profile)
+    with pytest.raises(IdempotencyConflictError, match="profile and demand"):
+        profile_only.enqueue("migrated-t04-conflict", request())
+
+    readmitted = GenerationService(database, images, admission_profile=profile)
+    readmitted.enqueue("migrated-t04-conflict", request(), workload_demand=demand)
+    conflicting_demand = parse_workload_demand(
+        workload_demand(system_ram_bytes=21 * GIB, accelerator_memory_bytes=20 * GIB)
+    )
+    with pytest.raises(IdempotencyConflictError, match="different admission evidence"):
+        readmitted.enqueue(
+            "migrated-t04-conflict", request(), workload_demand=conflicting_demand
+        )
+
+    inspection = readmitted.inspect_admission(queued.job_id)
+    assert inspection is not None
+    assert inspection.admission.demand == demand.to_dict()
+    assert readmitted.work()["processed"] == 1
+
+
+def test_version_four_running_retry_failure_requires_readmission_before_retry(
+    tmp_path: Path,
+) -> None:
+    """A migrated owner may finalize a failure, but queued retry needs admission."""
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    class ContainedAdapter(DeterministicCpuAdapter):
+        containment_contract = PROCESS_CONTAINED_CONTRACT
+
+    database, images = tmp_path / "studio.sqlite3", tmp_path / "images"
+    service = GenerationService(database, images, adapter=ContainedAdapter())
+    queued = service.enqueue("migrated-running-failure", request(), max_attempts=2)
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+    claim = service._store.claim_next_execution(
+        attempt_id="att_0123456789abcdef0123456789abcdef",
+        owner_id="worker_migrated_failure",
+        adapter_id=service.adapter.adapter_id,
+        adapter_configuration_json=adapter_configuration_json,
+        privacy_compliance_json=privacy_compliance_json,
+        resolved_output_directory=str(images),
+        process_contained=True,
+        containment_contract=PROCESS_CONTAINED_CONTRACT,
+        timestamp="2026-10-27T00:00:00Z",
+        lease_expires_at="2026-10-27T00:01:00Z",
+        job_id=queued.job_id,
+    )
+    assert claim is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_insert")
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_update")
+        connection.execute("DROP TABLE execution_admissions")
+        connection.execute("PRAGMA user_version = 4")
+
+    migrated = GenerationService(database, images, adapter=ContainedAdapter())
+    assert migrated._store.fail_execution(
+        queued.job_id,
+        claim.attempt_id,
+        "transient migrated failure",
+        "2026-10-27T00:00:02Z",
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="retryable",
+        termination_proven=True,
+    )
+    snapshot = migrated.get_provenance(queued.job_id)
+    assert snapshot["status"] == "queued"
+    assert snapshot["attempts"][0]["status"] == "failed"
+    assert snapshot["execution"]["retry_eligible"] is True
+    assert snapshot["execution"]["resource_state"] == "available"
+    assert snapshot["admission"]["decision"] == "unrecorded"
+    assert migrated._store.retry_execution(
+        queued.job_id, "2026-10-27T00:00:03Z"
+    ) is False
+    assert migrated.work()["processed"] == 0
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    demand = parse_workload_demand(workload_demand())
+    readmitted = GenerationService(
+        database,
+        images,
+        adapter=ContainedAdapter(),
+        admission_profile=profile,
+    )
+    readmitted.enqueue(
+        "migrated-running-failure", request(), workload_demand=demand
+    )
+    inspection = readmitted.inspect_admission(queued.job_id)
+    assert inspection is not None
+    assert inspection.admission.decision == "queued"
+    assert readmitted.work()["processed"] == 1
+    assert readmitted.get_provenance(queued.job_id)["status"] == "succeeded"
+
+
+def test_version_four_running_owner_can_complete_without_admission_row(
+    tmp_path: Path,
+) -> None:
+    """Migration does not block an already-claimed historical owner from finishing."""
+    from media_generation.domain import GenerationArtifact, GenerationPlan
+
+    class ContainedAdapter(DeterministicCpuAdapter):
+        containment_contract = PROCESS_CONTAINED_CONTRACT
+
+    database, images = tmp_path / "studio.sqlite3", tmp_path / "images"
+    service = GenerationService(database, images, adapter=ContainedAdapter())
+    queued = service.enqueue("migrated-running-success", request())
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+    claim = service._store.claim_next_execution(
+        attempt_id="att_fedcba9876543210fedcba9876543210",
+        owner_id="worker_migrated_success",
+        adapter_id=service.adapter.adapter_id,
+        adapter_configuration_json=adapter_configuration_json,
+        privacy_compliance_json=privacy_compliance_json,
+        resolved_output_directory=str(images),
+        process_contained=True,
+        containment_contract=PROCESS_CONTAINED_CONTRACT,
+        timestamp="2026-10-27T00:00:00Z",
+        lease_expires_at="2026-10-27T00:01:00Z",
+        job_id=queued.job_id,
+    )
+    assert claim is not None
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_insert")
+        connection.execute("DROP TRIGGER t04_writer_guard_execution_admissions_update")
+        connection.execute("DROP TABLE execution_admissions")
+        connection.execute("PRAGMA user_version = 4")
+
+    migrated = GenerationService(database, images, adapter=ContainedAdapter())
+    plan = GenerationPlan(
+        job_id=claim.job_id,
+        attempt_id=claim.attempt_id,
+        resolved_prompt=claim.resolved_prompt,
+        seed=claim.resolved_seed,
+        width=claim.width,
+        height=claim.height,
+        references=claim.references,
+        output_slot=claim.output_slot,
+        output_slot_id=claim.output_slot_id,
+    )
+
+    def write_image(destination, staged) -> None:
+        migrated.adapter.generate(plan, staged)
+
+    def make_artifact(info, destination) -> GenerationArtifact:
+        return GenerationArtifact(
+            artifact_id="art_0123456789abcdef0123456789abcdef",
+            job_id=claim.job_id,
+            attempt_id=claim.attempt_id,
+            output_slot_id=claim.output_slot_id,
+            path=str(destination),
+            media_type=info.media_type,
+            image_format=info.image_format,
+            width=info.width,
+            height=info.height,
+            file_size=info.file_size,
+            sha256=info.sha256,
+            created_at="2026-10-27T00:00:01Z",
+        )
+
+    artifact = migrated._publication.publish(
+        write_image,
+        make_artifact,
+        artifact_id="art_0123456789abcdef0123456789abcdef",
+        job_id=claim.job_id,
+        attempt_id=claim.attempt_id,
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+    )
+
+    assert artifact.artifact_id == "art_0123456789abcdef0123456789abcdef"
+    snapshot = migrated.get_provenance(queued.job_id)
+    assert snapshot["status"] == "succeeded"
+    assert snapshot["admission"]["decision"] == "unrecorded"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT count(*) FROM execution_admissions").fetchone()[0] == 0
+
+
+def test_version_five_missing_admission_table_fails_closed(tmp_path: Path) -> None:
+    """A version marker cannot hide an incomplete admission schema."""
+    database, images, _ = historical_running(tmp_path, "t03")
+    GenerationService(database, images)
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE execution_admissions")
+        before = list(connection.iterdump())
+
+    with pytest.raises(RuntimeError, match="execution_admissions"):
+        GenerationService(database, images)
+
+    with sqlite3.connect(database) as connection:
+        assert list(connection.iterdump()) == before
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
+
+
+def test_valid_version_three_schema_advances_to_version_five(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -294,7 +638,7 @@ def test_valid_version_three_schema_advances_to_version_four(
     GenerationService(database, images)
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute(
             "SELECT * FROM generation_attempts"
         ).fetchall() == attempts_before
@@ -593,7 +937,7 @@ def test_version_three_marker_without_singleton_resource_fails_closed(
 
     with sqlite3.connect(database) as connection:
         assert list(connection.iterdump()) == before
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
         assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone()[0] == jobs_before
 
 
@@ -609,6 +953,8 @@ EXPECTED_WRITER_GUARDS = {
     "t04_writer_guard_artifact_publications_update",
     "t04_writer_guard_artifact_integrity_insert",
     "t04_writer_guard_artifact_integrity_update",
+    "t04_writer_guard_execution_admissions_insert",
+    "t04_writer_guard_execution_admissions_update",
 }
 
 
@@ -635,7 +981,7 @@ def test_historical_writer_dml_is_rejected_after_migration(
                 ),
             )
         assert list(historical_writer.iterdump()) == before
-        assert historical_writer.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert historical_writer.execute("PRAGMA user_version").fetchone()[0] == 5
 
 
 def test_current_writer_passes_guards_and_missing_guard_is_recreated(
@@ -696,7 +1042,7 @@ def test_pre_v4_writer_epoch_is_rejected_after_upgrade(tmp_path: Path) -> None:
                 (job_row[0],),
             )
         assert list(stale_writer.iterdump()) == before
-        assert stale_writer.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert stale_writer.execute("PRAGMA user_version").fetchone()[0] == 5
         trigger_sql = stale_writer.execute(
             """SELECT sql FROM sqlite_master
                WHERE type = 'trigger'
@@ -759,7 +1105,7 @@ def test_version_three_job_without_execution_state_fails_closed(tmp_path: Path) 
                 "2026-10-24T00:00:00+00:00",
             ),
         )
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 5
 
     with pytest.raises(RuntimeError, match="without execution state"):
         GenerationService(database, images)

@@ -8,6 +8,12 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .admission import (
+    AdmissionProfile,
+    WorkloadDemand,
+    load_admission_profile,
+    load_workload_demand,
+)
 from .domain import GenerationRequest, ArtifactSource
 from .errors import (
     GenerationExecutionError,
@@ -43,6 +49,47 @@ class _JsonArgumentParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+def _add_admission_arguments(command: argparse.ArgumentParser) -> None:
+    """Add one optional, all-or-none capacity evidence input group."""
+    command.add_argument(
+        "--inventory-report",
+        type=Path,
+        help="strict T02 inventory report used to derive the capacity profile",
+    )
+    command.add_argument(
+        "--admission-policy",
+        type=Path,
+        help="strict operator policy with explicit headroom for every pool",
+    )
+    command.add_argument(
+        "--workload-demand",
+        type=Path,
+        help="strict versioned memory, context, offload, and residency demand",
+    )
+
+
+def _admission_inputs(
+    options: argparse.Namespace,
+) -> tuple[AdmissionProfile | None, WorkloadDemand | None]:
+    """Load admission inputs only when the operator supplied capacity evidence."""
+    values = (
+        options.inventory_report,
+        options.admission_policy,
+        options.workload_demand,
+    )
+    if not any(values):
+        return None, None
+    if not all(values):
+        raise InputValidationError(
+            "--inventory-report, --admission-policy, and --workload-demand "
+            "must be provided together"
+        )
+    return (
+        load_admission_profile(options.inventory_report, options.admission_policy),
+        load_workload_demand(options.workload_demand),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the documented local-only command surface."""
     parser = _JsonArgumentParser(
@@ -60,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="engine-neutral JSON request; use - to read JSON from standard input",
     )
+    _add_admission_arguments(submit)
 
     enqueue = commands.add_parser("enqueue", help="durably admit a generation request")
     enqueue.add_argument("--db", required=True, type=Path)
@@ -72,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="total attempts for a new admission; omit to use or preserve policy",
     )
+    _add_admission_arguments(enqueue)
 
     worker = commands.add_parser("worker", help="execute compatible queued jobs")
     worker.add_argument("--db", required=True, type=Path)
@@ -112,6 +161,11 @@ def build_parser() -> argparse.ArgumentParser:
     provenance = commands.add_parser("provenance", help="retrieve request, job, attempt, and artifact")
     provenance.add_argument("--db", required=True, type=Path, help="SQLite database path")
     provenance.add_argument("--job-id", required=True, help="generation job ID")
+    admission = commands.add_parser(
+        "admission", help="inspect a pinned capacity decision and reservation"
+    )
+    admission.add_argument("--db", required=True, type=Path, help="SQLite database path")
+    admission.add_argument("--job-id", required=True, help="generation job ID")
     inventory = commands.add_parser(
         "inventory",
         help="collect read-only host, runtime, and model inventory",
@@ -167,20 +221,37 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _run_inventory(options)
         if options.command == "submit":
             request = _parse_request(options.request_json)
-            service = GenerationService(options.db, options.output_dir)
-            result = service.submit(options.idempotency_key, request)
+            profile, demand = _admission_inputs(options)
+            service = GenerationService(
+                options.db, options.output_dir, admission_profile=profile
+            )
+            result = service.submit(
+                options.idempotency_key, request, workload_demand=demand
+            )
             _write_json(result.to_dict(), sys.stdout)
             return 0
 
         if options.command == "enqueue":
             request = _parse_request(options.request_json)
-            service = GenerationService(options.db, options.output_dir)
+            profile, demand = _admission_inputs(options)
+            service = GenerationService(
+                options.db, options.output_dir, admission_profile=profile
+            )
             result = service.enqueue(
                 options.idempotency_key,
                 request,
                 max_attempts=options.max_attempts,
+                workload_demand=demand,
             )
             _write_json(result.to_dict(), sys.stdout)
+            return 0
+
+        if options.command == "admission":
+            service = GenerationService(options.db, Path.cwd())
+            inspection = service.inspect_admission(options.job_id)
+            if inspection is None:
+                raise RecordNotFoundError(f"job not found: {options.job_id}")
+            _write_json(inspection.to_dict(), sys.stdout)
             return 0
 
         if options.command == "worker":
@@ -265,9 +336,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
     except ResourceBusyError as error:
         return _write_error("resource_busy", str(error), 1, job_id=error.job_id)
     except GenerationExecutionError as error:
-        return _write_error("generation_failed", str(error), 1, job_id=error.job_id)
+        return _write_error(
+            "generation_failed", error.safe_message, 1, job_id=error.job_id
+        )
     except PublicationIncompleteError as error:
-        return _write_error("publication_incomplete", str(error), 1,
+        return _write_error("publication_incomplete", error.safe_message, 1,
                             job_id=error.job_id, recovery=error.recovery)
     except PublicationError as error:
         return _write_error("publication_incomplete", str(error), 1)
@@ -277,6 +350,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("generation_error", str(error), 1)
     except OSError as error:
         return _write_error("storage_error", str(error), 1)
+    except InventoryValidationError as error:
+        return _write_error("admission_validation_error", str(error), 2)
     except (json.JSONDecodeError, UnicodeError, ValueError) as error:
         return _write_error("validation_error", f"invalid request JSON: {error}", 2)
 

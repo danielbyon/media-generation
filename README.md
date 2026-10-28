@@ -1,7 +1,8 @@
 # media-generation
 
 `media-generation` is a small, local image-generation service with synchronous
-submission, an opt-in durable worker CLI, and SQLite persistence. It provides an
+submission, an opt-in durable worker CLI, versioned resource admission, and
+SQLite persistence. It provides an
 engine-neutral request contract and a deterministic CPU adapter so application
 and adapter work can be exercised without a GPU, model download, or network
 service.
@@ -164,18 +165,43 @@ See [privacy compliance architecture](docs/architecture/privacy-compliance.md)
 for the profile contract,
 redaction rules, migration behavior, and real-tool integration responsibilities.
 
-Before opening an existing T01 or T03 database with this release, stop every
+Before opening an existing T01, T03, or version-4 database with this release, stop every
 older CLI worker, adapter process, and inference child that can write the
 database or image tree; wait for them to exit. Back up the database with the
 SQLite backup API or while it is offline, and preserve the image tree and
 publication roots with it. The version 4 migration adds nullable privacy
-evidence to execution jobs and preserves earlier rows as explicitly unverified.
-The migration also installs database guards
+evidence to execution jobs. Version 5 adds pinned resource-admission evidence
+and advances the writer epoch; both migrations preserve earlier rows.
+The migrations also install database guards
 that reject later writes from binaries that do not identify themselves as
 current, but a trigger cannot prove that an already-running process stopped or
 prevent it from changing files before its database commit fails. Restore the
 pre-migration database before intentionally running an older binary again; a
-version 4 database is not safely downgradeable in place.
+version 5 database is not safely downgradeable in place.
+
+## Capacity admission
+
+Durable workers still use one database-owned heavyweight reservation, but a
+submission can now account for observed unified or discrete memory, explicit
+operator headroom, and workload demand before a job becomes claimable:
+
+```sh
+media-generation enqueue --db ./studio.sqlite3 --output-dir ./artifacts \
+  --idempotency-key portrait-003 --request-json - < request.json \
+  --inventory-report ./inventory/inventory.json \
+  --admission-policy ./admission-policy.json \
+  --workload-demand ./image-demand.json
+
+media-generation admission --db ./studio.sqlite3 --job-id <job-id>
+```
+
+The profile and demand are pinned to the queued job. Shared APU memory and
+visible VRAM aliases are never counted twice, and unknown evidence or known
+over-budget demand cannot dispatch. Existing deterministic CPU commands remain
+available without admission documents. See
+[resource admission architecture](docs/architecture/resource-admission.md) for
+the document schemas, decision states, reservation lifecycle, and evidence
+limits.
 
 ## Durable execution
 

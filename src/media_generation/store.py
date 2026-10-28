@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .admission_store import (
+    AdmissionInspection,
+    AdmissionPersistence,
+    PendingAdmission,
+)
 from .domain import (
     GenerationArtifact,
     ImportedArtifact,
@@ -35,9 +40,9 @@ _PRIVACY_CLAIM_EVIDENCE_REQUIRED = (
 _PRIVACY_CLAIM_CONFIGURATION_REQUIRED = (
     "protected execution claim requires exact adapter-configuration evidence"
 )
-_WRITER_EPOCH = 4
+_WRITER_EPOCH = 5
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_SUPERSEDED_WRITER_EPOCHS = (3,)
+_SUPERSEDED_WRITER_EPOCHS = (3, 4)
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -50,6 +55,8 @@ _WRITER_GUARDS = (
     ("artifact_publications", "UPDATE"),
     ("artifact_integrity", "INSERT"),
     ("artifact_integrity", "UPDATE"),
+    ("execution_admissions", "INSERT"),
+    ("execution_admissions", "UPDATE"),
 )
 
 
@@ -106,6 +113,19 @@ _EXECUTION_COLUMN_SPECS: dict[
         "claim_epoch": ("INTEGER", True, None, 0),
         "created_at": ("TEXT", True, None, 0),
     },
+    "execution_admissions": {
+        "job_id": ("TEXT", False, None, 1),
+        "admission_profile_json": ("TEXT", True, None, 0),
+        "workload_demand_json": ("TEXT", True, None, 0),
+        "decision": ("TEXT", True, None, 0),
+        "decision_reason": ("TEXT", True, None, 0),
+        "profile_fingerprint": ("TEXT", False, None, 0),
+        "required_bytes_json": ("TEXT", True, None, 0),
+        "unknown_reasons_json": ("TEXT", True, None, 0),
+        "reserved_bytes_json": ("TEXT", False, None, 0),
+        "created_at": ("TEXT", True, None, 0),
+        "updated_at": ("TEXT", True, None, 0),
+    },
 }
 
 _EXECUTION_FOREIGN_KEYS: dict[str, frozenset[tuple[str, str, str]]] = {
@@ -129,6 +149,7 @@ _EXECUTION_FOREIGN_KEYS: dict[str, frozenset[tuple[str, str, str]]] = {
             ("attempt_id", "execution_attempts", "attempt_id"),
         }
     ),
+    "execution_admissions": frozenset({("job_id", "execution_jobs", "job_id")}),
 }
 
 _EXECUTION_UNIQUE_COLUMNS: dict[str, frozenset[tuple[str, ...]]] = {
@@ -136,6 +157,7 @@ _EXECUTION_UNIQUE_COLUMNS: dict[str, frozenset[tuple[str, ...]]] = {
     "execution_attempts": frozenset({("job_id", "attempt_number")}),
     "execution_resource": frozenset(),
     "artifact_publication_authority": frozenset(),
+    "execution_admissions": frozenset(),
 }
 
 _EXECUTION_INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
@@ -147,6 +169,9 @@ _EXECUTION_INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "execution_resource": {},
     "artifact_publication_authority": {},
+    "execution_admissions": {
+        "execution_admissions_dispatch_idx": ("decision", "created_at", "job_id"),
+    },
 }
 
 _EXECUTION_JOBS_V3_DDL = """CREATE TABLE execution_jobs (
@@ -237,11 +262,30 @@ _ARTIFACT_PUBLICATION_AUTHORITY_DDL = """CREATE TABLE artifact_publication_autho
     created_at TEXT NOT NULL
 )"""
 
+_EXECUTION_ADMISSIONS_DDL = """CREATE TABLE execution_admissions (
+    job_id TEXT PRIMARY KEY REFERENCES execution_jobs(job_id),
+    admission_profile_json TEXT NOT NULL,
+    workload_demand_json TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN (
+        'queued','blocked','denied','reserved','released','quarantined','canceled','legacy'
+    )),
+    decision_reason TEXT NOT NULL,
+    profile_fingerprint TEXT,
+    required_bytes_json TEXT NOT NULL,
+    unknown_reasons_json TEXT NOT NULL,
+    reserved_bytes_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)"""
+
 _EXECUTION_JOBS_QUEUED_INDEX_DDL = """CREATE INDEX execution_jobs_queued_idx
     ON execution_jobs(status, created_at, job_id)"""
 
 _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL = """CREATE INDEX execution_attempts_running_idx
     ON execution_attempts(job_id, status)"""
+
+_EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL = """CREATE INDEX execution_admissions_dispatch_idx
+    ON execution_admissions(decision, created_at, job_id)"""
 
 # Compare the complete table definition so CHECK constraints, foreign-key
 # actions, and table options are all part of the versioned contract. Version 3
@@ -271,6 +315,38 @@ _EXECUTION_TABLE_DDL: dict[int, dict[str, tuple[str, ...]]] = {
             _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
         ),
     },
+    5: {
+        "execution_jobs": (
+            _EXECUTION_JOBS_V4_DDL,
+            _EXECUTION_JOBS_V4_UPGRADE_DDL,
+        ),
+        "execution_attempts": (_EXECUTION_ATTEMPTS_DDL,),
+        "execution_resource": (_EXECUTION_RESOURCE_DDL,),
+        "artifact_publication_authority": (
+            _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
+        ),
+        "execution_admissions": (_EXECUTION_ADMISSIONS_DDL,),
+    },
+}
+
+_EXECUTION_TABLES_BY_VERSION: dict[int, frozenset[str]] = {
+    3: frozenset(
+        {
+            "execution_jobs",
+            "execution_attempts",
+            "execution_resource",
+            "artifact_publication_authority",
+        }
+    ),
+    4: frozenset(
+        {
+            "execution_jobs",
+            "execution_attempts",
+            "execution_resource",
+            "artifact_publication_authority",
+        }
+    ),
+    5: frozenset(_EXECUTION_TABLE_DDL[5]),
 }
 
 
@@ -337,7 +413,16 @@ class SQLiteStore:
         self._initialize()
 
     @contextmanager
-    def _connection(self, transaction: bool = False) -> Iterator[sqlite3.Connection]:
+    def _connection(
+        self,
+        transaction: bool = False,
+        *,
+        read_transaction: bool = False,
+    ) -> Iterator[sqlite3.Connection]:
+        if transaction and read_transaction:
+            raise ValueError(
+                "a connection cannot be both a read and a write transaction"
+            )
         connection = sqlite3.connect(str(self.database_path), timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.create_function(
@@ -347,12 +432,14 @@ class SQLiteStore:
         connection.execute("PRAGMA synchronous = FULL")
         if transaction:
             connection.execute("BEGIN IMMEDIATE")
+        elif read_transaction:
+            connection.execute("BEGIN DEFERRED")
         try:
             yield connection
-            if transaction:
+            if transaction or read_transaction:
                 connection.commit()
         except BaseException:
-            if transaction:
+            if transaction or read_transaction:
                 connection.rollback()
             raise
         finally:
@@ -451,6 +538,7 @@ class SQLiteStore:
 
             self._migrate_artifacts(connection)
             self._migrate_privacy(connection)
+            self._migrate_admission(connection)
 
     @staticmethod
     def _execute_script(connection: sqlite3.Connection, script: str) -> None:
@@ -575,9 +663,9 @@ class SQLiteStore:
         remains compatible.
         """
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 4:
+        if version > 5:
             raise RuntimeError(f"unsupported database schema version: {version}")
-        if version in {3, 4}:
+        if version in {3, 4, 5}:
             self._validate_execution_schema(connection, version=version)
             resource = connection.execute(
                 "SELECT state FROM execution_resource WHERE id = 1"
@@ -762,7 +850,7 @@ class SQLiteStore:
         intermediate writer emitted it before schema version 4 was finalized.
         That compatibility exception ends at version 4.
         """
-        if version not in {3, 4}:
+        if version not in {3, 4, 5}:
             raise ValueError(f"unsupported execution schema version: {version}")
 
         present_tables = {
@@ -771,14 +859,15 @@ class SQLiteStore:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
-        missing_tables = sorted(set(_EXECUTION_COLUMN_SPECS) - present_tables)
+        expected_tables = _EXECUTION_TABLES_BY_VERSION[version]
+        missing_tables = sorted(expected_tables - present_tables)
         if missing_tables:
             raise SQLiteStore._incomplete_schema(
                 version,
                 "missing tables: " + ", ".join(missing_tables),
             )
 
-        for table in sorted(_EXECUTION_COLUMN_SPECS):
+        for table in sorted(expected_tables):
             columns = {
                 str(row["name"]): row
                 for row in connection.execute(
@@ -923,9 +1012,11 @@ class SQLiteStore:
         column is rejected as incomplete.
         """
         version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 4:
+        if version > 5:
             raise RuntimeError(f"unsupported database schema version: {version}")
         SQLiteStore._validate_execution_schema(connection, version=version)
+        if version == 5:
+            return
         columns = {
             str(row["name"])
             for row in connection.execute("PRAGMA table_info(execution_jobs)")
@@ -940,6 +1031,42 @@ class SQLiteStore:
             )
         SQLiteStore._validate_execution_schema(connection, version=4)
         connection.execute("PRAGMA user_version = 4")
+
+    @staticmethod
+    def _migrate_admission(connection: sqlite3.Connection) -> None:
+        """Add pinned admission evidence without rewriting historical jobs.
+
+        Version 5 extends the existing singleton execution-resource authority
+        with one admission row per newly queued job.  Jobs created by older
+        versions retain no fabricated demand and continue through the legacy
+        compatibility path.
+        """
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version > 5:
+            raise RuntimeError(f"unsupported database schema version: {version}")
+        if version < 4:
+            # A caller can deliberately stop after an older intermediate
+            # migration.  Admission is only meaningful once the privacy
+            # migration has completed and established schema version 4.
+            return
+        if version == 5:
+            SQLiteStore._validate_execution_schema(connection, version=5)
+            SQLiteStore._install_writer_guards(connection)
+            return
+        SQLiteStore._validate_execution_schema(connection, version=4)
+        connection.execute(_EXECUTION_ADMISSIONS_DDL.replace(
+            "CREATE TABLE execution_admissions",
+            "CREATE TABLE IF NOT EXISTS execution_admissions",
+            1,
+        ))
+        connection.execute(_EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL.replace(
+            "CREATE INDEX execution_admissions_dispatch_idx",
+            "CREATE INDEX IF NOT EXISTS execution_admissions_dispatch_idx",
+            1,
+        ))
+        SQLiteStore._validate_execution_schema(connection, version=5)
+        SQLiteStore._install_writer_guards(connection)
+        connection.execute("PRAGMA user_version = 5")
 
     @staticmethod
     def _writer_guard_sql(
@@ -963,11 +1090,19 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         writing the legacy tables. Historical binaries open SQLite connections
         without registering ``media_generation_writer_epoch``. The triggers
         therefore abort their first data mutation while allowing connections
-        opened by this store. A missing trigger is recreated, the recognized
-        pre-v4 definition is upgraded, and any other same-name definition
-        fails closed.
+        opened by this store. A missing trigger is recreated, a recognized
+        epoch-3 or epoch-4 definition is upgraded, and any other same-name
+        definition fails closed.
         """
+        present_tables = {
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         for table, operation in _WRITER_GUARDS:
+            if table not in present_tables:
+                continue
             name, expected_sql = cls._writer_guard_sql(table, operation)
             row = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
@@ -1102,6 +1237,8 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         max_attempts: int | None,
         containment_contract: str | None,
         timestamp: str,
+        admission: PendingAdmission,
+        validate_admission_reuse: bool,
     ) -> QueuedExecution:
         """Atomically admit or reuse a queued job without creating an attempt.
 
@@ -1122,6 +1259,8 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             or requested_privacy.get("adapter_id") != adapter_id
         ):
             raise ValueError("privacy compliance evidence is malformed")
+        if not isinstance(admission, PendingAdmission):
+            raise ValueError("admission evidence must be a PendingAdmission")
         with self._connection(transaction=True) as connection:
             existing = connection.execute(
                 """SELECT jobs.*, execution.status AS execution_status,
@@ -1189,6 +1328,46 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     raise IdempotencyConflictError(
                         "idempotency key is already bound to a different or unknown output directory"
                     )
+                if (
+                    validate_admission_reuse
+                    and existing["execution_status"]
+                    not in {"succeeded", "failed", "canceled"}
+                ):
+                    pinned_admission = AdmissionPersistence.snapshot(
+                        connection, str(existing["job_id"])
+                    )
+                    proposed_demand = (
+                        {}
+                        if admission.demand is None
+                        else admission.demand.to_dict()
+                    )
+                    if (
+                        pinned_admission is not None
+                        and pinned_admission.decision == "unrecorded"
+                    ):
+                        if existing["execution_status"] != "queued":
+                            raise IdempotencyConflictError(
+                                "historical running execution cannot acquire admission evidence"
+                            )
+                        if admission.profile is None or admission.demand is None:
+                            raise IdempotencyConflictError(
+                                "historical queued execution re-admission requires profile and demand evidence"
+                            )
+                        AdmissionPersistence.insert(
+                            connection,
+                            job_id=str(existing["job_id"]),
+                            admission=admission,
+                            timestamp=timestamp,
+                        )
+                    elif (
+                        pinned_admission is None
+                        or pinned_admission.profile_fingerprint
+                        != admission.profile_fingerprint
+                        or _json(pinned_admission.demand) != _json(proposed_demand)
+                    ):
+                        raise IdempotencyConflictError(
+                            "idempotency key is already bound to different admission evidence"
+                        )
                 return QueuedExecution(
                     False,
                     str(existing["request_id"]),
@@ -1253,6 +1432,12 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     timestamp,
                     timestamp,
                 ),
+            )
+            AdmissionPersistence.insert(
+                connection,
+                job_id=job_id,
+                admission=admission,
+                timestamp=timestamp,
             )
             return QueuedExecution(
                 True,
@@ -1333,6 +1518,10 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         record's status. Historical NULL evidence is claimable only when the
         caller explicitly selects the legacy path with
         ``allow_unrecorded_privacy``; it is never treated as a privacy pass.
+        A version-4 job without an admission row remains explicitly
+        unrecorded and cannot be claimed until idempotent re-submission pins
+        profile and demand evidence. Jobs with admission evidence must be
+        queued or legacy.
         """
         requested_directory = str(Path(resolved_output_directory).expanduser().resolve())
         requested_privacy_status: str | None = None
@@ -1351,16 +1540,25 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             if resource is None or resource["state"] != "available":
                 return None
 
+            # Missing admission evidence is historical and remains blocked. A
+            # valid idempotent re-submission must first attach its pinned row.
             query = """SELECT jobs.*, execution.status AS execution_status,
                                 execution.max_attempts, execution.fence_epoch,
                                 execution.containment_contract,
                                 execution.resolved_plan_json,
-                                execution.privacy_compliance_json
+                                execution.privacy_compliance_json,
+                                admission.decision AS admission_decision,
+                                admission.decision_reason AS admission_reason,
+                                admission.required_bytes_json AS admission_required_bytes_json
                          FROM generation_jobs AS jobs
                          JOIN execution_jobs AS execution ON execution.job_id = jobs.job_id
+                         LEFT JOIN execution_admissions AS admission
+                           ON admission.job_id = execution.job_id
                          WHERE execution.status = 'queued'
                            AND jobs.adapter_id = ?
-                           AND execution.containment_contract IS ?"""
+                           AND execution.containment_contract IS ?
+                           AND admission.decision IN ('queued','legacy')
+                           AND admission.decision_reason != 'resource_busy'"""
             parameters: list[object] = [
                 adapter_id,
                 containment_contract,
@@ -1485,6 +1683,15 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                        reason = NULL, updated_at = ? WHERE id = 1""",
                 (candidate["job_id"], attempt_id, owner_id, timestamp),
             )
+            if candidate["admission_decision"] is not None:
+                if not AdmissionPersistence.reserve(
+                    connection,
+                    str(candidate["job_id"]),
+                    source_decision=str(candidate["admission_decision"]),
+                    timestamp=timestamp,
+                    required_bytes_json=str(candidate["admission_required_bytes_json"]),
+                ):
+                    raise RuntimeError("admission reservation transition was rejected")
             plan = json.loads(plan_json)
             references = tuple(
                 ResolvedReference(
@@ -1554,6 +1761,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     "UPDATE generation_jobs SET status = 'failed', updated_at = ? WHERE job_id = ?",
                     (timestamp, job_id),
                 )
+                AdmissionPersistence.cancel_before_dispatch(connection, job_id, timestamp)
                 return "acknowledged"
             if row["execution_status"] == "running":
                 connection.execute(
@@ -1577,10 +1785,13 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             row = connection.execute(
                 """SELECT execution.status, execution.retry_eligible,
                           execution.max_attempts, resource.state AS resource_state,
+                          admission.decision AS admission_decision,
                           (SELECT count(*) FROM execution_attempts
                            WHERE job_id = ?) AS attempt_count
                    FROM execution_jobs AS execution
                    JOIN execution_resource AS resource ON resource.id = 1
+                   LEFT JOIN execution_admissions AS admission
+                     ON admission.job_id = execution.job_id
                    WHERE execution.job_id = ?""",
                 (job_id, job_id),
             ).fetchone()
@@ -1591,28 +1802,45 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 or not bool(row["retry_eligible"])
                 or row["resource_state"] != "available"
                 or int(row["attempt_count"]) >= int(row["max_attempts"])
+                or row["admission_decision"] is None
             ):
                 return False
-            connection.execute(
-                """UPDATE execution_jobs
-                   SET status = 'queued', retry_eligible = 0,
-                       failure_message = NULL, updated_at = ?
-                   WHERE job_id = ? AND status = 'failed'""",
-                (timestamp, job_id),
-            )
-            connection.execute(
-                "UPDATE generation_jobs SET status = 'running', updated_at = ? WHERE job_id = ?",
-                (timestamp, job_id),
-            )
+            if row["status"] == "failed":
+                updated = connection.execute(
+                    """UPDATE execution_jobs
+                       SET status = 'queued', retry_eligible = 0,
+                           failure_message = NULL, updated_at = ?
+                       WHERE job_id = ? AND status = 'failed'""",
+                    (timestamp, job_id),
+                )
+                if updated.rowcount != 1:
+                    return False
+                connection.execute(
+                    "UPDATE generation_jobs SET status = 'running', updated_at = ? WHERE job_id = ?",
+                    (timestamp, job_id),
+                )
+                if not AdmissionPersistence.requeue_after_safe_retry(
+                    connection, job_id, timestamp
+                ):
+                    raise RuntimeError("admission retry transition was rejected")
+            else:
+                admission = AdmissionPersistence.snapshot(connection, job_id)
+                if admission is None or admission.decision != "queued":
+                    return False
             return True
 
     def resource_snapshot(self) -> dict[str, object]:
         """Return the persisted heavyweight-resource reservation."""
         with self._connection() as connection:
-            row = connection.execute("SELECT * FROM execution_resource WHERE id = 1").fetchone()
+            row = AdmissionPersistence.resource_snapshot(connection)
             if row is None:
                 raise RuntimeError("execution resource reservation row is missing")
-            return dict(row)
+            return row
+
+    def inspect_admission(self, job_id: str) -> AdmissionInspection | None:
+        """Read admission and its owned reservation from one transaction."""
+        with self._connection(read_transaction=True) as connection:
+            return AdmissionPersistence.inspect(connection, job_id)
 
     def current_attempt(self, job_id: str) -> dict[str, object] | None:
         """Return private recovery metadata for the current attempt."""
@@ -1689,7 +1917,11 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         publication_id: str | None = None, sources: tuple[ArtifactSource, ...] = (),
         attempt_owner_id: str | None = None, claim_epoch: int | None = None,
     ) -> None:
-        """Commit an artifact and release work only with trusted termination proof."""
+        """Commit an artifact and release work only with trusted termination proof.
+
+        A rejected admission completion transition raises before the transaction
+        commits, so execution, publication, and resource finalization are atomic.
+        """
         with self._connection(transaction=True) as connection:
             row = connection.execute(
                 "SELECT status, output_slot_id FROM generation_jobs WHERE job_id = ?", (artifact.job_id,)
@@ -1799,6 +2031,8 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                        owner_id = NULL, reason = NULL, updated_at = ? WHERE id = 1""",
                     (timestamp,),
                 )
+                admission_state = "released"
+                admission_reason = "termination_and_publication_reconciled"
             else:
                 connection.execute(
                     """UPDATE execution_resource
@@ -1812,6 +2046,24 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                         timestamp,
                     ),
                 )
+                admission_state = "quarantined"
+                admission_reason = (
+                    "successful publication has no trusted process-termination proof"
+                )
+            admission_finished = AdmissionPersistence.finish(
+                connection,
+                artifact.job_id,
+                decision=admission_state,
+                reason=admission_reason,
+                timestamp=timestamp,
+            )
+            if not admission_finished:
+                admission = AdmissionPersistence.snapshot(connection, artifact.job_id)
+                # A version-4 execution with no admission row retains its
+                # approved historical completion path until that policy is
+                # resolved. Any recorded row must obey the transition contract.
+                if admission is None or admission.decision != "unrecorded":
+                    raise RuntimeError("admission completion transition was rejected")
 
     @staticmethod
     def _commit_publication_row(
@@ -2152,6 +2404,8 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         A noncanceled attempt without trusted termination proof is reported as
         ambiguous at job level, retains its failure classification, quarantines
         the sole resource, and is never made retryable by this method.
+        A rejected admission transition raises before the transaction commits,
+        rolling back both execution and resource finalization.
         """
         if failure_class not in {
             "retryable",
@@ -2302,6 +2556,26 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     attempt_id,
                 ),
             )
+            if resource_state == "quarantined":
+                admission_state = "quarantined"
+            elif retry:
+                admission_state = "queued"
+            else:
+                admission_state = "released"
+            admission_finished = AdmissionPersistence.finish(
+                connection,
+                job_id,
+                decision=admission_state,
+                reason=message,
+                timestamp=timestamp,
+            )
+            if not admission_finished:
+                admission = AdmissionPersistence.snapshot(connection, job_id)
+                # Only an already-running pre-T06 attempt may finalize without
+                # admission evidence. Its retryable queue remains non-claimable
+                # until a later idempotent re-submission attaches a row.
+                if admission is None or admission.decision != "unrecorded":
+                    raise RuntimeError("admission failure transition was rejected")
             return True
 
     def get_request(self, request_id: str) -> GenerationRequestRecord:
@@ -2484,6 +2758,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 else job.status
             )
             privacy_compliance = _stored_privacy_compliance(job_row, job.adapter_id)
+            admission_record = AdmissionPersistence.snapshot(connection, job_id)
             return {
                 "job_id": job.job_id,
                 "request": request.to_dict(),
@@ -2500,6 +2775,9 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 "attempt": None if not attempts else attempts[-1].to_dict(),
                 "attempts": [attempt.to_dict() for attempt in attempts],
                 "artifact": None if artifact is None else artifact.to_dict(),
+                "admission": (
+                    None if admission_record is None else admission_record.to_dict()
+                ),
                 "execution": {
                     "status": execution_status,
                     "max_attempts": int(job_row["max_attempts"] or 1),

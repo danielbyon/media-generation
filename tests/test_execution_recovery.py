@@ -24,6 +24,13 @@ from test_durable_execution import (
 )
 
 
+def admission_record(service: GenerationService, job_id: str):
+    """Return typed admission evidence from one consistent inspection."""
+    inspection = service.inspect_admission(job_id)
+    assert inspection is not None
+    return inspection.admission
+
+
 def crash_worker(root: Path, *, checkpoint: str | None = None, external: bool = False) -> None:
     """Abruptly end a real worker without executing its cleanup handlers."""
     code = '''
@@ -94,8 +101,32 @@ def test_crashed_external_execution_remains_quarantined_after_lock_release(
     class ExternalAdapter(DeterministicCpuAdapter):
         containment_contract = None
 
-    service = service_at(tmp_path, adapter=ExternalAdapter())
-    queued = service.enqueue("external", request(), max_attempts=3)
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    service = service_at(
+        tmp_path, adapter=ExternalAdapter(), admission_profile=profile
+    )
+    queued = service.enqueue(
+        "external",
+        request(),
+        max_attempts=3,
+        workload_demand=parse_workload_demand(workload_demand()),
+    )
     crash_worker(tmp_path, external=True)
 
     report = service_at(tmp_path, adapter=ExternalAdapter()).recover()
@@ -104,6 +135,9 @@ def test_crashed_external_execution_remains_quarantined_after_lock_release(
     assert snapshot["status"] == "ambiguous"
     assert snapshot["execution"]["resource_state"] == "quarantined"
     assert snapshot["attempts"][0]["termination_proven"] is False
+    admission = admission_record(service_at(tmp_path), queued.job_id)
+    assert admission.decision == "quarantined"
+    assert admission.reserved_bytes == {"system_ram": 48 * GIB}
     service_at(tmp_path).enqueue("other", request())
     assert service_at(tmp_path).work()["status"] == "resource_busy"
     with pytest.raises(GenerationError):
@@ -497,14 +531,40 @@ def test_unqualified_success_preserves_artifact_but_quarantines_resource(
         height=9,
         reference_ids=(parent_artifact.artifact_id,),
     )
-    child_service = service_at(tmp_path, adapter=ExplicitExternalAdapter())
-    child = child_service.submit("unqualified-success", child_request)
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    child_service = service_at(
+        tmp_path, adapter=ExplicitExternalAdapter(), admission_profile=profile
+    )
+    child = child_service.submit(
+        "unqualified-success",
+        child_request,
+        workload_demand=parse_workload_demand(workload_demand()),
+    )
     child_artifact = child_service.get_artifact(child.artifact_id)
     snapshot = child_service.get_provenance(child.job_id)
 
     assert snapshot["status"] == "succeeded"
     assert snapshot["attempts"][0]["termination_proven"] is False
     assert snapshot["execution"]["resource_state"] == "quarantined"
+    admission = admission_record(child_service, child.job_id)
+    assert admission.decision == "quarantined"
+    assert admission.reserved_bytes == {"system_ram": 48 * GIB}
     assert Path(child_artifact.path).read_bytes()
     assert Path(parent_artifact.path).read_bytes() == parent_bytes
     lineage = child_service.get_lineage(child_artifact.artifact_id)

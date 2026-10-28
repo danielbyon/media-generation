@@ -9,6 +9,7 @@ weights for inference, or performs network requests.
 from __future__ import annotations
 
 from .report import InventoryOptions, InventoryResult, collect_inventory, write_inventory
+from .contract import ValidatedInventoryReport, validate_inventory_report
 from .schema import (
     FINGERPRINT_ALGORITHM,
     MANIFEST_SCHEMA_NAME,
@@ -29,6 +30,7 @@ __all__ = [
     "InventoryOutputError",
     "InventoryResult",
     "InventoryValidationError",
+    "ValidatedInventoryReport",
     "MANIFEST_SCHEMA_NAME",
     "MANIFEST_SCHEMA_VERSION",
     "REPLAY_SCHEMA_NAME",
@@ -36,5 +38,6 @@ __all__ = [
     "SCHEMA_NAME",
     "SCHEMA_VERSION",
     "collect_inventory",
+    "validate_inventory_report",
     "write_inventory",
 ]

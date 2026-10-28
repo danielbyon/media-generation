@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .components import inspect_bundles
+from .contract import validate_inventory_report
 from .discovery import discover_runtimes
 from .fingerprint import build_environment_fingerprint
 from .host import collect_host
@@ -411,6 +412,7 @@ def collect_inventory(options: InventoryOptions) -> InventoryResult:
         "findings": [finding.to_dict() for finding in findings],
         "evidence_gate": evidence_gate,
     }
+    validate_inventory_report(inventory)
     transcript = _build_transcript(
         ledger=ledger,
         inventory=inventory,

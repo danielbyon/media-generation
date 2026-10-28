@@ -18,6 +18,12 @@ from .adapters import (
     GenerationAdapter,
     trusted_containment_contract,
 )
+from .admission import (
+    AdmissionProfile,
+    WorkloadDemand,
+    evaluate_admission,
+)
+from .admission_store import AdmissionInspection, PendingAdmission
 from .domain import (
     GenerationArtifact,
     ImportedArtifact,
@@ -99,6 +105,7 @@ class GenerationService:
         heartbeat_seconds: float = 5.0,
         privacy_policy: PrivacyCompliancePolicy | None = None,
         require_privacy_pass: bool = False,
+        admission_profile: AdmissionProfile | None = None,
     ) -> None:
         if lease_seconds <= 0 or heartbeat_seconds <= 0 or heartbeat_seconds >= lease_seconds:
             raise ValueError("heartbeat interval must be positive and shorter than the lease")
@@ -111,6 +118,11 @@ class GenerationService:
             privacy_policy, PrivacyCompliancePolicy
         ):
             raise ValueError("privacy_policy must be a PrivacyCompliancePolicy")
+        if admission_profile is not None and not isinstance(
+            admission_profile, AdmissionProfile
+        ):
+            raise ValueError("admission_profile must be an AdmissionProfile")
+        self._admission_profile = admission_profile
         self._privacy_policy = privacy_policy or DEFAULT_PRIVACY_POLICY
         self._require_privacy_pass = require_privacy_pass
         self._current_privacy_snapshot()
@@ -126,6 +138,7 @@ class GenerationService:
         request: GenerationRequest,
         *,
         max_attempts: int | None = None,
+        workload_demand: WorkloadDemand | None = None,
     ) -> SubmissionResult:
         """Admit new work or reuse the existing persisted execution policy.
 
@@ -134,7 +147,12 @@ class GenerationService:
         An explicitly supplied positive budget must match unfinished work.
         Succeeded reuse ignores it without changing the persisted policy.
         """
-        queued = self._admit(idempotency_key, request, max_attempts=max_attempts)
+        queued = self._admit(
+            idempotency_key,
+            request,
+            max_attempts=max_attempts,
+            workload_demand=workload_demand,
+        )
         return self._submission_for_job(queued.job_id)
 
     def _current_privacy_snapshot(
@@ -189,6 +207,7 @@ class GenerationService:
         request: GenerationRequest,
         *,
         max_attempts: int | None,
+        workload_demand: WorkloadDemand | None = None,
     ) -> QueuedExecution:
         """Atomically admit or reuse one request and report whether it is new."""
         _, adapter_configuration_json, _, privacy_compliance_json = (
@@ -209,6 +228,19 @@ class GenerationService:
         resolved_seed = request.seed
         if resolved_seed is None:
             resolved_seed = int(request_digest[:8], 16)
+        if workload_demand is not None and not isinstance(
+            workload_demand, WorkloadDemand
+        ):
+            raise InputValidationError("workload_demand must be a WorkloadDemand")
+        decision = evaluate_admission(self._admission_profile, workload_demand)
+        pending_admission = PendingAdmission(
+            profile=self._admission_profile,
+            demand=workload_demand,
+            decision=decision.status,
+            reason=decision.reason,
+            required_bytes=dict(decision.required_bytes),
+            unknown_reasons=decision.unknown_reasons,
+        )
         queued = self._store.create_queued_execution(
             request=request,
             request_digest=request_digest,
@@ -227,19 +259,42 @@ class GenerationService:
             max_attempts=requested_max_attempts,
             containment_contract=trusted_containment_contract(self.adapter),
             timestamp=_now(),
+            admission=pending_admission,
+            validate_admission_reuse=(
+                self._admission_profile is not None or workload_demand is not None
+            ),
         )
         return queued
 
     def submit(
-        self, idempotency_key: str, request: GenerationRequest
+        self,
+        idempotency_key: str,
+        request: GenerationRequest,
+        *,
+        workload_demand: WorkloadDemand | None = None,
     ) -> SubmissionResult:
         """Admit work, then synchronously execute one matching local attempt.
 
         Existing successful jobs remain directly inspectable and reusable. An
         occupied heavyweight resource returns a specific error while leaving
-        the newly admitted job queued for a later worker or submit call.
+        the newly admitted job queued for a later worker or submit call. A
+        blocked or denied capacity decision returns the queued submission
+        without creating an attempt; inspect it with ``inspect_admission``.
+        A process-contained retryable failure remains durably queued for its
+        next bounded attempt and raises ``GenerationExecutionError`` with the
+        ``execution_retryable`` safe message.
+        Safe CLI messages remain generic for ambiguous, retryable, and canceled
+        executions. With an admission profile, terminal failures use
+        ``execution_failed``; an admission-disabled contained terminal failure
+        retains the established local diagnostic. Incomplete publications also
+        retain their diagnostic and recovery context.
         """
-        queued = self._admit(idempotency_key, request, max_attempts=None)
+        queued = self._admit(
+            idempotency_key,
+            request,
+            max_attempts=None,
+            workload_demand=workload_demand,
+        )
         admitted = self._submission_for_job(queued.job_id)
         if admitted.status in {"succeeded", "running"}:
             return admitted
@@ -256,18 +311,43 @@ class GenerationService:
         submission = self._submission_for_job(admitted.job_id)
         if submission.status == "succeeded":
             return submission
+        inspection = self.inspect_admission(admitted.job_id)
+        admission = None if inspection is None else inspection.admission
+        if admission is not None and admission.decision in {"blocked", "denied"}:
+            return admitted
         cause = failures[-1] if failures else None
         job = self._store.get_job(admitted.job_id)
-        message = job.failure_message or (
-            str(cause) if cause is not None else f"job is {submission.status}"
+        message = str(cause) if cause is not None else (
+            job.failure_message or f"job is {submission.status}"
         )
-        if submission.status in {"queued", "running"}:
-            error = PublicationIncompleteError(
-                admitted.job_id,
-                message,
-            )
+        admission_enabled = admission is not None and bool(admission.profile)
+        if job.execution_status == "queued":
+            error_type = GenerationExecutionError
+            safe_message = "execution_retryable"
+            if admission_enabled:
+                message = job.failure_message or "execution_retryable"
+        elif job.execution_status == "ambiguous":
+            error_type = GenerationExecutionError
+            safe_message = "execution_ambiguous"
+        elif job.execution_status == "canceled":
+            error_type = GenerationExecutionError
+            safe_message = "execution_canceled"
+        elif submission.status in {"queued", "running"}:
+            error_type = PublicationIncompleteError
+            safe_message = message
         else:
-            error = GenerationExecutionError(admitted.job_id, message)
+            error_type = GenerationExecutionError
+            safe_message = (
+                message
+                if not admission_enabled
+                and trusted_containment_contract(self.adapter) is not None
+                else "execution_failed"
+            )
+        error = error_type(
+            admitted.job_id,
+            message,
+            safe_message=safe_message,
+        )
         if cause is not None:
             raise error from cause
         raise error
@@ -600,7 +680,7 @@ class GenerationService:
                 finalized = self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
-                    str(error),
+                    "execution_canceled",
                     _now(),
                     attempt_owner_id=claim.owner_id,
                     claim_epoch=claim.claim_epoch,
@@ -616,7 +696,7 @@ class GenerationService:
                 self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
-                    str(error),
+                    "execution_preparation_failed",
                     _now(),
                     attempt_owner_id=claim.owner_id,
                     claim_epoch=claim.claim_epoch,
@@ -635,7 +715,7 @@ class GenerationService:
                 self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
-                    str(error),
+                    "execution_retryable" if retryable_failure else "execution_ambiguous",
                     _now(),
                     attempt_owner_id=claim.owner_id,
                     claim_epoch=claim.claim_epoch,
@@ -647,7 +727,7 @@ class GenerationService:
             self._store.fail_execution(
                 claim.job_id,
                 claim.attempt_id,
-                str(error),
+                "execution_retryable" if retryable_failure else "execution_failed",
                 _now(),
                 attempt_owner_id=claim.owner_id,
                 claim_epoch=claim.claim_epoch,
@@ -766,6 +846,15 @@ class GenerationService:
     def get_provenance(self, job_id: str) -> dict[str, object]:
         """Retrieve the request, adapter attempt, and output provenance snapshot."""
         return self._store.get_provenance(job_id)
+
+    def inspect_admission(self, job_id: str) -> AdmissionInspection | None:
+        """Return one consistent job-scoped admission and reservation view."""
+        return self._store.inspect_admission(job_id)
+
+    def get_resource_reservation(self, job_id: str) -> dict[str, object] | None:
+        """Return the singleton reservation only when this job owns it."""
+        reservation = self._store.resource_snapshot()
+        return reservation if reservation.get("job_id") == job_id else None
 
     def _validate_capabilities(self, request: GenerationRequest) -> None:
         capabilities = self.adapter.capabilities

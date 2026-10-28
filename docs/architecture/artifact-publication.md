@@ -16,17 +16,20 @@ source is copied unchanged, including metadata and orientation. Subsequent edits
 to the source file cannot change the stored artifact. Migration backfills ordered
 reference edges from historical jobs and leaves their rows and image bytes intact.
 
-The current schema uses `user_version = 4`. Version 3 added execution and
+The current schema uses `user_version = 5`. Version 3 added execution and
 publication-authority sidecar tables while leaving the T01 and T03 record tables,
 JSON, identities, image bytes, and lineage unchanged. Publication authority is
 backfilled only for historical publications whose journal state is `committed`.
 Version 4 adds nullable privacy-compliance evidence to execution jobs. Historical
 rows remain NULL and are exposed as unverified; migration never assigns a
-retrospective privacy pass.
+retrospective privacy pass. Version 5 adds one pinned admission row per newly
+queued execution. Historical jobs remain on the compatibility path and do not
+receive fabricated capacity evidence.
 An unfinished historical journal has no trustworthy owner, epoch, lease, or
-containment evidence, so it remains quarantined. Opening a version-4 database
-requires all four sidecar tables and the valid singleton `execution_resource`
-row; an incomplete schema fails closed before admission. Migration and backfill
+containment evidence, so it remains quarantined. Opening a version-4 or
+version-5 database requires all of its sidecar tables and the valid singleton
+`execution_resource` row; an incomplete schema fails closed before admission.
+Migration and backfill
 execute in one transaction; failure rolls back the entire upgrade. Older
 application versions must not write an upgraded database; migration remains
 compatibility-forward for database readers.
@@ -37,9 +40,10 @@ connection-local `media_generation_writer_epoch()` function, and `BEFORE
 INSERT/UPDATE` triggers on `generation_requests`, `generation_jobs`,
 `generation_attempts`, `generation_artifacts`, `artifact_edges`,
 `artifact_publications`, and `artifact_integrity` require that function to
-report epoch 4. A pre-v4 writer either lacks that function or reports epoch 3,
-so its first guarded mutation aborts while `user_version` remains 4. Opening
-version 4 recreates a missing guard and upgrades a recognized epoch-3 guard; it
+report epoch 5. A pre-v5 writer either lacks that function or reports an older
+recognized epoch, so its first guarded mutation aborts while `user_version`
+remains 5. Opening version 5 recreates a missing guard and upgrades a recognized
+epoch-3 or epoch-4 guard; it
 rejects any other same-name guard with a divergent definition. Opening also fails with
 an explicit diagnostic if a public job has no `execution_jobs` sidecar, because
 such a row was admitted after the migration boundary by a writer that bypassed
