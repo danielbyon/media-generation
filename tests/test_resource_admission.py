@@ -146,6 +146,62 @@ def test_synthetic_unified_profile_preserves_origin_and_applies_headroom() -> No
     assert profile.to_dict()["shared_pool_ids"] == ["drm:card1:gtt", "drm:card1:vis_vram"]
 
 
+def test_admission_profile_rejects_unsupported_schema_version() -> None:
+    """A pinned profile cannot use a version other than the current schema."""
+    import pytest
+
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_admission_profile,
+    )
+    from media_generation.inventory.schema import InventoryValidationError
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    payload = profile.to_dict()
+    payload["schema_version"] = 2
+
+    with pytest.raises(InventoryValidationError, match="schema_version"):
+        parse_admission_profile(payload)
+
+
+def test_admission_profile_rejects_contradictory_fingerprint() -> None:
+    """A profile body must reproduce its embedded identity fingerprint."""
+    import pytest
+
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_admission_profile,
+    )
+    from media_generation.inventory.schema import InventoryValidationError
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    payload = profile.to_dict()
+    payload["origin"] = "contradictory_origin"
+
+    with pytest.raises(InventoryValidationError, match="fingerprint"):
+        parse_admission_profile(payload)
+
+
 def test_admission_policy_rejects_boolean_schema_version() -> None:
     """Boolean JSON values cannot impersonate the integer policy version."""
     import pytest
@@ -1460,8 +1516,11 @@ def test_restart_uses_pinned_profile_and_preserves_its_evidence(tmp_path) -> Non
     assert admission_record(restarted, first.job_id).profile == profile.to_dict()
 
 
-def test_succeeded_idempotent_reuse_preserves_first_pinned_demand(tmp_path) -> None:
-    """A succeeded key never retroactively replaces its original capacity evidence."""
+def test_succeeded_idempotent_reuse_rejects_changed_demand(tmp_path) -> None:
+    """A succeeded key cannot retrofit different capacity evidence."""
+    import pytest
+
+    from media_generation.errors import IdempotencyConflictError
     from media_generation.admission import (
         build_admission_profile,
         parse_admission_policy,
@@ -1493,8 +1552,10 @@ def test_succeeded_idempotent_reuse_preserves_first_pinned_demand(tmp_path) -> N
     )
     first = service.enqueue("stable-demand", request(), workload_demand=first_demand)
     assert service.work()["status"] == "complete"
-    reused = service.enqueue("stable-demand", request(), workload_demand=changed_demand)
+    with pytest.raises(IdempotencyConflictError, match="admission evidence"):
+        service.enqueue("stable-demand", request(), workload_demand=changed_demand)
 
+    reused = service.enqueue("stable-demand", request(), workload_demand=first_demand)
     reused_admission = admission_record(service, reused.job_id)
     assert reused_admission.demand == first_demand.to_dict()
     assert reused_admission.job_id == first.job_id
@@ -1585,10 +1646,13 @@ def test_unfinished_idempotent_reuse_rejects_changed_profile(tmp_path) -> None:
         changed_service.enqueue("unfinished-profile", request(), workload_demand=demand)
 
 
-def test_legacy_reuse_without_admission_inputs_preserves_pinned_evidence(
+def test_current_reuse_without_admission_inputs_requires_exact_evidence(
     tmp_path,
 ) -> None:
-    """Omitting admission inputs keeps the historical idempotent reuse path."""
+    """Omitted heavyweight inputs cannot silently reuse a queued decision."""
+    import pytest
+
+    from media_generation.errors import IdempotencyConflictError
     from media_generation.admission import (
         build_admission_profile,
         parse_admission_policy,
@@ -1618,9 +1682,9 @@ def test_legacy_reuse_without_admission_inputs_preserves_pinned_evidence(
     ).enqueue("legacy-reuse", request(), workload_demand=demand)
     legacy_service = GenerationService(database, tmp_path / "images")
 
-    reused = legacy_service.enqueue("legacy-reuse", request())
+    with pytest.raises(IdempotencyConflictError, match="admission evidence"):
+        legacy_service.enqueue("legacy-reuse", request())
 
-    assert reused.job_id == first.job_id
     pinned = admission_record(legacy_service, first.job_id)
     assert pinned.profile_fingerprint == profile.fingerprint
     assert pinned.demand == demand.to_dict()
@@ -2147,5 +2211,77 @@ def test_workload_demand_persisted_shape_round_trips() -> None:
     )
 
     assert parse_workload_demand(original.to_dict()) == original
+
+
+def test_not_required_cpu_job_cannot_be_claimed_by_adapter_subclass(
+    tmp_path,
+) -> None:
+    """A subclass cannot reuse the exact adapter exemption at claim time."""
+    from media_generation.adapters import (
+        PROCESS_CONTAINED_CONTRACT,
+        DeterministicCpuAdapter,
+    )
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+
+    class CpuSubclass(DeterministicCpuAdapter):
+        containment_contract = PROCESS_CONTAINED_CONTRACT
+
+    database = tmp_path / "studio.sqlite3"
+    output = tmp_path / "images"
+    exact_service = GenerationService(database, output)
+    queued = exact_service.enqueue("subclass-claim", request())
+
+    subclass_report = GenerationService(
+        database,
+        output,
+        adapter=CpuSubclass(),
+    ).work()
+
+    assert subclass_report["processed"] == 0
+    snapshot = exact_service.get_provenance(queued.job_id)
+    assert snapshot["status"] == "queued"
+    assert snapshot["attempts"] == []
+    assert admission_record(exact_service, queued.job_id).decision == "not_required"
+    assert exact_service.work()["processed"] == 1
+
+
+def test_exact_cpu_retry_preserves_not_required_admission(
+    tmp_path, monkeypatch,
+) -> None:
+    """A lightweight retry retains absent capacity evidence as None."""
+    from media_generation.adapters import DeterministicCpuAdapter
+    from media_generation.errors import RetryableGenerationError
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+
+    original_generate = DeterministicCpuAdapter.generate
+    calls = 0
+
+    def fail_once(adapter, plan, stream):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableGenerationError("transient")
+        return original_generate(adapter, plan, stream)
+
+    monkeypatch.setattr(DeterministicCpuAdapter, "generate", fail_once)
+    service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "images")
+    queued = service.enqueue("cpu-retry", request(), max_attempts=2)
+
+    service.work()
+
+    admission = admission_record(service, queued.job_id)
+    assert service.get_provenance(queued.job_id)["status"] == "queued"
+    assert admission.profile is None
+    assert admission.demand is None
+    assert admission.decision == "not_required"
+    assert service.retry(queued.job_id).status == "queued"
+    assert admission_record(service, queued.job_id).decision == "not_required"
+
+    service.work()
+
+    assert service.get_provenance(queued.job_id)["status"] == "succeeded"
+    assert admission_record(service, queued.job_id).decision == "released"
 
 

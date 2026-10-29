@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -33,6 +34,12 @@ from media_generation.privacy import (
     is_privacy_compliance_record,
 )
 from media_generation.service import GenerationService
+from media_generation.admission import (
+    build_admission_profile,
+    parse_admission_policy,
+    parse_workload_demand,
+)
+from test_resource_admission import GIB, inventory_report, workload_demand
 
 
 FIXTURE_ADAPTER_ID = "fixture-local-engine-adapter-v1"
@@ -157,6 +164,25 @@ def _request(output_slot: str = "privacy") -> GenerationRequest:
         height=7,
         output_slot=output_slot,
     )
+
+
+def _heavyweight_profile():
+    """Return deterministic capacity evidence for the fixture adapter."""
+    return build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+
+
+def _heavyweight_demand():
+    """Return explicit demand that fits the privacy fixture profile."""
+    return parse_workload_demand(workload_demand())
 
 
 def test_compliant_effective_settings_produce_versioned_configuration_pass() -> None:
@@ -687,14 +713,19 @@ def test_deterministic_cpu_remains_usable_but_unverified_and_unchanged(
 
 def test_strict_admission_accepts_only_configuration_pass(tmp_path: Path) -> None:
     policy = _policy()
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
     admission_service = GenerationService(
         tmp_path / "accepted.sqlite3",
         tmp_path / "accepted-images",
         adapter=_FixturePrivacyAdapter(_compliant_configuration()),
         privacy_policy=policy,
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
-    accepted = admission_service.enqueue("accepted-privacy", _request())
+    accepted = admission_service.enqueue(
+        "accepted-privacy", _request(), workload_demand=demand
+    )
 
     assert accepted.status == "queued"
     assert (
@@ -827,24 +858,30 @@ def test_policy_version_change_cannot_reuse_stale_pass(tmp_path: Path) -> None:
     database = tmp_path / "studio.sqlite3"
     output = tmp_path / "images"
     adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
     first = GenerationService(
         database,
         output,
         adapter=adapter,
         privacy_policy=_policy(profile_version=1),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
-    first.enqueue("stale-privacy", _request("stale"))
+    first.enqueue("stale-privacy", _request("stale"), workload_demand=demand)
     changed_policy = GenerationService(
         database,
         output,
         adapter=adapter,
         privacy_policy=_policy(profile_version=2),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
 
     with pytest.raises(IdempotencyConflictError, match="privacy"):
-        changed_policy.enqueue("stale-privacy", _request("stale"))
+        changed_policy.enqueue(
+            "stale-privacy", _request("stale"), workload_demand=demand
+        )
 
 
 def test_strict_idempotent_retry_rejects_completed_unverified_job(
@@ -854,13 +891,19 @@ def test_strict_idempotent_retry_rejects_completed_unverified_job(
     database = tmp_path / "studio.sqlite3"
     output = tmp_path / "images"
     adapter = _FixturePrivacyAdapter(_compliant_configuration())
-    permissive = GenerationService(database, output, adapter=adapter)
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    permissive = GenerationService(
+        database, output, adapter=adapter, admission_profile=admission_profile
+    )
     key = "unverified-strict-retry"
 
-    queued = permissive.enqueue(key, _request("unverified"))
+    queued = permissive.enqueue(key, _request("unverified"), workload_demand=demand)
     assert queued.status == "queued"
     permissive.work(limit=1)
-    produced = permissive.enqueue(key, _request("unverified"))
+    produced = permissive.enqueue(
+        key, _request("unverified"), workload_demand=demand
+    )
     assert produced.job_id == queued.job_id
     assert produced.status == "succeeded"
     assert produced.artifact_id is not None
@@ -876,13 +919,16 @@ def test_strict_idempotent_retry_rejects_completed_unverified_job(
         adapter=adapter,
         privacy_policy=_policy(),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
     reused = None
     with pytest.raises(
         IdempotencyConflictError,
         match="privacy-compliance evidence",
     ):
-        reused = strict.enqueue(key, _request("unverified"))
+        reused = strict.enqueue(
+            key, _request("unverified"), workload_demand=demand
+        )
 
     assert reused is None
     assert strict.get_job(produced.job_id).artifact_id == produced.artifact_id
@@ -898,20 +944,24 @@ def test_worker_does_not_claim_job_with_stale_privacy_evidence(tmp_path: Path) -
     database = tmp_path / "studio.sqlite3"
     output = tmp_path / "images"
     adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
     first = GenerationService(
         database,
         output,
         adapter=adapter,
         privacy_policy=_policy(profile_version=1),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
-    first.enqueue("stale-worker", _request("worker"))
+    first.enqueue("stale-worker", _request("worker"), workload_demand=demand)
     changed_policy = GenerationService(
         database,
         output,
         adapter=adapter,
         privacy_policy=_policy(profile_version=2),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
 
     job_id = first._store.find_idempotency_key("stale-worker")[0]
@@ -938,8 +988,11 @@ def test_omitted_privacy_claim_allows_only_valid_unverified_evidence(
         adapter=passed_adapter,
         privacy_policy=_policy(),
         require_privacy_pass=True,
+        admission_profile=_heavyweight_profile(),
     )
-    passed_job = passed.enqueue("passed-privacy", _request("passed"))
+    passed_job = passed.enqueue(
+        "passed-privacy", _request("passed"), workload_demand=_heavyweight_demand()
+    )
     passed_record = passed.get_provenance(passed_job.job_id)["privacy_compliance"]
     passed_json = json.dumps(
         passed_record,
@@ -978,9 +1031,13 @@ def test_omitted_privacy_claim_allows_only_valid_unverified_evidence(
             lease_expires_at="2026-10-26T00:01:00+00:00",
             privacy_compliance_json=evidence,
             job_id=job_id,
+        allow_not_required=type(current_adapter) is DeterministicCpuAdapter,
         )
 
-    with pytest.raises(GenerationError) as raised:
+    with pytest.raises(
+        GenerationError,
+        match=f"^{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {unverified.job_id}$",
+    ):
         claim(
             service,
             adapter,
@@ -989,9 +1046,6 @@ def test_omitted_privacy_claim_allows_only_valid_unverified_evidence(
             "attempt-unverified-privacy",
             None,
         )
-    assert str(raised.value) == (
-        f"{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {unverified.job_id}"
-    )
     _assert_claim_refusal_preserved_state(service, unverified.job_id)
 
     unverified_json = json.dumps(
@@ -1026,7 +1080,10 @@ def test_omitted_privacy_claim_allows_only_valid_unverified_evidence(
     assert unverified_claim is not None
     assert unverified_claim.job_id == unverified.job_id
 
-    with pytest.raises(GenerationError) as raised:
+    with pytest.raises(
+        GenerationError,
+        match=f"^{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {passed_job.job_id}$",
+    ):
         claim(
             passed,
             passed_adapter,
@@ -1035,9 +1092,6 @@ def test_omitted_privacy_claim_allows_only_valid_unverified_evidence(
             "attempt-pass-without-evidence",
             None,
         )
-    assert str(raised.value) == (
-        f"{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {passed_job.job_id}"
-    )
     _assert_claim_refusal_preserved_state(passed, passed_job.job_id)
 
     with pytest.raises(GenerationError) as raised:
@@ -1083,6 +1137,7 @@ def test_omitted_privacy_claim_rejects_invalid_stored_evidence(
     output = tmp_path / "images"
     service = GenerationService(tmp_path / "studio.sqlite3", output, adapter=adapter)
     queued = service.enqueue("invalid-evidence", _request())
+    _, _, _, caller_evidence_json = service._current_privacy_snapshot()
     with service._store._connection(transaction=True) as connection:
         connection.execute(
             "UPDATE execution_jobs SET privacy_compliance_json = ? WHERE job_id = ?",
@@ -1109,8 +1164,9 @@ def test_omitted_privacy_claim_rejects_invalid_stored_evidence(
             containment_contract=containment_contract,
             timestamp="2026-10-26T00:00:00+00:00",
             lease_expires_at="2026-10-26T00:01:00+00:00",
-            privacy_compliance_json=None,
+        privacy_compliance_json=caller_evidence_json,
             job_id=queued.job_id,
+        allow_not_required=True,
         )
 
     assert invalid_evidence not in str(raised.value)
@@ -1143,9 +1199,10 @@ def test_omitted_privacy_claim_rejects_invalid_stored_evidence(
     _assert_claim_refusal_preserved_state(service, queued.job_id)
 
 
-def test_unverified_caller_cannot_claim_null_evidence_without_fallback(
+def test_unverified_caller_cannot_store_null_evidence_without_fallback(
     tmp_path: Path,
 ) -> None:
+    """SQLite rejects unrecorded fallback storage without changing execution state."""
     adapter = DeterministicCpuAdapter()
     output = tmp_path / "images"
     service = GenerationService(tmp_path / "studio.sqlite3", output, adapter=adapter)
@@ -1158,14 +1215,22 @@ def test_unverified_caller_cannot_claim_null_evidence_without_fallback(
         sort_keys=True,
         separators=(",", ":"),
     )
-    with service._store._connection(transaction=True) as connection:
-        connection.execute(
-            "UPDATE execution_jobs SET privacy_compliance_json = NULL WHERE job_id = ?",
-            (queued.job_id,),
-        )
-    containment_contract = trusted_containment_contract(adapter)
+    before = _execution_state_snapshot(service, queued.job_id)
 
-    with pytest.raises(GenerationError) as raised:
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        with service._store._connection(transaction=True) as connection:
+            connection.execute(
+                "UPDATE execution_jobs SET privacy_compliance_json = NULL WHERE job_id = ?",
+                (queued.job_id,),
+            )
+
+    assert _execution_state_snapshot(service, queued.job_id) == before
+    assert before["execution"]["privacy_compliance_json"] == evidence_json
+    containment_contract = trusted_containment_contract(adapter)
+    with pytest.raises(
+        GenerationError,
+        match=f"^{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {queued.job_id}$",
+    ):
         service._store.claim_next_execution(
             attempt_id="attempt-unverified-no-fallback",
             owner_id="privacy-no-fallback-worker",
@@ -1181,13 +1246,33 @@ def test_unverified_caller_cannot_claim_null_evidence_without_fallback(
             containment_contract=containment_contract,
             timestamp="2026-10-26T00:00:00+00:00",
             lease_expires_at="2026-10-26T00:01:00+00:00",
-            privacy_compliance_json=evidence_json,
-            allow_unrecorded_privacy=False,
+            privacy_compliance_json=None,
+            allow_not_required=True,
             job_id=queued.job_id,
         )
 
-    assert str(raised.value) == f"{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {queued.job_id}"
     _assert_claim_refusal_preserved_state(service, queued.job_id)
+    claim = service._store.claim_next_execution(
+        attempt_id="attempt-unverified-exact-evidence",
+        owner_id="privacy-exact-evidence-worker",
+        adapter_id=adapter.adapter_id,
+        adapter_configuration_json=json.dumps(
+            adapter.configuration,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        resolved_output_directory=str(output),
+        process_contained=containment_contract is not None,
+        containment_contract=containment_contract,
+        timestamp="2026-10-26T00:00:00+00:00",
+        lease_expires_at="2026-10-26T00:01:00+00:00",
+        privacy_compliance_json=evidence_json,
+        allow_not_required=True,
+        job_id=queued.job_id,
+    )
+    assert claim is not None
+    assert claim.job_id == queued.job_id
 
 
 @pytest.mark.parametrize(
@@ -1232,15 +1317,18 @@ def test_invalid_caller_privacy_evidence_is_rejected_before_claim(
             timestamp="2026-10-26T00:00:00+00:00",
             lease_expires_at="2026-10-26T00:01:00+00:00",
             privacy_compliance_json=caller_evidence,
-            allow_unrecorded_privacy=True,
+            allow_not_required=True,
             job_id=queued.job_id,
         )
 
     assert service.get_provenance(queued.job_id)["status"] == "queued"
 
 
-def test_pass_evidence_cannot_use_unrecorded_fallback(tmp_path: Path) -> None:
+def test_pass_evidence_requires_exact_non_null_claim(tmp_path: Path) -> None:
+    """Stored pass evidence cannot be nulled or substituted at claim time."""
     adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
     output = tmp_path / "images"
     service = GenerationService(
         tmp_path / "studio.sqlite3",
@@ -1248,8 +1336,9 @@ def test_pass_evidence_cannot_use_unrecorded_fallback(tmp_path: Path) -> None:
         adapter=adapter,
         privacy_policy=_policy(),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
-    queued = service.enqueue("pass-fallback", _request())
+    queued = service.enqueue("pass-fallback", _request(), workload_demand=demand)
     evidence = service.get_provenance(queued.job_id)["privacy_compliance"]
     evidence_json = json.dumps(
         evidence,
@@ -1257,17 +1346,25 @@ def test_pass_evidence_cannot_use_unrecorded_fallback(tmp_path: Path) -> None:
         sort_keys=True,
         separators=(",", ":"),
     )
-    with service._store._connection(transaction=True) as connection:
-        connection.execute(
-            "UPDATE execution_jobs SET privacy_compliance_json = NULL WHERE job_id = ?",
-            (queued.job_id,),
-        )
-    containment_contract = trusted_containment_contract(adapter)
+    before = _execution_state_snapshot(service, queued.job_id)
 
-    with pytest.raises(GenerationError) as raised:
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        with service._store._connection(transaction=True) as connection:
+            connection.execute(
+                "UPDATE execution_jobs SET privacy_compliance_json = NULL WHERE job_id = ?",
+                (queued.job_id,),
+            )
+
+    assert _execution_state_snapshot(service, queued.job_id) == before
+    assert before["execution"]["privacy_compliance_json"] == evidence_json
+    containment_contract = trusted_containment_contract(adapter)
+    with pytest.raises(
+        GenerationError,
+        match=f"^{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {queued.job_id}$",
+    ):
         service._store.claim_next_execution(
-            attempt_id="attempt-pass-fallback",
-            owner_id="privacy-pass-fallback-worker",
+            attempt_id="attempt-pass-null-evidence",
+            owner_id="privacy-pass-null-worker",
             adapter_id=adapter.adapter_id,
             adapter_configuration_json=json.dumps(
                 adapter.configuration,
@@ -1280,37 +1377,14 @@ def test_pass_evidence_cannot_use_unrecorded_fallback(tmp_path: Path) -> None:
             containment_contract=containment_contract,
             timestamp="2026-10-26T00:00:00+00:00",
             lease_expires_at="2026-10-26T00:01:00+00:00",
-            privacy_compliance_json=evidence_json,
-            allow_unrecorded_privacy=True,
+            privacy_compliance_json=None,
             job_id=queued.job_id,
         )
 
-    assert str(raised.value) == f"{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {queued.job_id}"
     _assert_claim_refusal_preserved_state(service, queued.job_id)
-
-
-def test_unverified_evidence_can_use_unrecorded_fallback(tmp_path: Path) -> None:
-    adapter = DeterministicCpuAdapter()
-    output = tmp_path / "images"
-    service = GenerationService(tmp_path / "studio.sqlite3", output, adapter=adapter)
-    queued = service.enqueue("unverified-fallback", _request())
-    evidence = service.get_provenance(queued.job_id)["privacy_compliance"]
-    evidence_json = json.dumps(
-        evidence,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    with service._store._connection(transaction=True) as connection:
-        connection.execute(
-            "UPDATE execution_jobs SET privacy_compliance_json = NULL WHERE job_id = ?",
-            (queued.job_id,),
-        )
-    containment_contract = trusted_containment_contract(adapter)
-
     claim = service._store.claim_next_execution(
-        attempt_id="attempt-unverified-fallback",
-        owner_id="privacy-unverified-fallback-worker",
+        attempt_id="attempt-pass-exact-evidence",
+        owner_id="privacy-pass-exact-worker",
         adapter_id=adapter.adapter_id,
         adapter_configuration_json=json.dumps(
             adapter.configuration,
@@ -1324,24 +1398,93 @@ def test_unverified_evidence_can_use_unrecorded_fallback(tmp_path: Path) -> None
         timestamp="2026-10-26T00:00:00+00:00",
         lease_expires_at="2026-10-26T00:01:00+00:00",
         privacy_compliance_json=evidence_json,
-        allow_unrecorded_privacy=True,
         job_id=queued.job_id,
     )
-
     assert claim is not None
     assert claim.job_id == queued.job_id
 
 
+def test_unverified_evidence_requires_exact_non_null_caller_evidence(
+    tmp_path: Path,
+) -> None:
+    """Unverified evidence still requires a current non-null caller record."""
+    adapter = DeterministicCpuAdapter()
+    output = tmp_path / "images"
+    service = GenerationService(tmp_path / "studio.sqlite3", output, adapter=adapter)
+    queued = service.enqueue("unverified-fallback", _request())
+    evidence = service.get_provenance(queued.job_id)["privacy_compliance"]
+    evidence_json = json.dumps(
+        evidence,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    before = _execution_state_snapshot(service, queued.job_id)
+
+    with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+        with service._store._connection(transaction=True) as connection:
+            connection.execute(
+                "UPDATE execution_jobs SET privacy_compliance_json = NULL WHERE job_id = ?",
+                (queued.job_id,),
+            )
+
+    assert _execution_state_snapshot(service, queued.job_id) == before
+    containment_contract = trusted_containment_contract(adapter)
+    claim_kwargs = {
+        "attempt_id": "attempt-unverified-null-evidence",
+        "owner_id": "privacy-unverified-null-worker",
+        "adapter_id": adapter.adapter_id,
+        "adapter_configuration_json": json.dumps(
+            adapter.configuration,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        "resolved_output_directory": str(output),
+        "process_contained": containment_contract is not None,
+        "containment_contract": containment_contract,
+        "timestamp": "2026-10-26T00:00:00+00:00",
+        "lease_expires_at": "2026-10-26T00:01:00+00:00",
+        "allow_not_required": True,
+        "job_id": queued.job_id,
+    }
+    with pytest.raises(
+        GenerationError,
+        match=f"^{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {queued.job_id}$",
+    ):
+        service._store.claim_next_execution(**claim_kwargs)
+    _assert_claim_refusal_preserved_state(service, queued.job_id)
+    with pytest.raises(
+        GenerationError,
+        match=f"^{_PRIVACY_CLAIM_EVIDENCE_ERROR}: {queued.job_id}$",
+    ):
+        service._store.claim_next_execution(
+            **claim_kwargs,
+            privacy_compliance_json=None,
+        )
+    _assert_claim_refusal_preserved_state(service, queued.job_id)
+
+    claim = service._store.claim_next_execution(
+        **claim_kwargs,
+        privacy_compliance_json=evidence_json,
+    )
+    assert claim is not None
+    assert claim.job_id == queued.job_id
 def test_worker_reevaluates_current_settings_before_claim(tmp_path: Path) -> None:
     adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
         adapter=adapter,
         privacy_policy=_policy(),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
-    queued = service.enqueue("changed-before-work", _request("changed"))
+    queued = service.enqueue(
+        "changed-before-work", _request("changed"), workload_demand=demand
+    )
     adapter.set_control(PrivacyControl.TELEMETRY, True)
 
     with pytest.raises(PrivacyComplianceError, match="fail"):
@@ -1494,6 +1637,8 @@ def test_worker_rechecks_privacy_before_each_claim_in_batch(
     tmp_path: Path,
 ) -> None:
     adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
 
     class _ConfigurationChangingService(GenerationService):
         def _execute_claim(self, *args: object, **kwargs: object) -> object:
@@ -1508,9 +1653,14 @@ def test_worker_rechecks_privacy_before_each_claim_in_batch(
         adapter=adapter,
         privacy_policy=_policy(),
         require_privacy_pass=True,
+        admission_profile=admission_profile,
     )
-    first = service.enqueue("batch-first", _request("batch-first"))
-    second = service.enqueue("batch-second", _request("batch-second"))
+    first = service.enqueue(
+        "batch-first", _request("batch-first"), workload_demand=demand
+    )
+    second = service.enqueue(
+        "batch-second", _request("batch-second"), workload_demand=demand
+    )
 
     with pytest.raises(PrivacyComplianceError):
         service.work(limit=2)

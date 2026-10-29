@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .adapters import DeterministicCpuAdapter
 from .inventory import validate_inventory_report
 from .inventory.contract import require_positive_int
 from .inventory.schema import (
@@ -95,6 +96,175 @@ class AdmissionProfile:
             "apex_evidence": self.apex_evidence,
             "fingerprint": self.fingerprint,
         }
+
+
+def parse_admission_profile(payload: object) -> AdmissionProfile:
+    """Validate one complete version-1 capacity profile.
+
+    The embedded fingerprint covers every profile field except the fingerprint
+    itself. A persisted profile is accepted only when the current schema,
+    typed field values, canonical evidence lists, and that fingerprint all
+    agree.
+    """
+    profile = _mapping(payload, label="admission profile")
+    _reject_unknown(
+        profile,
+        {
+            "schema",
+            "schema_version",
+            "status",
+            "origin",
+            "environment_fingerprint",
+            "topology",
+            "pools",
+            "shared_pool_ids",
+            "unknown_reasons",
+            "apex_qualification",
+            "apex_evidence",
+            "fingerprint",
+        },
+        label="admission profile",
+    )
+    if profile.get("schema") != PROFILE_SCHEMA:
+        raise InventoryValidationError(
+            f"admission profile schema must be {PROFILE_SCHEMA!r}"
+        )
+    if (
+        type(profile.get("schema_version")) is not int
+        or profile["schema_version"] != ADMISSION_SCHEMA_VERSION
+    ):
+        raise InventoryValidationError(
+            "unsupported admission profile schema_version"
+        )
+
+    status = _string(profile.get("status"), label="admission profile.status")
+    if status not in {"ready", "unknown"}:
+        raise InventoryValidationError(
+            "admission profile.status must be ready or unknown"
+        )
+    origin = _string(profile.get("origin"), label="admission profile.origin")
+    environment_fingerprint = _string(
+        profile.get("environment_fingerprint"),
+        label="admission profile.environment_fingerprint",
+    )
+    topology = _string(profile.get("topology"), label="admission profile.topology")
+
+    raw_pools = _list(profile.get("pools"), label="admission profile.pools")
+    pools = tuple(
+        _parse_capacity_pool(raw_pool, index=index)
+        for index, raw_pool in enumerate(raw_pools)
+    )
+    raw_shared_pool_ids = _list(
+        profile.get("shared_pool_ids"),
+        label="admission profile.shared_pool_ids",
+    )
+    shared_pool_ids = tuple(
+        _string(value, label="admission profile.shared_pool_ids item")
+        for value in raw_shared_pool_ids
+    )
+    if shared_pool_ids != tuple(sorted(set(shared_pool_ids))):
+        raise InventoryValidationError(
+            "admission profile.shared_pool_ids must be sorted and unique"
+        )
+
+    raw_unknown_reasons = _list(
+        profile.get("unknown_reasons"),
+        label="admission profile.unknown_reasons",
+    )
+    unknown_reasons = tuple(
+        _string(value, label="admission profile.unknown_reasons item")
+        for value in raw_unknown_reasons
+    )
+    if unknown_reasons != tuple(sorted(set(unknown_reasons))):
+        raise InventoryValidationError(
+            "admission profile.unknown_reasons must be sorted and unique"
+        )
+    if (status == "unknown") != bool(unknown_reasons):
+        raise InventoryValidationError(
+            "admission profile.status contradicts unknown_reasons"
+        )
+
+    apex_qualification = _string(
+        profile.get("apex_qualification"),
+        label="admission profile.apex_qualification",
+    )
+    apex_evidence = profile.get("apex_evidence")
+    if apex_qualification != "unverified" or apex_evidence is not False:
+        raise InventoryValidationError(
+            "admission profile APEX qualification must remain unverified"
+        )
+    fingerprint = _string(
+        profile.get("fingerprint"), label="admission profile.fingerprint"
+    )
+    stable_body = {
+        key: value for key, value in profile.items() if key != "fingerprint"
+    }
+    if fingerprint != digest_value(stable_body):
+        raise InventoryValidationError(
+            "admission profile fingerprint does not match its canonical evidence"
+        )
+
+    return AdmissionProfile(
+        status=status,
+        origin=origin,
+        environment_fingerprint=environment_fingerprint,
+        topology=topology,
+        pools=pools,
+        shared_pool_ids=shared_pool_ids,
+        unknown_reasons=unknown_reasons,
+        fingerprint=fingerprint,
+        apex_qualification=apex_qualification,
+        apex_evidence=apex_evidence,
+    )
+
+
+def _parse_capacity_pool(payload: object, *, index: int) -> CapacityPool:
+    """Validate one capacity pool nested in a persisted admission profile."""
+    label = f"admission profile.pools[{index}]"
+    pool = _mapping(payload, label=label)
+    _reject_unknown(
+        pool,
+        {"id", "kind", "total_bytes", "headroom_bytes", "available_bytes"},
+        label=label,
+    )
+    pool_id = _string(pool.get("id"), label=f"{label}.id")
+    if pool_id != pool_id.strip():
+        raise InventoryValidationError(f"{label}.id must not have surrounding whitespace")
+    kind = _string(pool.get("kind"), label=f"{label}.kind")
+    total_bytes = _nonnegative_byte_count(
+        pool.get("total_bytes"), label=f"{label}.total_bytes"
+    )
+    raw_headroom = pool.get("headroom_bytes")
+    raw_available = pool.get("available_bytes")
+    if raw_headroom is None:
+        headroom_bytes = None
+    else:
+        headroom_bytes = _nonnegative_byte_count(
+            raw_headroom, label=f"{label}.headroom_bytes"
+        )
+    if raw_available is None:
+        available_bytes = None
+    else:
+        available_bytes = _nonnegative_byte_count(
+            raw_available, label=f"{label}.available_bytes"
+        )
+    if (headroom_bytes is None) != (available_bytes is None):
+        raise InventoryValidationError(
+            f"{label} headroom_bytes and available_bytes must both be known or unknown"
+        )
+    if headroom_bytes is not None and available_bytes != max(
+        0, total_bytes - headroom_bytes
+    ):
+        raise InventoryValidationError(
+            f"{label}.available_bytes contradicts total_bytes and headroom_bytes"
+        )
+    return CapacityPool(
+        id=pool_id,
+        kind=kind,
+        total_bytes=total_bytes,
+        headroom_bytes=headroom_bytes,
+        available_bytes=available_bytes,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,22 +602,56 @@ def _workload_demand_out_of_range_field(demand: WorkloadDemand) -> str | None:
     return None
 
 
+def is_lightweight_cpu_adapter(adapter: object) -> bool:
+    """Return whether an adapter is the exact bundled lightweight CPU adapter.
+
+    Exact type comparison deliberately excludes subclasses. A subclass can
+    inherit the adapter ID and implementation behavior, but admission treats
+    only the bundled concrete class as trusted to run without capacity evidence.
+    """
+    return type(adapter) is DeterministicCpuAdapter
+
+
+def is_lightweight_cpu_adapter_id(adapter_id: object) -> bool:
+    """Return whether a persisted adapter ID names the lightweight CPU adapter.
+
+    Admission persistence stores ``adapter_id`` rather than an adapter instance.
+    This predicate keeps persisted boundary checks aligned with the identity
+    declared by the bundled adapter class.
+    """
+    return adapter_id == DeterministicCpuAdapter.adapter_id
+
+
 def evaluate_admission(
     profile: AdmissionProfile | None,
     demand: WorkloadDemand | None,
+    *,
+    allow_not_required: bool = False,
 ) -> AdmissionDecision:
-    """Decide whether one demand fits a pinned capacity profile.
+    """Decide whether one demand fits the pinned capacity profile.
 
-    Unknown evidence is blocked.  A known demand that exceeds any required pool
-    is denied.  A fitting demand remains queued until the existing singleton
-    SQLite claim atomically reserves the resource.
+    Unknown evidence is blocked. A known demand that exceeds a required pool
+    is denied. Fitting demand remains queued until the singleton SQLite claim
+    atomically reserves the resource. The omission exemption is available only
+    for the trusted deterministic CPU adapter; every heavyweight caller must
+    supply explicit capacity evidence.
     """
+    if not isinstance(allow_not_required, bool):
+        raise InventoryValidationError("allow_not_required must be boolean")
     if profile is None and demand is None:
+        if allow_not_required:
+            return AdmissionDecision(
+                status="not_required",
+                reason="lightweight_deterministic_cpu",
+                required_bytes={},
+                profile_fingerprint=None,
+            )
         return AdmissionDecision(
-            status="legacy",
-            reason="admission_not_configured",
+            status="blocked",
+            reason="resource_admission_required",
             required_bytes={},
             profile_fingerprint=None,
+            unknown_reasons=("admission:required",),
         )
     if profile is None:
         return AdmissionDecision(

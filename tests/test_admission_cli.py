@@ -311,6 +311,30 @@ def test_adapter_failure_details_are_redacted_from_admission_and_cli(
             ]
         )
 
+    if not admission_enabled:
+        assert main(arguments) == 2
+        captured = capsys.readouterr()
+        assert prompt_sentinel not in captured.out + captured.err
+        assert credential_sentinel not in captured.out + captured.err
+        error = json.loads(captured.err)
+        assert error["error"]["code"] == "validation_error"
+        assert (
+            error["error"]["message"]
+            == "heavyweight execution requires explicit profile and demand evidence"
+        )
+        assert not (tmp_path / "images").exists()
+        with services[0]._store._connection() as connection:
+            for table in (
+                "generation_requests",
+                "generation_jobs",
+                "execution_jobs",
+                "execution_admissions",
+            ):
+                assert connection.execute(
+                    f"SELECT count(*) FROM {table}"
+                ).fetchone()[0] == 0
+        return
+
     assert main(arguments) == 1
 
     captured = capsys.readouterr()
@@ -328,23 +352,21 @@ def test_adapter_failure_details_are_redacted_from_admission_and_cli(
         assert credential_sentinel not in json.dumps(admission.to_dict())
 
 
-def test_cli_distinguishes_unrecorded_historical_job_from_missing(
-    tmp_path: Path, capsys
-) -> None:
-    """Historical jobs without admission evidence remain inspectable by identity."""
-    from test_execution_migration import historical_running
+def test_cli_rejects_current_job_with_missing_admission(tmp_path: Path) -> None:
+    """A current job without admission evidence is structurally incompatible."""
+    import sqlite3
 
-    database, _images, job_id = historical_running(tmp_path, "t03")
+    from media_generation.service import GenerationService
 
-    assert main(["admission", "--db", str(database), "--job-id", job_id]) == 0
-    inspected = json.loads(capsys.readouterr().out)
-    assert inspected["admission"]["job_id"] == job_id
-    assert inspected["admission"]["decision"] == "unrecorded"
-    assert inspected["admission"]["reason"] == "legacy_admission_not_recorded"
+    database = tmp_path / "studio.sqlite3"
+    queued = GenerationService(database, tmp_path / "images").enqueue(
+        "missing-admission", request()
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM execution_admissions WHERE job_id = ?", (queued.job_id,)
+        )
 
-    missing = "job_" + "f" * 32
-    assert main(["admission", "--db", str(database), "--job-id", missing]) == 4
-    captured = capsys.readouterr()
-    error = json.loads(captured.err)
-    assert error["error"]["code"] == "not_found"
+    with pytest.raises(RuntimeError, match="incompatible.*no changes were made"):
+        main(["admission", "--db", str(database), "--job-id", queued.job_id])
 

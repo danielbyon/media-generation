@@ -2,61 +2,50 @@
 
 ## 1. Identity and compatibility
 
-An Artifact ID identifies an immutable logical image and its provenance. SHA-256
-identifies the encoded bytes. Two jobs or two import commands can produce the
-same bytes and still create distinct Artifact IDs. This implementation does not
-share blobs. Images remain ordinary files outside SQLite.
+An Artifact ID identifies one immutable logical image and its provenance. The
+SHA-256 value identifies the encoded bytes. Two jobs or two import commands can
+produce the same bytes and still create distinct Artifact IDs. This
+implementation does not share blobs; images remain ordinary files outside
+SQLite.
 
-On opening a T01 database, an atomic SQLite migration extends the artifact table
-to distinguish generated and imported records. Generated records retain their
-job, attempt, output slot, metadata, IDs, and public JSON shape. Imports have no
-job, attempt, or output slot; they retain the explicitly approved source root,
-relative filename, observed source identity and timestamps, and import time. The
-source is copied unchanged, including metadata and orientation. Subsequent edits
-to the source file cannot change the stored artifact. Migration backfills ordered
-reference edges from historical jobs and leaves their rows and image bytes intact.
+The current generated-artifact record retains its job, attempt, output slot,
+metadata, identity, and public JSON shape. An imported record has no generation
+job, attempt, or output slot; it retains the explicitly approved source root,
+relative filename, observed source identity and timestamps, and import time.
+The source bytes are copied unchanged, including metadata and orientation.
+Later edits to the source file cannot change the stored artifact.
 
-The current schema uses `user_version = 5`. Version 3 added execution and
-publication-authority sidecar tables while leaving the T01 and T03 record tables,
-JSON, identities, image bytes, and lineage unchanged. Publication authority is
-backfilled only for historical publications whose journal state is `committed`.
-Version 4 adds nullable privacy-compliance evidence to execution jobs. Historical
-rows remain NULL and are exposed as unverified; migration never assigns a
-retrospective privacy pass. Version 5 adds one pinned admission row per newly
-queued execution. Historical jobs remain on the compatibility path and do not
-receive fabricated capacity evidence.
-An unfinished historical journal has no trustworthy owner, epoch, lease, or
-containment evidence, so it remains quarantined. Opening a version-4 or
-version-5 database requires all of its sidecar tables and the valid singleton
-`execution_resource` row; an incomplete schema fails closed before admission.
-Migration and backfill
-execute in one transaction; failure rolls back the entire upgrade. Older
-application versions must not write an upgraded database; migration remains
-compatibility-forward for database readers.
+The current schema is `user_version = 5`. A new database creates artifact,
+lineage, publication, execution, privacy, and admission structures directly in
+one transaction. An existing database reopens through a read-only connection
+and must match the complete current schema exactly. Older, newer, partial,
+malformed-current, and nonempty unversioned databases are rejected without
+mutation. There is no migration, backfill, historical publication repair, or
+old-job compatibility path.
 
-The version 3 migration also installs a database write barrier for the legacy
-T01 and T03 tables. Every connection created by the current store registers a
-connection-local `media_generation_writer_epoch()` function, and `BEFORE
-INSERT/UPDATE` triggers on `generation_requests`, `generation_jobs`,
-`generation_attempts`, `generation_artifacts`, `artifact_edges`,
-`artifact_publications`, and `artifact_integrity` require that function to
-report epoch 5. A pre-v5 writer either lacks that function or reports an older
-recognized epoch, so its first guarded mutation aborts while `user_version`
-remains 5. Opening version 5 recreates a missing guard and upgrades a recognized
-epoch-3 or epoch-4 guard; it
-rejects any other same-name guard with a divergent definition. Opening also fails with
-an explicit diagnostic if a public job has no `execution_jobs` sidecar, because
-such a row was admitted after the migration boundary by a writer that bypassed
-the barrier.
+Every current generation job has an `execution_jobs` sidecar with non-null
+privacy-compliance evidence and exactly one `execution_admissions` row. The
+`execution_resource` singleton must contain one valid row. A job without its
+execution sidecar or admission evidence makes the database structurally
+incompatible. A `not_required` admission is accepted only for the exact bundled
+`deterministic-cpu-png-v1` adapter.
 
-This barrier protects SQLite mutations made after migration commits. It is not
-a process supervisor or an authentication boundary. Operators must stop all
-T01/T03 workers and their adapter or inference children, wait for those
-processes to exit, and take a verified database and image-tree backup before
-migrating. Already-running older writers can still change files, and a
-deliberate process could register a matching function or remove triggers.
-Restore the pre-migration database before intentionally running an older binary;
-image files and publication journals must be restored with it.
+The store also creates immutable-artifact and writer-epoch triggers. Every
+connection registers the connection-local
+`media_generation_writer_epoch()` function. `BEFORE INSERT/UPDATE` guards on
+current mutation tables require epoch 5. A client that lacks the function, or
+that reports a different epoch, aborts on its first guarded mutation.
+Validation compares every table, index, trigger definition, singleton resource
+row, execution sidecar, admission row, and exemption. Unknown objects and
+divergent same-name definitions fail closed.
+
+The writer guard protects SQLite writes after a compatible database has been
+opened. It is not a process supervisor or authentication boundary. Operators
+must stop every worker, adapter, and inference process before replacing a
+database or image tree. An already-running process can still change files, and
+a deliberately modified client can register a matching function or remove
+triggers. Preserve the incompatible database and choose a new path; delete a
+disposable development database only after explicit operator acceptance.
 
 ## 2. Approved import boundary
 
@@ -111,10 +100,9 @@ An omitted budget defaults to one only for a new job; reuse preserves the first
 admission's budget, and an explicitly different value conflicts for non-
 succeeded jobs. Succeeded reuse returns the existing artifact without changing
 its saved budget. Reuse also requires a matching resolved destination and any
-containment contract recorded by a non-succeeded job. A terminal historical
-T01/T03 failure with a NULL migrated contract keeps the legacy NULL
-compatibility exception; queued, running, and differing non-NULL contracts fail
-closed. A queued job has no attempt until a worker claim succeeds. Each database
+containment contract recorded by a non-succeeded job. The pinned admission
+profile fingerprint, workload demand, required bytes, and unknown reasons must
+also match. A queued job has no attempt until a worker claim succeeds. Each database
 contains one heavyweight resource row for its local execution domain.
 
 A claim atomically reserves that resource and creates the current attempt with a
@@ -244,20 +232,23 @@ and exits 1. The `integrity` command is an observation query and returns its
 explicit `ok`, `missing`, or `corrupt` status in JSON without changing
 historical success.
 
-For a journal-backed artifact, the recorded publication owner determines the
-verification path. The `integrity --output-dir` argument supplies inspection
-context for legacy artifacts that have no publication record. Migration keeps
-historical T01 artifact paths unchanged. A legacy artifact in a different
-directory is trusted only as direct durable-edge compatibility evidence when a
-neighbor without a publication record has a parent resolving under the configured
-output root and its bytes still match immutable metadata. The neighbor is opened
-relative to a pinned directory with no-follow checks under the configured root.
-An alias is compatibility evidence for legacy lineage, not authority for a new
-import or for an artifact owned by a publication journal. Missing or corrupt
-neighbor content and aliases that resolve elsewhere remain untrusted.
-Verification also pins and compares the alias directory identity with the
-configured root, reads the neighbor through the pinned descriptor, and reconfirms
-the alias binding before accepting evidence.
+For an artifact with a publication journal, the recorded publication owner
+and final filename determine the verification path. A path or name mismatch is
+corrupt evidence, not a reason to infer another location.
+
+For a current record without a publication row, integrity first requires that
+the stored parent is the authorized output root. A cross-root record is trusted
+only when a direct durable lineage neighbor resolves through a pinned no-follow
+directory alias to the configured root and its bytes still match immutable
+metadata. The neighbor is opened relative to the pinned directory, with no-follow
+checks on every path component. Alias evidence does not infer a path, migrate a
+row, authorize a new import, or grant ownership to an unrelated artifact.
+Missing or corrupt neighbor content and aliases that resolve elsewhere remain
+untrusted.
+
+Verification pins and compares the alias directory identity with the configured
+root, reads the neighbor through the pinned descriptor, and reconfirms the alias
+binding before accepting evidence.
 
 ## 5. Lineage
 
@@ -277,17 +268,19 @@ both directions across restarts; it is unrelated to scene hierarchy.
 
 ## 6. Validation and limits
 
-Tests construct real T01 and historical T03 databases from frozen SQL fixtures.
-They verify transactional migration, old artifact JSON, identities, lineage,
-idempotency, unfinished-journal quarantine, and version-3 singleton-resource
-completeness. Runtime images exercise the import boundary and full decoding. The
+Tests create fresh current-schema databases directly. They verify atomic
+initialization, exact object definitions, same-schema reopen, missing execution
+or admission evidence, incompatible-writer guards, and byte-for-byte
+non-mutation when older, newer, malformed-current, or nonempty unversioned
+databases are rejected. Runtime images exercise the import boundary and full
+decoding. The
 field-by-field publication fault matrix covers allocation through reply loss.
 Focused cancellation tests exercise all 14 precommit checkpoints as accepted and
 all six postcommit checkpoints as `too_late`. Recovery tests cover canceled ready
 journals before and after physical link, repeated convergence, committed-wins
 refusal, retained-final orphan reporting, owner and epoch fences, stale
 completion, immutable retry budgets, omitted cross-surface budget reuse,
-unqualified success and failure containment, malformed version-3 schemas, and
+unqualified success and failure containment, malformed current schemas, and
 successful bounded retry through the CLI.
 
 These tests establish process-crash behavior on the tested filesystem. They do

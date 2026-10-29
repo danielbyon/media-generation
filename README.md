@@ -83,12 +83,12 @@ intent, adapter identity, adapter configuration, and resolved output directory
 all match the values stored for that idempotency key. A supplied attempt budget
 must also match for a non-succeeded job. If a non-succeeded job recorded a
 containment contract, the contract must match as well. A changed value produces
-an explicit `idempotency_conflict`. A migrated terminal failed T01/T03 job whose
-persisted containment contract is NULL keeps the legacy reuse behavior after
-the other checks pass; that exception never applies to a queued or running job,
-or to two different non-NULL contracts. A matching queued job retains its
-persisted attempt budget; a matching succeeded job returns its existing artifact
-identity; and a matching failed or ambiguous job remains inspectable. An omitted
+an explicit `idempotency_conflict`. Reuse also requires the current admission
+evidence to match: profile fingerprint, workload demand, required bytes, and
+unknown reasons. Terminal jobs retain their final admission state, while a
+matching queued job retains its persisted attempt budget. A matching succeeded
+job returns its existing artifact identity; a matching failed or ambiguous job
+remains inspectable. An omitted
 `max_attempts` does not rewrite the budget chosen by the first admission, while an
 explicitly different budget conflicts for non-succeeded work. If no seed is supplied,
 the service resolves one
@@ -102,12 +102,11 @@ the durable `job_id`; it does not report a queue entry as a completed image.
 Repeating `submit` after the resource is free executes the same queued job
 without creating a second job, output slot, or attempt budget.
 
-Job JSON reports two status dimensions without removing either compatibility
-field: `status` is the legacy `generation_jobs.status` lifecycle
-(`running`, `succeeded`, or `failed`), while `execution_status` is the durable
-queue state (`queued`, `running`, `succeeded`, `failed`, `canceled`, or
+Job JSON reports two status dimensions. `status` is the underlying generation
+lifecycle (`running`, `succeeded`, or `failed`), while `execution_status` is the
+durable queue state (`queued`, `running`, `succeeded`, `failed`, `canceled`, or
 `ambiguous`). `SubmissionResult.status` and provenance's top-level `status`
-report the durable execution state. A queued job can show legacy `status`
+report the durable execution state. A queued job can therefore contain `status`
 `running` while `execution_status` is `queued`.
 
 The SQLite database has one heavyweight execution resource shared by every job.
@@ -155,29 +154,32 @@ separate from inference settings.
 The service rejects `fail` configuration. A matching compliance-capable profile
 also rejects `unverified` values automatically. Callers can set
 `require_privacy_pass=True` to reject an adapter that has no trusted profile at
-all. The bundled deterministic CPU adapter retains its legacy execution behavior
-under the default admission mode, but its provenance is explicitly `unverified`
-for real-tool privacy. A job's
-stored privacy evidence and exact configuration are required to match before an
-idempotent submission is reused or a worker claims the job.
-
+all. The bundled deterministic CPU adapter is the only adapter that receives
+the `not_required` admission outcome when no capacity documents are supplied.
+Its provenance still reports privacy as explicitly `unverified` for a real-tool
+deployment. A job's stored privacy evidence and exact adapter configuration
+must match before an idempotent submission is reused or a worker claims it.
 See [privacy compliance architecture](docs/architecture/privacy-compliance.md)
-for the profile contract,
-redaction rules, migration behavior, and real-tool integration responsibilities.
+for the profile contract, redaction rules, and integration responsibilities.
 
-Before opening an existing T01, T03, or version-4 database with this release, stop every
-older CLI worker, adapter process, and inference child that can write the
-database or image tree; wait for them to exit. Back up the database with the
-SQLite backup API or while it is offline, and preserve the image tree and
-publication roots with it. The version 4 migration adds nullable privacy
-evidence to execution jobs. Version 5 adds pinned resource-admission evidence
-and advances the writer epoch; both migrations preserve earlier rows.
-The migrations also install database guards
-that reject later writes from binaries that do not identify themselves as
-current, but a trigger cannot prove that an already-running process stopped or
-prevent it from changing files before its database commit fails. Restore the
-pre-migration database before intentionally running an older binary again; a
-version 5 database is not safely downgradeable in place.
+## Current database schema
+
+This release supports SQLite schema version 5 only. Opening a new database
+creates every table, index, trigger, singleton resource row, and the schema
+version marker in one transaction. Opening an existing database validates its
+complete structure and required admission evidence through a read-only
+connection.
+
+Older, newer, partial, malformed-current, and nonempty unversioned databases
+are rejected without changing database bytes. There is no migration, backfill,
+reset, downgrade, or prior-job compatibility path. To continue with an
+incompatible development database, preserve it and choose a new database path;
+delete a disposable database only after explicit operator acceptance.
+
+Writer-epoch triggers on durable mutation tables reject clients that do not
+identify the current writer. These guards cannot stop a process that was
+already mutating files before a schema change; operators must stop all workers
+and adapter processes before replacing a database with a compatible one.
 
 ## Capacity admission
 
@@ -197,8 +199,10 @@ media-generation admission --db ./studio.sqlite3 --job-id <job-id>
 
 The profile and demand are pinned to the queued job. Shared APU memory and
 visible VRAM aliases are never counted twice, and unknown evidence or known
-over-budget demand cannot dispatch. Existing deterministic CPU commands remain
-available without admission documents. See
+over-budget demand cannot dispatch. Every heavyweight adapter must supply the
+three admission documents; omitting them records a blocked decision that is not
+claimable. Only the exact bundled deterministic CPU adapter remains available
+without admission documents and receives `not_required`. See
 [resource admission architecture](docs/architecture/resource-admission.md) for
 the document schemas, decision states, reservation lifecycle, and evidence
 limits.
@@ -269,11 +273,12 @@ recovery, or another job's resource claim can make a later request fail instead
 of acknowledging stale eligibility. A later worker claim creates the next
 attempt only when the persisted retry policy permits it.
 
-Migration preserves historical failed work as terminal. The job keeps one
-historical attempt, a one-attempt budget, retry eligibility set to false, and a
-terminal attempt classification. Neither `work` nor `retry` replays that work.
-Reusing its idempotency key returns the existing failed job under the NULL
-containment compatibility rule above; it does not admit or execute new work.
+Only the exact current schema can be reopened. A current queued job must
+already contain valid admission evidence; `work` and `retry` do not infer or
+backfill evidence from adapter identity or older rows. A database with
+historical or admission-less work is rejected without mutation. Preserve an
+incompatible development database and select a new database path; delete a
+disposable database only after explicit operator acceptance.
 
 Cancellation of a never-claimed job is terminal and creates no attempt. An
 active attempt is fenced immediately, but cancel returns `accepted` while the
@@ -316,7 +321,8 @@ historical metadata view; use `integrity` for a current content check. Published
 content is verified before new reference use.
 
 See [publication and recovery](docs/architecture/artifact-publication.md) for
-ordering, migration, source authority, graph roles, and filesystem limitations.
+ordering, current-schema initialization, source authority, graph roles, and
+filesystem limitations.
 
 ## Current limits
 

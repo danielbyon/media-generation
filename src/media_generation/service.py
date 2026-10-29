@@ -22,6 +22,7 @@ from .admission import (
     AdmissionProfile,
     WorkloadDemand,
     evaluate_admission,
+    is_lightweight_cpu_adapter,
 )
 from .admission_store import AdmissionInspection, PendingAdmission
 from .domain import (
@@ -232,7 +233,24 @@ class GenerationService:
             workload_demand, WorkloadDemand
         ):
             raise InputValidationError("workload_demand must be a WorkloadDemand")
-        decision = evaluate_admission(self._admission_profile, workload_demand)
+        admission_missing = (
+            self._admission_profile is None or workload_demand is None
+        )
+        if admission_missing and not is_lightweight_cpu_adapter(self.adapter):
+            raise InputValidationError(
+                "heavyweight execution requires explicit profile and demand evidence"
+            )
+        if admission_missing and (
+            self._admission_profile is not None or workload_demand is not None
+        ):
+            raise InputValidationError(
+                "admission profile and workload demand must be supplied together"
+            )
+        decision = evaluate_admission(
+            self._admission_profile,
+            workload_demand,
+            allow_not_required=is_lightweight_cpu_adapter(self.adapter),
+        )
         pending_admission = PendingAdmission(
             profile=self._admission_profile,
             demand=workload_demand,
@@ -260,9 +278,7 @@ class GenerationService:
             containment_contract=trusted_containment_contract(self.adapter),
             timestamp=_now(),
             admission=pending_admission,
-            validate_admission_reuse=(
-                self._admission_profile is not None or workload_demand is not None
-            ),
+            allow_not_required=is_lightweight_cpu_adapter(self.adapter),
         )
         return queued
 
@@ -284,10 +300,11 @@ class GenerationService:
         next bounded attempt and raises ``GenerationExecutionError`` with the
         ``execution_retryable`` safe message.
         Safe CLI messages remain generic for ambiguous, retryable, and canceled
-        executions. With an admission profile, terminal failures use
-        ``execution_failed``; an admission-disabled contained terminal failure
-        retains the established local diagnostic. Incomplete publications also
-        retain their diagnostic and recovery context.
+        executions. With a capacity profile, terminal failures use
+        ``execution_failed``. The exact lightweight deterministic CPU path may
+        retain a local diagnostic only when the adapter supplies a trusted
+        containment contract. Incomplete publications also retain their
+        diagnostic and recovery context.
         """
         queued = self._admit(
             idempotency_key,
@@ -553,16 +570,13 @@ class GenerationService:
                     adapter_id=self.adapter.adapter_id,
                     adapter_configuration_json=adapter_configuration_json,
                     privacy_compliance_json=privacy_compliance_json,
-                    allow_unrecorded_privacy=(
-                        privacy_compliance.status
-                        is PrivacyComplianceStatus.UNVERIFIED
-                    ),
                     resolved_output_directory=str(self.output_directory),
                     process_contained=trusted_containment_contract(self.adapter) is not None,
                     containment_contract=trusted_containment_contract(self.adapter),
                     timestamp=timestamp,
                     lease_expires_at=_lease_deadline(self._lease),
                     job_id=job_id,
+                    allow_not_required=is_lightweight_cpu_adapter(self.adapter),
                 )
                 if claim is None:
                     break

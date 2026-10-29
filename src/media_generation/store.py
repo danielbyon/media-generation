@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
+from .admission import is_lightweight_cpu_adapter_id
 from .admission_store import (
     AdmissionInspection,
     AdmissionPersistence,
@@ -30,7 +31,7 @@ from .errors import (
     RecordNotFoundError,
     UnknownReferenceError,
 )
-from .privacy import historical_privacy_compliance, is_privacy_compliance_record
+from .privacy import is_privacy_compliance_record
 
 _RESOLVED_OUTPUT_DIRECTORY_KEY = "_resolved_output_directory"
 _MALFORMED_STORED_PRIVACY_EVIDENCE = "stored privacy-compliance evidence is malformed"
@@ -42,7 +43,7 @@ _PRIVACY_CLAIM_CONFIGURATION_REQUIRED = (
 )
 _WRITER_EPOCH = 5
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_SUPERSEDED_WRITER_EPOCHS = (3, 4)
+_CURRENT_SCHEMA_VERSION = 5
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -60,126 +61,13 @@ _WRITER_GUARDS = (
 )
 
 
-# Version 3 introduced the execution sidecars. A version 3 database may have
-# the version 4 privacy column if it was produced by an intermediate build, so
-# the privacy column is optional only while validating a version 3 schema.
-_EXECUTION_COLUMN_SPECS: dict[
-    str, dict[str, tuple[str, bool, str | None, int]]
-] = {
-    "execution_jobs": {
-        "job_id": ("TEXT", False, None, 1),
-        "status": ("TEXT", True, None, 0),
-        "max_attempts": ("INTEGER", True, None, 0),
-        "containment_contract": ("TEXT", False, None, 0),
-        "privacy_compliance_json": ("TEXT", False, None, 0),
-        "fence_epoch": ("INTEGER", True, "0", 0),
-        "current_attempt_id": ("TEXT", False, None, 0),
-        "retry_eligible": ("INTEGER", True, "0", 0),
-        "failure_message": ("TEXT", False, None, 0),
-        "resolved_plan_json": ("TEXT", True, None, 0),
-        "created_at": ("TEXT", True, None, 0),
-        "updated_at": ("TEXT", True, None, 0),
-    },
-    "execution_attempts": {
-        "attempt_id": ("TEXT", False, None, 1),
-        "job_id": ("TEXT", True, None, 0),
-        "attempt_number": ("INTEGER", True, None, 0),
-        "status": ("TEXT", True, None, 0),
-        "owner_id": ("TEXT", False, None, 0),
-        "claim_epoch": ("INTEGER", True, "0", 0),
-        "heartbeat_at": ("TEXT", False, None, 0),
-        "lease_expires_at": ("TEXT", False, None, 0),
-        "process_contained": ("INTEGER", False, None, 0),
-        "containment_contract": ("TEXT", False, None, 0),
-        "failure_class": ("TEXT", False, None, 0),
-        "termination_proven": ("INTEGER", True, "0", 0),
-        "plan_json": ("TEXT", False, None, 0),
-        "completed_at": ("TEXT", False, None, 0),
-    },
-    "execution_resource": {
-        "id": ("INTEGER", False, None, 1),
-        "state": ("TEXT", True, None, 0),
-        "job_id": ("TEXT", False, None, 0),
-        "attempt_id": ("TEXT", False, None, 0),
-        "owner_id": ("TEXT", False, None, 0),
-        "reason": ("TEXT", False, None, 0),
-        "updated_at": ("TEXT", True, None, 0),
-    },
-    "artifact_publication_authority": {
-        "publication_id": ("TEXT", False, None, 1),
-        "job_id": ("TEXT", True, None, 0),
-        "attempt_id": ("TEXT", True, None, 0),
-        "owner_id": ("TEXT", False, None, 0),
-        "claim_epoch": ("INTEGER", True, None, 0),
-        "created_at": ("TEXT", True, None, 0),
-    },
-    "execution_admissions": {
-        "job_id": ("TEXT", False, None, 1),
-        "admission_profile_json": ("TEXT", True, None, 0),
-        "workload_demand_json": ("TEXT", True, None, 0),
-        "decision": ("TEXT", True, None, 0),
-        "decision_reason": ("TEXT", True, None, 0),
-        "profile_fingerprint": ("TEXT", False, None, 0),
-        "required_bytes_json": ("TEXT", True, None, 0),
-        "unknown_reasons_json": ("TEXT", True, None, 0),
-        "reserved_bytes_json": ("TEXT", False, None, 0),
-        "created_at": ("TEXT", True, None, 0),
-        "updated_at": ("TEXT", True, None, 0),
-    },
-}
-
-_EXECUTION_FOREIGN_KEYS: dict[str, frozenset[tuple[str, str, str]]] = {
-    "execution_jobs": frozenset(
-        {
-            ("job_id", "generation_jobs", "job_id"),
-            ("current_attempt_id", "generation_attempts", "attempt_id"),
-        }
-    ),
-    "execution_attempts": frozenset(
-        {
-            ("attempt_id", "generation_attempts", "attempt_id"),
-            ("job_id", "execution_jobs", "job_id"),
-        }
-    ),
-    "execution_resource": frozenset(),
-    "artifact_publication_authority": frozenset(
-        {
-            ("publication_id", "artifact_publications", "publication_id"),
-            ("job_id", "execution_jobs", "job_id"),
-            ("attempt_id", "execution_attempts", "attempt_id"),
-        }
-    ),
-    "execution_admissions": frozenset({("job_id", "execution_jobs", "job_id")}),
-}
-
-_EXECUTION_UNIQUE_COLUMNS: dict[str, frozenset[tuple[str, ...]]] = {
-    "execution_jobs": frozenset(),
-    "execution_attempts": frozenset({("job_id", "attempt_number")}),
-    "execution_resource": frozenset(),
-    "artifact_publication_authority": frozenset(),
-    "execution_admissions": frozenset(),
-}
-
-_EXECUTION_INDEXES: dict[str, dict[str, tuple[str, ...]]] = {
-    "execution_jobs": {
-        "execution_jobs_queued_idx": ("status", "created_at", "job_id"),
-    },
-    "execution_attempts": {
-        "execution_attempts_running_idx": ("job_id", "status"),
-    },
-    "execution_resource": {},
-    "artifact_publication_authority": {},
-    "execution_admissions": {
-        "execution_admissions_dispatch_idx": ("decision", "created_at", "job_id"),
-    },
-}
-
-_EXECUTION_JOBS_V3_DDL = """CREATE TABLE execution_jobs (
+_EXECUTION_JOBS_DDL = """CREATE TABLE execution_jobs (
     job_id TEXT PRIMARY KEY REFERENCES generation_jobs(job_id),
     status TEXT NOT NULL CHECK (status IN (
         'queued','running','succeeded','failed','canceled','ambiguous')),
     max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
     containment_contract TEXT,
+    privacy_compliance_json TEXT NOT NULL,
     fence_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fence_epoch >= 0),
     current_attempt_id TEXT REFERENCES generation_attempts(attempt_id),
     retry_eligible INTEGER NOT NULL DEFAULT 0 CHECK (retry_eligible IN (0,1)),
@@ -187,38 +75,6 @@ _EXECUTION_JOBS_V3_DDL = """CREATE TABLE execution_jobs (
     resolved_plan_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
-)"""
-
-_EXECUTION_JOBS_V4_DDL = """CREATE TABLE execution_jobs (
-    job_id TEXT PRIMARY KEY REFERENCES generation_jobs(job_id),
-    status TEXT NOT NULL CHECK (status IN (
-        'queued','running','succeeded','failed','canceled','ambiguous')),
-    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
-    containment_contract TEXT,
-    privacy_compliance_json TEXT,
-    fence_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fence_epoch >= 0),
-    current_attempt_id TEXT REFERENCES generation_attempts(attempt_id),
-    retry_eligible INTEGER NOT NULL DEFAULT 0 CHECK (retry_eligible IN (0,1)),
-    failure_message TEXT,
-    resolved_plan_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-)"""
-
-_EXECUTION_JOBS_V4_UPGRADE_DDL = """CREATE TABLE execution_jobs (
-    job_id TEXT PRIMARY KEY REFERENCES generation_jobs(job_id),
-    status TEXT NOT NULL CHECK (status IN (
-        'queued','running','succeeded','failed','canceled','ambiguous')),
-    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
-    containment_contract TEXT,
-    fence_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fence_epoch >= 0),
-    current_attempt_id TEXT REFERENCES generation_attempts(attempt_id),
-    retry_eligible INTEGER NOT NULL DEFAULT 0 CHECK (retry_eligible IN (0,1)),
-    failure_message TEXT,
-    resolved_plan_json TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    privacy_compliance_json TEXT
 )"""
 
 _EXECUTION_ATTEMPTS_DDL = """CREATE TABLE execution_attempts (
@@ -267,7 +123,7 @@ _EXECUTION_ADMISSIONS_DDL = """CREATE TABLE execution_admissions (
     admission_profile_json TEXT NOT NULL,
     workload_demand_json TEXT NOT NULL,
     decision TEXT NOT NULL CHECK (decision IN (
-        'queued','blocked','denied','reserved','released','quarantined','canceled','legacy'
+'queued','not_required','blocked','denied','reserved','released','quarantined','canceled'
     )),
     decision_reason TEXT NOT NULL,
     profile_fingerprint TEXT,
@@ -287,66 +143,219 @@ _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL = """CREATE INDEX execution_attempts_runni
 _EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL = """CREATE INDEX execution_admissions_dispatch_idx
     ON execution_admissions(decision, created_at, job_id)"""
 
-# Compare the complete table definition so CHECK constraints, foreign-key
-# actions, and table options are all part of the versioned contract. Version 3
-# has one known intermediate variant: it contains the version 4 privacy column.
-# Version 4 also permits the column appended by the additive ALTER TABLE path.
-_EXECUTION_TABLE_DDL: dict[int, dict[str, tuple[str, ...]]] = {
-    3: {
-        "execution_jobs": (
-            _EXECUTION_JOBS_V3_DDL,
-            _EXECUTION_JOBS_V4_DDL,
-            _EXECUTION_JOBS_V4_UPGRADE_DDL,
-        ),
-        "execution_attempts": (_EXECUTION_ATTEMPTS_DDL,),
-        "execution_resource": (_EXECUTION_RESOURCE_DDL,),
-        "artifact_publication_authority": (
-            _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
-        ),
-    },
-    4: {
-        "execution_jobs": (
-            _EXECUTION_JOBS_V4_DDL,
-            _EXECUTION_JOBS_V4_UPGRADE_DDL,
-        ),
-        "execution_attempts": (_EXECUTION_ATTEMPTS_DDL,),
-        "execution_resource": (_EXECUTION_RESOURCE_DDL,),
-        "artifact_publication_authority": (
-            _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
-        ),
-    },
-    5: {
-        "execution_jobs": (
-            _EXECUTION_JOBS_V4_DDL,
-            _EXECUTION_JOBS_V4_UPGRADE_DDL,
-        ),
-        "execution_attempts": (_EXECUTION_ATTEMPTS_DDL,),
-        "execution_resource": (_EXECUTION_RESOURCE_DDL,),
-        "artifact_publication_authority": (
-            _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
-        ),
-        "execution_admissions": (_EXECUTION_ADMISSIONS_DDL,),
-    },
+_GENERATION_REQUESTS_DDL = """CREATE TABLE generation_requests (
+    request_id TEXT PRIMARY KEY,
+    canonical_json TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)"""
+
+_GENERATION_JOBS_DDL = """CREATE TABLE generation_jobs (
+    job_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE REFERENCES generation_requests(request_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    request_digest TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    adapter_id TEXT NOT NULL,
+    adapter_configuration_json TEXT NOT NULL,
+    resolved_prompt TEXT NOT NULL,
+    resolved_seed INTEGER NOT NULL,
+    validated_reference_ids_json TEXT NOT NULL,
+    output_slot TEXT NOT NULL,
+    output_slot_id TEXT NOT NULL UNIQUE,
+    effective_parameters_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)"""
+
+_GENERATION_ATTEMPTS_DDL = """CREATE TABLE generation_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES generation_jobs(job_id),
+    attempt_number INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
+    adapter_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    error_message TEXT,
+    UNIQUE (job_id, attempt_number),
+    UNIQUE (job_id, attempt_id)
+)"""
+
+_GENERATION_ARTIFACTS_DDL = """CREATE TABLE generation_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    job_id TEXT REFERENCES generation_jobs(job_id),
+    attempt_id TEXT REFERENCES generation_attempts(attempt_id),
+    output_slot_id TEXT,
+    path TEXT NOT NULL UNIQUE,
+    media_type TEXT NOT NULL,
+    image_format TEXT NOT NULL,
+    width INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    file_size INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('generated', 'imported')),
+    import_provenance_json TEXT,
+    CHECK ((origin = 'generated' AND job_id IS NOT NULL
+        AND attempt_id IS NOT NULL AND output_slot_id IS NOT NULL
+        AND import_provenance_json IS NULL)
+        OR (origin = 'imported' AND job_id IS NULL
+        AND attempt_id IS NULL AND output_slot_id IS NULL
+        AND import_provenance_json IS NOT NULL)),
+    UNIQUE (job_id, output_slot_id),
+    FOREIGN KEY (job_id, attempt_id)
+        REFERENCES generation_attempts(job_id, attempt_id)
+)"""
+
+_ARTIFACT_EDGES_DDL = """CREATE TABLE artifact_edges (
+    source_id TEXT NOT NULL REFERENCES generation_artifacts(artifact_id),
+    target_id TEXT NOT NULL REFERENCES generation_artifacts(artifact_id),
+    role TEXT NOT NULL CHECK (
+        role IN ('reference','source','derivation','inspiration')),
+    position INTEGER NOT NULL CHECK (position >= 0),
+    CHECK (source_id != target_id),
+    PRIMARY KEY (target_id, position),
+    UNIQUE (source_id, target_id, role)
+)"""
+
+_ARTIFACT_PUBLICATIONS_DDL = """CREATE TABLE artifact_publications (
+    publication_id TEXT PRIMARY KEY,
+    artifact_id TEXT NOT NULL UNIQUE,
+    root TEXT NOT NULL,
+    root_dev INTEGER NOT NULL,
+    root_ino INTEGER NOT NULL,
+    root_token TEXT NOT NULL,
+    stage_name TEXT NOT NULL UNIQUE,
+    stage_dev INTEGER,
+    stage_ino INTEGER,
+    final_name TEXT,
+    state TEXT NOT NULL CHECK (
+        state IN ('allocated','ready','committed','abandoned')),
+    job_id TEXT,
+    attempt_id TEXT,
+    artifact_json TEXT,
+    sources_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    error TEXT
+)"""
+
+_ARTIFACT_INTEGRITY_DDL = """CREATE TABLE artifact_integrity (
+    artifact_id TEXT PRIMARY KEY REFERENCES generation_artifacts(artifact_id),
+    status TEXT NOT NULL CHECK (status IN ('ok','missing','corrupt')),
+    checked_at TEXT NOT NULL,
+    detail TEXT
+)"""
+
+_GENERATION_ARTIFACTS_JOB_INDEX_DDL = """CREATE INDEX generation_artifacts_job_idx
+    ON generation_artifacts(job_id)"""
+
+_GENERATION_REQUESTS_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER generation_requests_immutable_update
+BEFORE UPDATE ON generation_requests
+BEGIN
+    SELECT RAISE(ABORT, 'generation requests are immutable');
+END"""
+
+_GENERATION_REQUESTS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER generation_requests_immutable_delete
+BEFORE DELETE ON generation_requests
+BEGIN
+    SELECT RAISE(ABORT, 'generation requests are immutable');
+END"""
+
+_GENERATION_ARTIFACTS_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER generation_artifacts_immutable_update
+BEFORE UPDATE ON generation_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'generation artifacts are immutable');
+END"""
+
+_GENERATION_ARTIFACTS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER generation_artifacts_immutable_delete
+BEFORE DELETE ON generation_artifacts
+BEGIN
+    SELECT RAISE(ABORT, 'generation artifacts are immutable');
+END"""
+
+_ARTIFACT_EDGES_ACYCLIC_DDL = """CREATE TRIGGER artifact_edges_acyclic
+BEFORE INSERT ON artifact_edges
+BEGIN
+    SELECT RAISE(ABORT, 'artifact lineage cycle') WHERE EXISTS (
+        WITH RECURSIVE descendants(id) AS (
+            SELECT target_id FROM artifact_edges
+            WHERE source_id = NEW.target_id
+            UNION
+            SELECT e.target_id FROM artifact_edges e JOIN descendants d
+                ON e.source_id = d.id
+        )
+        SELECT 1 FROM descendants WHERE id = NEW.source_id
+    );
+END"""
+
+_ARTIFACT_EDGES_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER artifact_edges_immutable_update
+BEFORE UPDATE ON artifact_edges
+BEGIN
+    SELECT RAISE(ABORT, 'artifact edges are immutable');
+END"""
+
+_ARTIFACT_EDGES_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER artifact_edges_immutable_delete
+BEFORE DELETE ON artifact_edges
+BEGIN
+    SELECT RAISE(ABORT, 'artifact edges are immutable');
+END"""
+
+_ARTIFACT_EDGES_SEALED_DDL = """CREATE TRIGGER artifact_edges_sealed
+BEFORE INSERT ON artifact_edges
+WHEN NOT EXISTS (
+    SELECT 1 FROM artifact_publications
+    WHERE artifact_id = NEW.target_id AND state = 'ready'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'artifact lineage is sealed');
+END"""
+
+_EXECUTION_TABLE_DDL: dict[str, str] = {
+    "execution_jobs": _EXECUTION_JOBS_DDL,
+    "execution_attempts": _EXECUTION_ATTEMPTS_DDL,
+    "execution_resource": _EXECUTION_RESOURCE_DDL,
+    "artifact_publication_authority": _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
+    "execution_admissions": _EXECUTION_ADMISSIONS_DDL,
 }
 
-_EXECUTION_TABLES_BY_VERSION: dict[int, frozenset[str]] = {
-    3: frozenset(
-        {
-            "execution_jobs",
-            "execution_attempts",
-            "execution_resource",
-            "artifact_publication_authority",
-        }
+
+_CURRENT_TABLE_DDL: dict[str, str] = {
+    "generation_requests": _GENERATION_REQUESTS_DDL,
+    "generation_jobs": _GENERATION_JOBS_DDL,
+    "generation_attempts": _GENERATION_ATTEMPTS_DDL,
+    "generation_artifacts": _GENERATION_ARTIFACTS_DDL,
+    "artifact_edges": _ARTIFACT_EDGES_DDL,
+    "artifact_publications": _ARTIFACT_PUBLICATIONS_DDL,
+    "artifact_integrity": _ARTIFACT_INTEGRITY_DDL,
+    **_EXECUTION_TABLE_DDL,
+}
+
+_CURRENT_TABLES = frozenset(_CURRENT_TABLE_DDL)
+
+_CURRENT_INDEX_DDL: dict[str, str] = {
+    "generation_artifacts_job_idx": _GENERATION_ARTIFACTS_JOB_INDEX_DDL,
+    "execution_jobs_queued_idx": _EXECUTION_JOBS_QUEUED_INDEX_DDL,
+    "execution_attempts_running_idx": _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
+    "execution_admissions_dispatch_idx": _EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL,
+}
+
+_STATIC_TRIGGER_DDL: dict[str, str] = {
+    "generation_requests_immutable_update": (
+        _GENERATION_REQUESTS_IMMUTABLE_UPDATE_DDL
     ),
-    4: frozenset(
-        {
-            "execution_jobs",
-            "execution_attempts",
-            "execution_resource",
-            "artifact_publication_authority",
-        }
+    "generation_requests_immutable_delete": (
+        _GENERATION_REQUESTS_IMMUTABLE_DELETE_DDL
     ),
-    5: frozenset(_EXECUTION_TABLE_DDL[5]),
+    "generation_artifacts_immutable_update": (
+        _GENERATION_ARTIFACTS_IMMUTABLE_UPDATE_DDL
+    ),
+    "generation_artifacts_immutable_delete": (
+        _GENERATION_ARTIFACTS_IMMUTABLE_DELETE_DDL
+    ),
+    "artifact_edges_acyclic": _ARTIFACT_EDGES_ACYCLIC_DDL,
+    "artifact_edges_immutable_update": _ARTIFACT_EDGES_IMMUTABLE_UPDATE_DDL,
+    "artifact_edges_immutable_delete": _ARTIFACT_EDGES_IMMUTABLE_DELETE_DDL,
+    "artifact_edges_sealed": _ARTIFACT_EDGES_SEALED_DDL,
 }
 
 
@@ -403,14 +412,19 @@ class ExecutionClaim:
 class SQLiteStore:
     """Store generation records in a local SQLite database.
 
-    Each operation owns a short-lived connection. A pending job and its first
-    attempt commit together before the service invokes an adapter.
+    New databases use the complete current schema. Existing databases are
+    opened only after read-only structural validation confirms that exact
+    schema; incompatible databases are rejected without mutation. Each
+    operation owns a short-lived connection.
     """
 
     def __init__(self, database_path: Path) -> None:
         self.database_path = database_path.expanduser().resolve()
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        if self.database_path.exists() and self.database_path.stat().st_size:
+            self._validate_existing_database()
+        else:
+            self._initialize()
 
     @contextmanager
     def _connection(
@@ -446,335 +460,65 @@ class SQLiteStore:
             connection.close()
 
     def _initialize(self) -> None:
-        """Create or upgrade the complete schema in one transaction."""
+        """Create the complete current schema in one SQLite transaction."""
         with self._connection(transaction=True) as connection:
-            self._execute_script(
-                connection,
-                """
-                CREATE TABLE IF NOT EXISTS generation_requests (
-                    request_id TEXT PRIMARY KEY,
-                    canonical_json TEXT NOT NULL,
-                    request_digest TEXT NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS generation_jobs (
-                    job_id TEXT PRIMARY KEY,
-                    request_id TEXT NOT NULL UNIQUE REFERENCES generation_requests(request_id),
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    request_digest TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
-                    adapter_id TEXT NOT NULL,
-                    adapter_configuration_json TEXT NOT NULL,
-                    resolved_prompt TEXT NOT NULL,
-                    resolved_seed INTEGER NOT NULL,
-                    validated_reference_ids_json TEXT NOT NULL,
-                    output_slot TEXT NOT NULL,
-                    output_slot_id TEXT NOT NULL UNIQUE,
-                    effective_parameters_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS generation_attempts (
-                    attempt_id TEXT PRIMARY KEY,
-                    job_id TEXT NOT NULL REFERENCES generation_jobs(job_id),
-                    attempt_number INTEGER NOT NULL,
-                    status TEXT NOT NULL CHECK (status IN ('running', 'succeeded', 'failed')),
-                    adapter_id TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    error_message TEXT,
-                    UNIQUE (job_id, attempt_number),
-                    UNIQUE (job_id, attempt_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS generation_artifacts (
-                    artifact_id TEXT PRIMARY KEY,
-                    job_id TEXT NOT NULL REFERENCES generation_jobs(job_id),
-                    attempt_id TEXT NOT NULL REFERENCES generation_attempts(attempt_id),
-                    output_slot_id TEXT NOT NULL,
-                    path TEXT NOT NULL UNIQUE,
-                    media_type TEXT NOT NULL,
-                    image_format TEXT NOT NULL,
-                    width INTEGER NOT NULL,
-                    height INTEGER NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    UNIQUE (job_id, output_slot_id),
-                    FOREIGN KEY (job_id, attempt_id)
-                        REFERENCES generation_attempts(job_id, attempt_id)
-                );
-
-                CREATE INDEX IF NOT EXISTS generation_artifacts_job_idx
-                    ON generation_artifacts(job_id);
-
-                CREATE TRIGGER IF NOT EXISTS generation_requests_immutable_update
-                BEFORE UPDATE ON generation_requests
-                BEGIN
-                    SELECT RAISE(ABORT, 'generation requests are immutable');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS generation_requests_immutable_delete
-                BEFORE DELETE ON generation_requests
-                BEGIN
-                    SELECT RAISE(ABORT, 'generation requests are immutable');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS generation_artifacts_immutable_update
-                BEFORE UPDATE ON generation_artifacts
-                BEGIN
-                    SELECT RAISE(ABORT, 'generation artifacts are immutable');
-                END;
-
-                CREATE TRIGGER IF NOT EXISTS generation_artifacts_immutable_delete
-                BEFORE DELETE ON generation_artifacts
-                BEGIN
-                    SELECT RAISE(ABORT, 'generation artifacts are immutable');
-                END;
-                """
-            )
-
-            self._migrate_artifacts(connection)
-            self._migrate_privacy(connection)
-            self._migrate_admission(connection)
-
-    @staticmethod
-    def _execute_script(connection: sqlite3.Connection, script: str) -> None:
-        """Execute a SQL script without SQLite's implicit transaction commit."""
-        statement = ""
-        for line in script.splitlines(keepends=True):
-            statement += line
-            if sqlite3.complete_statement(statement):
-                if statement.strip():
-                    connection.execute(statement)
-                statement = ""
-        if statement.strip():
-            connection.execute(statement)
-
-    def _migrate_artifacts(self, connection: sqlite3.Connection) -> None:
-        """Upgrade the original T01 schema atomically without rewriting its records.
-
-        Imported artifacts share the same identity namespace and file metadata,
-        but have no generation job or attempt. Existing generated JSON stays
-        unchanged; the discriminator is a persistence detail for those records.
-        """
-        with nullcontext(connection) as connection:
-            columns = {row["name"] for row in connection.execute(
-                "PRAGMA table_info(generation_artifacts)"
-            )}
-            if "origin" not in columns:
-                connection.execute("""CREATE TABLE generation_artifacts_v2 (
-                    artifact_id TEXT PRIMARY KEY,
-                    job_id TEXT REFERENCES generation_jobs(job_id),
-                    attempt_id TEXT REFERENCES generation_attempts(attempt_id),
-                    output_slot_id TEXT,
-                    path TEXT NOT NULL UNIQUE,
-                    media_type TEXT NOT NULL, image_format TEXT NOT NULL,
-                    width INTEGER NOT NULL, height INTEGER NOT NULL,
-                    file_size INTEGER NOT NULL, sha256 TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    origin TEXT NOT NULL CHECK (origin IN ('generated', 'imported')),
-                    import_provenance_json TEXT,
-                    CHECK ((origin = 'generated' AND job_id IS NOT NULL
-                        AND attempt_id IS NOT NULL AND output_slot_id IS NOT NULL
-                        AND import_provenance_json IS NULL)
-                        OR (origin = 'imported' AND job_id IS NULL
-                        AND attempt_id IS NULL AND output_slot_id IS NULL
-                        AND import_provenance_json IS NOT NULL)),
-                    UNIQUE (job_id, output_slot_id),
-                    FOREIGN KEY (job_id, attempt_id)
-                        REFERENCES generation_attempts(job_id, attempt_id)
-                )""")
-                connection.execute("""INSERT INTO generation_artifacts_v2
-                    SELECT *, 'generated', NULL FROM generation_artifacts""")
-                connection.execute("DROP TABLE generation_artifacts")
-                connection.execute("ALTER TABLE generation_artifacts_v2 RENAME TO generation_artifacts")
-            connection.execute("""CREATE INDEX IF NOT EXISTS generation_artifacts_job_idx
-                ON generation_artifacts(job_id)""")
-            for operation in ("UPDATE", "DELETE"):
-                connection.execute(f"""CREATE TRIGGER IF NOT EXISTS
-                    generation_artifacts_immutable_{operation.lower()}
-                    BEFORE {operation} ON generation_artifacts BEGIN
-                    SELECT RAISE(ABORT, 'generation artifacts are immutable'); END""")
-            connection.execute("""CREATE TABLE IF NOT EXISTS artifact_edges (
-                source_id TEXT NOT NULL REFERENCES generation_artifacts(artifact_id),
-                target_id TEXT NOT NULL REFERENCES generation_artifacts(artifact_id),
-                role TEXT NOT NULL CHECK (role IN ('reference','source','derivation','inspiration')),
-                position INTEGER NOT NULL CHECK (position >= 0),
-                CHECK (source_id != target_id),
-                PRIMARY KEY (target_id, position),
-                UNIQUE (source_id, target_id, role)
-            )""")
-            connection.execute("""CREATE TRIGGER IF NOT EXISTS artifact_edges_acyclic
-                BEFORE INSERT ON artifact_edges BEGIN
-                SELECT RAISE(ABORT, 'artifact lineage cycle') WHERE EXISTS (
-                    WITH RECURSIVE descendants(id) AS (
-                        SELECT target_id FROM artifact_edges WHERE source_id = NEW.target_id
-                        UNION SELECT e.target_id FROM artifact_edges e JOIN descendants d
-                        ON e.source_id = d.id
-                    ) SELECT 1 FROM descendants WHERE id = NEW.source_id
-                ); END""")
-            for operation in ("UPDATE", "DELETE"):
-                connection.execute(f"""CREATE TRIGGER IF NOT EXISTS
-                    artifact_edges_immutable_{operation.lower()}
-                    BEFORE {operation} ON artifact_edges BEGIN
-                    SELECT RAISE(ABORT, 'artifact edges are immutable'); END""")
-            connection.execute("""CREATE TABLE IF NOT EXISTS artifact_publications (
-                publication_id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL UNIQUE,
-                root TEXT NOT NULL, root_dev INTEGER NOT NULL, root_ino INTEGER NOT NULL,
-                root_token TEXT NOT NULL,
-                stage_name TEXT NOT NULL UNIQUE, stage_dev INTEGER, stage_ino INTEGER,
-                final_name TEXT, state TEXT NOT NULL
-                    CHECK (state IN ('allocated','ready','committed','abandoned')),
-                job_id TEXT, attempt_id TEXT, artifact_json TEXT, sources_json TEXT NOT NULL,
-                created_at TEXT NOT NULL, error TEXT
-            )""")
-            connection.execute("""CREATE TABLE IF NOT EXISTS artifact_integrity (
-                artifact_id TEXT PRIMARY KEY REFERENCES generation_artifacts(artifact_id),
-                status TEXT NOT NULL CHECK (status IN ('ok','missing','corrupt')),
-                checked_at TEXT NOT NULL, detail TEXT
-            )""")
-            # T01 already froze reference membership and order in each job.
-            # Backfill these historical relationships once, in the migration.
-            version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version < 2:
-                for row in connection.execute("""SELECT a.artifact_id,
-                    j.validated_reference_ids_json FROM generation_artifacts a
-                    JOIN generation_jobs j ON j.job_id = a.job_id""").fetchall():
-                    self._insert_sources(connection, row["artifact_id"], tuple(
-                        ArtifactSource(item) for item in json.loads(row["validated_reference_ids_json"])
-                    ))
-                connection.execute("PRAGMA user_version = 2")
-            connection.execute("""CREATE TRIGGER IF NOT EXISTS artifact_edges_sealed
-                BEFORE INSERT ON artifact_edges
-                WHEN NOT EXISTS (SELECT 1 FROM artifact_publications
-                    WHERE artifact_id = NEW.target_id AND state = 'ready')
-                BEGIN SELECT RAISE(ABORT, 'artifact lineage is sealed'); END""")
-            self._migrate_execution(connection)
-
-    def _migrate_execution(self, connection: sqlite3.Connection) -> None:
-        """Add version-3 execution sidecars without rewriting historical rows.
-
-        T01 and T03 tables retain their original columns, row identities, JSON,
-        and image bytes. Runtime queue state, attempt ownership, and publication
-        authority live in dependent tables so historical ``SELECT *`` behavior
-        remains compatible.
-        """
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 5:
-            raise RuntimeError(f"unsupported database schema version: {version}")
-        if version in {3, 4, 5}:
-            self._validate_execution_schema(connection, version=version)
-            resource = connection.execute(
-                "SELECT state FROM execution_resource WHERE id = 1"
+            existing_objects = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
             ).fetchone()
-            if resource is None or resource["state"] not in {
-                "available",
-                "claimed",
-                "quarantined",
-            }:
-                raise RuntimeError(
-                    "database schema version 3 incomplete; "
-                    "execution_resource singleton row is missing or invalid"
-                )
-            self._install_writer_guards(connection)
-            self._assert_all_jobs_have_execution_state(connection)
-            return
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if existing_objects is not None or version:
+                self._validate_current_schema(connection)
+                return
 
-        statements = (
-            _EXECUTION_JOBS_V4_DDL,
-            _EXECUTION_JOBS_QUEUED_INDEX_DDL,
-            _EXECUTION_ATTEMPTS_DDL,
-            _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
-            _EXECUTION_RESOURCE_DDL,
-            _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
-        )
-        for statement in statements:
-            connection.execute(statement)
-
-        timestamp = connection.execute(
-            "SELECT min(created_at) FROM generation_jobs"
-        ).fetchone()[0] or "1970-01-01T00:00:00+00:00"
-        jobs = connection.execute("SELECT * FROM generation_jobs ORDER BY created_at, job_id").fetchall()
-        quarantined = False
-        for job in jobs:
-            references = self._references_for_job(connection, job["job_id"])
-            plan_json = self._resolved_plan_json(job, references)
-            current = connection.execute(
-                """SELECT attempt_id FROM generation_attempts
-                   WHERE job_id = ? ORDER BY attempt_number DESC LIMIT 1""",
-                (job["job_id"],),
-            ).fetchone()
+            for definition in _CURRENT_TABLE_DDL.values():
+                connection.execute(definition)
+            for definition in _CURRENT_INDEX_DDL.values():
+                connection.execute(definition)
             connection.execute(
-                """INSERT INTO execution_jobs
-                   (job_id,status,max_attempts,fence_epoch,current_attempt_id,
-                    retry_eligible,failure_message,resolved_plan_json,created_at,updated_at)
-                   VALUES (?,?,1,0,?,0,NULL,?,?,?)""",
-                (
-                    job["job_id"],
-                    job["status"],
-                    None if current is None else current["attempt_id"],
-                    plan_json,
-                    job["created_at"],
-                    job["updated_at"],
-                ),
+                "INSERT INTO execution_resource "
+                "(id, state, job_id, attempt_id, owner_id, reason, updated_at) "
+                "VALUES (1, 'available', NULL, NULL, NULL, NULL, ?)",
+                ("1970-01-01T00:00:00+00:00",),
             )
-            attempts = connection.execute(
-                "SELECT * FROM generation_attempts WHERE job_id = ? ORDER BY attempt_number",
-                (job["job_id"],),
-            ).fetchall()
-            for attempt in attempts:
-                running = attempt["status"] == "running"
-                quarantined = quarantined or running
-                connection.execute(
-                    """INSERT INTO execution_attempts
-                       (attempt_id,job_id,attempt_number,status,owner_id,claim_epoch,
-                        heartbeat_at,lease_expires_at,process_contained,failure_class,
-                        termination_proven,plan_json,completed_at)
-                       VALUES (?,?,?,?,NULL,0,NULL,NULL,NULL,?,?,?,?)""",
-                    (
-                        attempt["attempt_id"],
-                        attempt["job_id"],
-                        attempt["attempt_number"],
-                        attempt["status"],
-                        "ambiguous" if running else (None if attempt["status"] == "succeeded" else "terminal"),
-                        0,
-                        plan_json,
-                        attempt["finished_at"],
-                    ),
-                )
+            for definition in _STATIC_TRIGGER_DDL.values():
+                connection.execute(definition)
+            self._install_writer_guards(connection)
+            connection.execute(f"PRAGMA user_version = {_CURRENT_SCHEMA_VERSION}")
+            self._validate_current_schema(connection)
 
-        connection.execute(
-            """INSERT INTO execution_resource
-               (id,state,job_id,attempt_id,owner_id,reason,updated_at)
-               VALUES (1,?,NULL,NULL,NULL,?,?)""",
-            (
-                "quarantined" if quarantined else "available",
-                "historical unfinished attempt has no trusted containment proof"
-                if quarantined else None,
-                timestamp,
-            ),
+    def _validate_existing_database(self) -> None:
+        """Validate an existing database through a read-only connection."""
+        connection = sqlite3.connect(
+            f"{self.database_path.as_uri()}?mode=ro",
+            timeout=30,
+            isolation_level=None,
+            uri=True,
         )
-        connection.execute(
-            """INSERT INTO artifact_publication_authority
-               (publication_id,job_id,attempt_id,owner_id,claim_epoch,created_at)
-               SELECT publication_id,job_id,attempt_id,NULL,0,created_at
-               FROM artifact_publications
-               WHERE state = 'committed'
-                 AND job_id IS NOT NULL AND attempt_id IS NOT NULL"""
+        connection.row_factory = sqlite3.Row
+        connection.create_function(
+            _WRITER_EPOCH_FUNCTION,
+            0,
+            lambda: _WRITER_EPOCH,
+            deterministic=True,
         )
-        self._validate_execution_schema(connection, version=3)
-        self._install_writer_guards(connection)
-        self._assert_all_jobs_have_execution_state(connection)
-        connection.execute("PRAGMA user_version = 3")
+        try:
+            connection.execute("PRAGMA foreign_keys = ON")
+            self._validate_current_schema(connection)
+        except sqlite3.DatabaseError as error:
+            raise RuntimeError(
+                "database cannot be opened as a current media-generation "
+                "schema; no changes were made"
+            ) from error
+        finally:
+            connection.close()
 
     @staticmethod
-    def _incomplete_schema(version: int, detail: str) -> RuntimeError:
-        """Build a stable error for a schema that cannot satisfy its version."""
+    def _incomplete_schema(detail: str) -> RuntimeError:
+        """Build an actionable error for a non-current database layout."""
         return RuntimeError(
-            f"database schema version {version} incomplete; {detail}"
+            "database schema is incompatible with the current media-generation "
+            f"schema: {detail}; no changes were made"
         )
 
     @staticmethod
@@ -827,323 +571,192 @@ class SQLiteStore:
         return "".join(compact)
 
     @staticmethod
-    def _quoted_sqlite_identifier(identifier: str) -> str:
-        """Quote a schema object name read from an untrusted database."""
-        return '"' + identifier.replace('"', '""') + '"'
-
-    @staticmethod
-    def _validate_execution_schema(
-        connection: sqlite3.Connection,
-        *,
-        version: int,
-    ) -> None:
-        """Require the complete execution schema before changing its version.
-
-        Schema versions are durable claims. Table names alone do not prove that
-        the queues, ownership checks, publication authority, or privacy column
-        can enforce their contracts. Validate columns, indexes, foreign keys,
-        and complete normalized table definitions before a migration can set
-        a new version marker, and repeat the check for an already-versioned
-        database so a partial copy fails closed.
-
-        Version 3 historically allowed the privacy column because one
-        intermediate writer emitted it before schema version 4 was finalized.
-        That compatibility exception ends at version 4.
-        """
-        if version not in {3, 4, 5}:
-            raise ValueError(f"unsupported execution schema version: {version}")
-
-        present_tables = {
-            str(row["name"])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+    def _validate_current_schema(connection: sqlite3.Connection) -> None:
+        """Require the exact supported schema without changing the database."""
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version != _CURRENT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported database schema version {version}; "
+                f"expected {_CURRENT_SCHEMA_VERSION}; no changes were made"
             )
+
+        objects = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        by_type: dict[str, dict[str, str]] = {
+            "table": {},
+            "index": {},
+            "trigger": {},
+            "view": {},
         }
-        expected_tables = _EXECUTION_TABLES_BY_VERSION[version]
-        missing_tables = sorted(expected_tables - present_tables)
-        if missing_tables:
+        for row in objects:
+            object_type = str(row["type"])
+            if object_type in by_type:
+                by_type[object_type][str(row["name"])] = str(row["sql"] or "")
+
+        if by_type["view"]:
             raise SQLiteStore._incomplete_schema(
-                version,
-                "missing tables: " + ", ".join(missing_tables),
+                "unexpected views: " + ", ".join(sorted(by_type["view"]))
             )
 
-        for table in sorted(expected_tables):
-            columns = {
-                str(row["name"]): row
-                for row in connection.execute(
-                    f"PRAGMA table_info({SQLiteStore._quoted_sqlite_identifier(table)})"
+        tables = frozenset(by_type["table"])
+        missing_tables = sorted(_CURRENT_TABLES - tables)
+        unexpected_tables = sorted(tables - _CURRENT_TABLES)
+        if missing_tables or unexpected_tables:
+            details: list[str] = []
+            if missing_tables:
+                details.append("missing tables: " + ", ".join(missing_tables))
+            if unexpected_tables:
+                details.append(
+                    "unexpected tables: " + ", ".join(unexpected_tables)
                 )
-            }
-            specs = _EXECUTION_COLUMN_SPECS[table]
-            required = set(specs)
-            if version == 3 and table == "execution_jobs":
-                required.remove("privacy_compliance_json")
+            raise SQLiteStore._incomplete_schema("; ".join(details))
 
-            missing_columns = sorted(required - set(columns))
-            if missing_columns:
-                raise SQLiteStore._incomplete_schema(
-                    version,
-                    f"{table} missing columns: {', '.join(missing_columns)}",
-                )
-            extra_columns = sorted(set(columns) - set(specs))
-            if extra_columns:
-                raise SQLiteStore._incomplete_schema(
-                    version,
-                    f"{table} has unexpected columns: {', '.join(extra_columns)}",
-                )
-
-            for name, row in columns.items():
-                expected_type, expected_not_null, expected_default, expected_pk = specs[name]
-                actual_default = row["dflt_value"]
-                actual_default = (
-                    None if actual_default is None else str(actual_default).strip()
-                )
-                actual = (
-                    str(row["type"]).strip().upper(),
-                    bool(row["notnull"]),
-                    actual_default,
-                    int(row["pk"]),
-                )
-                expected = (
-                    expected_type,
-                    expected_not_null,
-                    expected_default,
-                    expected_pk,
-                )
-                if actual != expected:
-                    raise SQLiteStore._incomplete_schema(
-                        version,
-                        f"{table}.{name} has a divergent column definition",
-                    )
-
-            definition_row = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
-                (table,),
-            ).fetchone()
-            definition = "" if definition_row is None else str(definition_row["sql"] or "")
+        for table, expected_sql in _CURRENT_TABLE_DDL.items():
             try:
-                actual_definition = SQLiteStore._normalized_schema_sql(definition)
-                expected_definitions = {
-                    SQLiteStore._normalized_schema_sql(candidate)
-                    for candidate in _EXECUTION_TABLE_DDL[version][table]
-                }
+                actual_sql = SQLiteStore._normalized_schema_sql(
+                    by_type["table"][table]
+                )
+                normalized_expected = SQLiteStore._normalized_schema_sql(
+                    expected_sql
+                )
             except ValueError as error:
                 raise SQLiteStore._incomplete_schema(
-                    version,
-                    f"{table} has a malformed table definition",
+                    f"{table} malformed table definition"
                 ) from error
-            if actual_definition not in expected_definitions:
+            if actual_sql != normalized_expected:
                 raise SQLiteStore._incomplete_schema(
-                    version,
-                    f"{table} has a divergent table definition",
+                    f"{table} divergent table definition"
                 )
 
-            actual_foreign_keys = frozenset(
-                (
-                    str(row["from"]),
-                    str(row["table"]),
-                    str(row["to"]),
+        named_indexes = frozenset(by_type["index"])
+        missing_indexes = sorted(
+            frozenset(_CURRENT_INDEX_DDL) - named_indexes
+        )
+        unexpected_indexes = sorted(
+            named_indexes - frozenset(_CURRENT_INDEX_DDL)
+        )
+        if missing_indexes or unexpected_indexes:
+            details = []
+            if missing_indexes:
+                details.append("missing indexes: " + ", ".join(missing_indexes))
+            if unexpected_indexes:
+                details.append(
+                    "unexpected indexes: " + ", ".join(unexpected_indexes)
                 )
-                for row in connection.execute(
-                    f"PRAGMA foreign_key_list({SQLiteStore._quoted_sqlite_identifier(table)})"
-                )
+            raise SQLiteStore._incomplete_schema("; ".join(details))
+        for index_name, expected_sql in _CURRENT_INDEX_DDL.items():
+            actual_sql = SQLiteStore._normalized_schema_sql(
+                by_type["index"][index_name]
             )
-            if actual_foreign_keys != _EXECUTION_FOREIGN_KEYS[table]:
+            if actual_sql != SQLiteStore._normalized_schema_sql(expected_sql):
                 raise SQLiteStore._incomplete_schema(
-                    version,
-                    f"{table} has missing or divergent foreign-key constraints",
+                    f"index {index_name} divergent definition"
                 )
 
-            index_rows = {
-                str(row["name"]): row
-                for row in connection.execute(
-                    f"PRAGMA index_list({SQLiteStore._quoted_sqlite_identifier(table)})"
-                )
-            }
-
-            def index_columns(index_name: str) -> tuple[str, ...]:
-                rows = connection.execute(
-                    "PRAGMA index_info("
-                    + SQLiteStore._quoted_sqlite_identifier(index_name)
-                    + ")"
-                ).fetchall()
-                return tuple(
-                    str(row["name"])
-                    for row in sorted(rows, key=lambda item: int(item["seqno"]))
-                )
-
-            unique_columns = {
-                index_columns(index_name)
-                for index_name, row in index_rows.items()
-                if int(row["unique"])
-            }
-            if not _EXECUTION_UNIQUE_COLUMNS[table] <= unique_columns:
-                raise SQLiteStore._incomplete_schema(
-                    version,
-                    f"{table} has missing or divergent unique constraints",
-                )
-
-            for index_name, expected_columns in _EXECUTION_INDEXES[table].items():
-                index = index_rows.get(index_name)
-                if index is None:
-                    raise SQLiteStore._incomplete_schema(
-                        version,
-                        f"{table} is missing index {index_name}",
-                    )
-                partial = int(index["partial"]) if "partial" in index.keys() else 0
-                if int(index["unique"]) or partial:
-                    raise SQLiteStore._incomplete_schema(
-                        version,
-                        f"{table} index {index_name} has divergent flags",
-                    )
-                if index_columns(index_name) != expected_columns:
-                    raise SQLiteStore._incomplete_schema(
-                        version,
-                        f"{table} index {index_name} has divergent columns",
-                    )
-
-    @staticmethod
-    def _migrate_privacy(connection: sqlite3.Connection) -> None:
-        """Add nullable privacy evidence while leaving historical jobs unqualified.
-
-        Version 3 databases receive one additive column. Historical rows remain
-        NULL so reads expose an explicit unverified record instead of assigning
-        retrospective configuration evidence. A version 4 database missing the
-        column is rejected as incomplete.
-        """
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 5:
-            raise RuntimeError(f"unsupported database schema version: {version}")
-        SQLiteStore._validate_execution_schema(connection, version=version)
-        if version == 5:
-            return
-        columns = {
-            str(row["name"])
-            for row in connection.execute("PRAGMA table_info(execution_jobs)")
-        }
-        if "privacy_compliance_json" not in columns:
-            if version == 4:
-                raise RuntimeError(
-                    "database schema version 4 incomplete; missing privacy evidence column"
-                )
-            connection.execute(
-                "ALTER TABLE execution_jobs ADD COLUMN privacy_compliance_json TEXT"
-            )
-        SQLiteStore._validate_execution_schema(connection, version=4)
-        connection.execute("PRAGMA user_version = 4")
-
-    @staticmethod
-    def _migrate_admission(connection: sqlite3.Connection) -> None:
-        """Add pinned admission evidence without rewriting historical jobs.
-
-        Version 5 extends the existing singleton execution-resource authority
-        with one admission row per newly queued job.  Jobs created by older
-        versions retain no fabricated demand and continue through the legacy
-        compatibility path.
-        """
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if version > 5:
-            raise RuntimeError(f"unsupported database schema version: {version}")
-        if version < 4:
-            # A caller can deliberately stop after an older intermediate
-            # migration.  Admission is only meaningful once the privacy
-            # migration has completed and established schema version 4.
-            return
-        if version == 5:
-            SQLiteStore._validate_execution_schema(connection, version=5)
-            SQLiteStore._install_writer_guards(connection)
-            return
-        SQLiteStore._validate_execution_schema(connection, version=4)
-        connection.execute(_EXECUTION_ADMISSIONS_DDL.replace(
-            "CREATE TABLE execution_admissions",
-            "CREATE TABLE IF NOT EXISTS execution_admissions",
-            1,
-        ))
-        connection.execute(_EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL.replace(
-            "CREATE INDEX execution_admissions_dispatch_idx",
-            "CREATE INDEX IF NOT EXISTS execution_admissions_dispatch_idx",
-            1,
-        ))
-        SQLiteStore._validate_execution_schema(connection, version=5)
-        SQLiteStore._install_writer_guards(connection)
-        connection.execute("PRAGMA user_version = 5")
-
-    @staticmethod
-    def _writer_guard_sql(
-        table: str,
-        operation: str,
-        epoch: int = _WRITER_EPOCH,
-    ) -> tuple[str, str]:
-        """Return the stable trigger name and definition for one table write."""
-        name = f"t04_writer_guard_{table}_{operation.lower()}"
-        sql = f"""CREATE TRIGGER {name}
-BEFORE {operation} ON {table}
-WHEN {_WRITER_EPOCH_FUNCTION}() != {epoch}
-BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
-        return name, sql
-
-    @classmethod
-    def _install_writer_guards(cls, connection: sqlite3.Connection) -> None:
-        """Ensure every legacy mutation requires a current writer connection.
-
-        Version 3 sidecars do not prevent an older T01 or T03 process from
-        writing the legacy tables. Historical binaries open SQLite connections
-        without registering ``media_generation_writer_epoch``. The triggers
-        therefore abort their first data mutation while allowing connections
-        opened by this store. A missing trigger is recreated, a recognized
-        epoch-3 or epoch-4 definition is upgraded, and any other same-name
-        definition fails closed.
-        """
-        present_tables = {
-            str(row["name"])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
-            )
-        }
+        expected_triggers = dict(_STATIC_TRIGGER_DDL)
         for table, operation in _WRITER_GUARDS:
-            if table not in present_tables:
-                continue
-            name, expected_sql = cls._writer_guard_sql(table, operation)
-            row = connection.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
-                (name,),
-            ).fetchone()
-            if row is None:
-                connection.execute(expected_sql)
-                continue
-            current_sql = " ".join(str(row["sql"]).split()).rstrip(";")
-            normalized_expected = " ".join(expected_sql.split()).rstrip(";")
-            if current_sql == normalized_expected:
-                continue
-            superseded_sql = {
-                " ".join(
-                    cls._writer_guard_sql(table, operation, epoch)[1].split()
-                ).rstrip(";")
-                for epoch in _SUPERSEDED_WRITER_EPOCHS
-            }
-            if current_sql in superseded_sql:
-                connection.execute(f"DROP TRIGGER {name}")
-                connection.execute(expected_sql)
-                continue
-            raise RuntimeError(f"database writer guard is divergent: {name}")
+            guard_name, guard_sql = SQLiteStore._writer_guard_sql(
+                table, operation
+            )
+            expected_triggers[guard_name] = guard_sql
+        actual_triggers = frozenset(by_type["trigger"])
+        missing_triggers = sorted(frozenset(expected_triggers) - actual_triggers)
+        unexpected_triggers = sorted(actual_triggers - frozenset(expected_triggers))
+        if missing_triggers or unexpected_triggers:
+            details = []
+            if missing_triggers:
+                details.append(
+                    "missing triggers: " + ", ".join(missing_triggers)
+                )
+            if unexpected_triggers:
+                details.append(
+                    "unexpected triggers: " + ", ".join(unexpected_triggers)
+                )
+            raise SQLiteStore._incomplete_schema("; ".join(details))
+        for trigger_name, expected_sql in expected_triggers.items():
+            actual_sql = SQLiteStore._normalized_schema_sql(
+                by_type["trigger"][trigger_name]
+            )
+            if actual_sql != SQLiteStore._normalized_schema_sql(expected_sql):
+                raise SQLiteStore._incomplete_schema(
+                    f"trigger {trigger_name} divergent definition"
+                )
 
-    @staticmethod
-    def _assert_all_jobs_have_execution_state(connection: sqlite3.Connection) -> None:
-        """Reject rows admitted through the legacy tables without T04 sidecars."""
-        rows = connection.execute(
+        resources = connection.execute(
+            "SELECT id, state FROM execution_resource ORDER BY id"
+        ).fetchall()
+        if (
+            len(resources) != 1
+            or int(resources[0]["id"]) != 1
+            or str(resources[0]["state"])
+            not in {"available", "claimed", "quarantined"}
+        ):
+            raise SQLiteStore._incomplete_schema(
+                "execution_resource singleton row missing or invalid"
+            )
+
+        missing_execution = connection.execute(
             """SELECT jobs.job_id
                FROM generation_jobs AS jobs
                LEFT JOIN execution_jobs AS execution
                  ON execution.job_id = jobs.job_id
                WHERE execution.job_id IS NULL
-               ORDER BY jobs.created_at, jobs.job_id"""
-        ).fetchall()
-        if rows:
-            job_ids = ", ".join(str(row["job_id"]) for row in rows)
-            raise RuntimeError(
-                "database schema version 3 contains generation jobs without execution state: "
-                f"{job_ids}; stop older writers and restore or repair from a pre-migration backup"
+               LIMIT 1"""
+        ).fetchone()
+        if missing_execution is not None:
+            raise SQLiteStore._incomplete_schema(
+                "generation job lacks execution state: "
+                f"{missing_execution['job_id']}"
             )
+
+        missing_admission = connection.execute(
+            """SELECT execution.job_id
+               FROM execution_jobs AS execution
+            LEFT JOIN execution_admissions AS admission
+                 ON admission.job_id = execution.job_id
+               WHERE admission.job_id IS NULL
+               LIMIT 1"""
+        ).fetchone()
+        if missing_admission is not None:
+            raise SQLiteStore._incomplete_schema(
+                "execution job lacks admission evidence: "
+                f"{missing_admission['job_id']}"
+            )
+
+        try:
+            AdmissionPersistence.validate_persisted(connection)
+        except ValueError as error:
+            raise SQLiteStore._incomplete_schema(str(error)) from error
+
+    @staticmethod
+    def _writer_guard_sql(table: str, operation: str) -> tuple[str, str]:
+        """Return the trigger name and definition for one guarded write."""
+        name = f"t04_writer_guard_{table}_{operation.lower()}"
+        sql = f"""CREATE TRIGGER {name}
+BEFORE {operation} ON {table}
+WHEN {_WRITER_EPOCH_FUNCTION}() != {_WRITER_EPOCH}
+BEGIN
+    SELECT RAISE(ABORT, 'stale media-generation writer');
+END"""
+        return name, sql
+
+    @classmethod
+    def _install_writer_guards(cls, connection: sqlite3.Connection) -> None:
+        """Create current writer guards for a newly initialized database."""
+        for table, operation in _WRITER_GUARDS:
+            name, expected_sql = cls._writer_guard_sql(table, operation)
+            existing = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'trigger' AND name = ?",
+                (name,),
+            ).fetchone()
+            if existing is not None:
+                raise cls._incomplete_schema(
+                    f"writer guard already exists during initialization: {name}"
+                )
+            connection.execute(expected_sql)
 
     @staticmethod
     def _insert_sources(connection, artifact_id: str, sources: tuple[ArtifactSource, ...]) -> None:
@@ -1238,13 +851,15 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         containment_contract: str | None,
         timestamp: str,
         admission: PendingAdmission,
-        validate_admission_reuse: bool,
+        allow_not_required: bool,
     ) -> QueuedExecution:
-        """Atomically admit or reuse a queued job without creating an attempt.
+        """Atomically persist or reuse a queued job and its admission evidence.
 
-        ``max_attempts=None`` means the caller omitted an admission policy.
-        It defaults to one only while creating a job. Reusing an existing job
-        preserves the policy chosen by the first admission.
+        A new job requires validated ``PendingAdmission`` evidence. Only the
+        exact bundled deterministic CPU adapter may receive ``not_required``;
+        every other queued job must carry explicit capacity evidence. Reusing
+        an existing job preserves the admission and attempt budget recorded
+        when that job was created.
         """
         effective_max_attempts = 1 if max_attempts is None else max_attempts
         if (
@@ -1261,6 +876,18 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             raise ValueError("privacy compliance evidence is malformed")
         if not isinstance(admission, PendingAdmission):
             raise ValueError("admission evidence must be a PendingAdmission")
+        AdmissionPersistence.validate_new(
+            admission,
+            adapter_id,
+            allow_not_required=allow_not_required,
+        )
+        if (
+            admission.decision in {"blocked", "denied"}
+            and (admission.profile is None or admission.demand is None)
+        ):
+            raise ValueError(
+                "blocked heavyweight admission requires explicit profile and demand evidence"
+            )
         with self._connection(transaction=True) as connection:
             existing = connection.execute(
                 """SELECT jobs.*, execution.status AS execution_status,
@@ -1276,98 +903,64 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             if existing is not None:
                 if existing["request_digest"] != request_digest:
                     raise IdempotencyConflictError(
-                        "idempotency key is already bound to different canonical request intent"
+                        "idempotency key already bound to different canonical request intent"
                     )
                 if existing["adapter_id"] != adapter_id or json.loads(
                     str(existing["adapter_configuration_json"])
                 ) != json.loads(adapter_configuration_json):
                     raise IdempotencyConflictError(
-                        "idempotency key is already bound to a different adapter identity or configuration"
+                        "idempotency key already bound to different adapter identity or configuration"
                     )
-                stored_privacy_json = existing["privacy_compliance_json"]
-                if stored_privacy_json is None:
-                    if requested_privacy.get("status") == "pass":
-                        raise IdempotencyConflictError(
-                            "historical job cannot acquire retrospective privacy-compliance evidence"
-                        )
-                else:
-                    stored_privacy = _decode_stored_privacy_compliance(
-                        stored_privacy_json, adapter_id
+                stored_privacy = _decode_stored_privacy_compliance(
+                    existing["privacy_compliance_json"], adapter_id
+                )
+                if stored_privacy != requested_privacy:
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different privacy-compliance evidence"
                     )
-                    if stored_privacy != requested_privacy:
-                        raise IdempotencyConflictError(
-                            "idempotency key is already bound to different privacy-compliance evidence"
-                        )
                 if (
                     max_attempts is not None
                     and existing["execution_status"] != "succeeded"
                     and int(existing["execution_max_attempts"]) != max_attempts
                 ):
                     raise IdempotencyConflictError(
-                        "idempotency key is already bound to a different attempt budget"
+                        "idempotency key already bound to different attempt budget"
                     )
-                legacy_failed_without_contract = (
-                    existing["containment_contract"] is None
-                    and existing["execution_status"] == "failed"
-                    and not bool(existing["execution_retry_eligible"])
-                )
                 if (
                     existing["containment_contract"] != containment_contract
                     and existing["execution_status"] != "succeeded"
-                    and not legacy_failed_without_contract
                 ):
                     raise IdempotencyConflictError(
-                        "idempotency key is already bound to a different containment contract"
+                        "idempotency key already bound to different containment contract"
                     )
                 existing_directory = self._output_directory_for_job(
                     connection,
                     str(existing["job_id"]),
                     str(existing["effective_parameters_json"]),
                 )
-                if existing_directory != str(Path(resolved_output_directory).expanduser().resolve()):
-                    raise IdempotencyConflictError(
-                        "idempotency key is already bound to a different or unknown output directory"
-                    )
-                if (
-                    validate_admission_reuse
-                    and existing["execution_status"]
-                    not in {"succeeded", "failed", "canceled"}
+                if existing_directory != str(
+                    Path(resolved_output_directory).expanduser().resolve()
                 ):
-                    pinned_admission = AdmissionPersistence.snapshot(
-                        connection, str(existing["job_id"])
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different or unknown output directory"
                     )
-                    proposed_demand = (
-                        {}
-                        if admission.demand is None
-                        else admission.demand.to_dict()
+                pinned_admission = AdmissionPersistence.snapshot(
+                    connection, str(existing["job_id"])
+                )
+                proposed_demand = (
+                    None if admission.demand is None else admission.demand.to_dict()
+                )
+                if (
+                    pinned_admission is None
+                    or pinned_admission.profile_fingerprint
+                    != admission.profile_fingerprint
+                    or _json(pinned_admission.demand) != _json(proposed_demand)
+                    or pinned_admission.required_bytes != admission.required_bytes
+                    or pinned_admission.unknown_reasons != admission.unknown_reasons
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different admission evidence"
                     )
-                    if (
-                        pinned_admission is not None
-                        and pinned_admission.decision == "unrecorded"
-                    ):
-                        if existing["execution_status"] != "queued":
-                            raise IdempotencyConflictError(
-                                "historical running execution cannot acquire admission evidence"
-                            )
-                        if admission.profile is None or admission.demand is None:
-                            raise IdempotencyConflictError(
-                                "historical queued execution re-admission requires profile and demand evidence"
-                            )
-                        AdmissionPersistence.insert(
-                            connection,
-                            job_id=str(existing["job_id"]),
-                            admission=admission,
-                            timestamp=timestamp,
-                        )
-                    elif (
-                        pinned_admission is None
-                        or pinned_admission.profile_fingerprint
-                        != admission.profile_fingerprint
-                        or _json(pinned_admission.demand) != _json(proposed_demand)
-                    ):
-                        raise IdempotencyConflictError(
-                            "idempotency key is already bound to different admission evidence"
-                        )
                 return QueuedExecution(
                     False,
                     str(existing["request_id"]),
@@ -1507,32 +1100,29 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         timestamp: str,
         lease_expires_at: str,
         privacy_compliance_json: str | None = None,
-        allow_unrecorded_privacy: bool = False,
         job_id: str | None = None,
         adapter_configuration_json: str | None = None,
+        allow_not_required: bool = False,
     ) -> ExecutionClaim | None:
-        """Atomically create one attempt for the oldest matching queued job.
+        """Atomically create one attempt from explicitly admitted queued work.
 
-        Durable non-NULL privacy evidence requires the caller's exact privacy
-        record and adapter-configuration snapshot, regardless of the stored
-        record's status. Historical NULL evidence is claimable only when the
-        caller explicitly selects the legacy path with
-        ``allow_unrecorded_privacy``; it is never treated as a privacy pass.
-        A version-4 job without an admission row remains explicitly
-        unrecorded and cannot be claimed until idempotent re-submission pins
-        profile and demand evidence. Jobs with admission evidence must be
-        queued or legacy.
+        The selected row must have current privacy-compliance evidence and an
+        admission decision of queued or not_required. Missing admission evidence
+        is never treated as an implicit execution grant. Only callers that have
+        verified the adapter's exact concrete type may enable ``not_required``.
         """
         requested_directory = str(Path(resolved_output_directory).expanduser().resolve())
-        requested_privacy_status: str | None = None
-        if privacy_compliance_json is not None:
-            requested_privacy = json.loads(privacy_compliance_json)
-            if (
-                not is_privacy_compliance_record(requested_privacy)
-                or requested_privacy.get("adapter_id") != adapter_id
-            ):
-                raise ValueError("privacy compliance evidence is malformed")
-            requested_privacy_status = requested_privacy.get("status")
+        if not isinstance(privacy_compliance_json, str):
+            suffix = "" if job_id is None else f": {job_id}"
+            raise GenerationError(
+                f"{_PRIVACY_CLAIM_EVIDENCE_REQUIRED}{suffix}"
+            )
+        requested_privacy = json.loads(privacy_compliance_json)
+        if (
+            not is_privacy_compliance_record(requested_privacy)
+            or requested_privacy.get("adapter_id") != adapter_id
+        ):
+            raise ValueError("privacy compliance evidence malformed")
         with self._connection(transaction=True) as connection:
             resource = connection.execute(
                 "SELECT state FROM execution_resource WHERE id = 1"
@@ -1540,28 +1130,34 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             if resource is None or resource["state"] != "available":
                 return None
 
-            # Missing admission evidence is historical and remains blocked. A
-            # valid idempotent re-submission must first attach its pinned row.
             query = """SELECT jobs.*, execution.status AS execution_status,
-                                execution.max_attempts, execution.fence_epoch,
-                                execution.containment_contract,
-                                execution.resolved_plan_json,
-                                execution.privacy_compliance_json,
-                                admission.decision AS admission_decision,
-                                admission.decision_reason AS admission_reason,
-                                admission.required_bytes_json AS admission_required_bytes_json
-                         FROM generation_jobs AS jobs
-                         JOIN execution_jobs AS execution ON execution.job_id = jobs.job_id
-                         LEFT JOIN execution_admissions AS admission
-                           ON admission.job_id = execution.job_id
-                         WHERE execution.status = 'queued'
-                           AND jobs.adapter_id = ?
-                           AND execution.containment_contract IS ?
-                           AND admission.decision IN ('queued','legacy')
-                           AND admission.decision_reason != 'resource_busy'"""
+                execution.max_attempts, execution.fence_epoch,
+                execution.containment_contract,
+                execution.resolved_plan_json,
+                execution.privacy_compliance_json,
+                admission.decision AS admission_decision,
+                admission.decision_reason AS admission_reason,
+        admission.admission_profile_json AS admission_profile_json,
+        admission.workload_demand_json AS admission_demand_json,
+               admission.profile_fingerprint AS admission_profile_fingerprint,
+                admission.required_bytes_json AS admission_required_bytes_json
+                FROM generation_jobs AS jobs
+                JOIN execution_jobs AS execution
+                  ON execution.job_id = jobs.job_id
+                JOIN execution_admissions AS admission
+                  ON admission.job_id = execution.job_id
+                WHERE execution.status = 'queued'
+                  AND jobs.adapter_id = ?
+                  AND execution.containment_contract IS ?
+        AND (
+            admission.decision = 'queued'
+            OR (? AND admission.decision = 'not_required')
+        )
+                  AND admission.decision_reason != 'resource_busy'"""
             parameters: list[object] = [
                 adapter_id,
                 containment_contract,
+                int(allow_not_required),
             ]
             if job_id is not None:
                 query += " AND jobs.job_id = ?"
@@ -1570,47 +1166,40 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             candidate = None
             privacy_rejection_job_id: str | None = None
             for row in connection.execute(query, tuple(parameters)).fetchall():
-                if self._output_directory_for_job(
-                    connection, str(row["job_id"]), str(row["effective_parameters_json"])
-                ) != requested_directory:
+                if str(row["admission_decision"]) == "queued":
+                    try:
+                        AdmissionPersistence.validate_claim_evidence(
+                            row["admission_profile_json"],
+                            row["admission_demand_json"],
+                    row["admission_profile_fingerprint"],
+                row["admission_required_bytes_json"],
+                            row["job_id"],
+                        )
+                    except ValueError as error:
+                        raise RuntimeError(str(error)) from error
+                if (
+                    self._output_directory_for_job(
+                        connection,
+                        str(row["job_id"]),
+                        str(row["effective_parameters_json"]),
+                    )
+                    != requested_directory
+                ):
                     continue
                 stored_privacy_json = row["privacy_compliance_json"]
-                if stored_privacy_json is not None:
-                    _decode_stored_privacy_compliance(
-                        stored_privacy_json,
-                        adapter_id,
+                _decode_stored_privacy_compliance(stored_privacy_json, adapter_id)
+                if (
+                    adapter_configuration_json is None
+                    or str(row["adapter_configuration_json"])
+                    != adapter_configuration_json
+                ):
+                    raise GenerationError(
+                        f"{_PRIVACY_CLAIM_CONFIGURATION_REQUIRED}: "
+                        f"{row['job_id']}"
                     )
-                stored_adapter_configuration_json = str(
-                    row["adapter_configuration_json"]
-                )
-                adapter_configuration_matches = (
-                    adapter_configuration_json is not None
-                    and stored_adapter_configuration_json
-                    == adapter_configuration_json
-                )
-                if stored_privacy_json is not None:
-                    if privacy_compliance_json is None:
-                        privacy_rejection_job_id = str(row["job_id"])
-                        continue
-                    if not adapter_configuration_matches:
-                        raise GenerationError(
-                            f"{_PRIVACY_CLAIM_CONFIGURATION_REQUIRED}: "
-                            f"{row['job_id']}"
-                        )
-                    if stored_privacy_json != privacy_compliance_json:
-                        privacy_rejection_job_id = str(row["job_id"])
-                        continue
-                else:
-                    if (
-                        not allow_unrecorded_privacy
-                        or not adapter_configuration_matches
-                        or (
-                            privacy_compliance_json is not None
-                            and requested_privacy_status != "unverified"
-                        )
-                    ):
-                        privacy_rejection_job_id = str(row["job_id"])
-                        continue
+                if stored_privacy_json != privacy_compliance_json:
+                    privacy_rejection_job_id = str(row["job_id"])
+                    continue
                 candidate = row
                 break
             if candidate is None:
@@ -1683,15 +1272,14 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                        reason = NULL, updated_at = ? WHERE id = 1""",
                 (candidate["job_id"], attempt_id, owner_id, timestamp),
             )
-            if candidate["admission_decision"] is not None:
-                if not AdmissionPersistence.reserve(
-                    connection,
-                    str(candidate["job_id"]),
-                    source_decision=str(candidate["admission_decision"]),
-                    timestamp=timestamp,
-                    required_bytes_json=str(candidate["admission_required_bytes_json"]),
-                ):
-                    raise RuntimeError("admission reservation transition was rejected")
+            if not AdmissionPersistence.reserve(
+                connection,
+                str(candidate["job_id"]),
+                source_decision=str(candidate["admission_decision"]),
+                timestamp=timestamp,
+                required_bytes_json=str(candidate["admission_required_bytes_json"]),
+            ):
+                raise RuntimeError("admission reservation transition was rejected")
             plan = json.loads(plan_json)
             references = tuple(
                 ResolvedReference(
@@ -1790,7 +1378,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                            WHERE job_id = ?) AS attempt_count
                    FROM execution_jobs AS execution
                    JOIN execution_resource AS resource ON resource.id = 1
-                   LEFT JOIN execution_admissions AS admission
+                JOIN execution_admissions AS admission
                      ON admission.job_id = execution.job_id
                    WHERE execution.job_id = ?""",
                 (job_id, job_id),
@@ -1819,13 +1407,16 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     "UPDATE generation_jobs SET status = 'running', updated_at = ? WHERE job_id = ?",
                     (timestamp, job_id),
                 )
-                if not AdmissionPersistence.requeue_after_safe_retry(
+                if row["admission_decision"] != "not_required" and not AdmissionPersistence.requeue_after_safe_retry(
                     connection, job_id, timestamp
                 ):
                     raise RuntimeError("admission retry transition was rejected")
             else:
                 admission = AdmissionPersistence.snapshot(connection, job_id)
-                if admission is None or admission.decision != "queued":
+                if admission is None or admission.decision not in {
+                "queued",
+                "not_required",
+            }:
                     return False
             return True
 
@@ -2058,12 +1649,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 timestamp=timestamp,
             )
             if not admission_finished:
-                admission = AdmissionPersistence.snapshot(connection, artifact.job_id)
-                # A version-4 execution with no admission row retains its
-                # approved historical completion path until that policy is
-                # resolved. Any recorded row must obey the transition contract.
-                if admission is None or admission.decision != "unrecorded":
-                    raise RuntimeError("admission completion transition was rejected")
+                raise RuntimeError("admission completion transition was rejected")
 
     @staticmethod
     def _commit_publication_row(
@@ -2363,28 +1949,6 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 "SELECT * FROM artifact_edges WHERE source_id = ? ORDER BY target_id, position", (artifact_id,))]
         return {"artifact_id": artifact_id, "parents": parents, "children": children}
 
-    def _legacy_fail_execution(
-        self, job_id: str, attempt_id: str, message: str, timestamp: str
-    ) -> None:
-        """Fail only an execution with no recoverable or committed publication."""
-        with self._connection(transaction=True) as connection:
-            if connection.execute(
-                "SELECT 1 FROM artifact_publications WHERE job_id = ? "
-                "AND state IN ('ready', 'committed')", (job_id,)
-            ).fetchone() is not None:
-                return
-            connection.execute(
-                "UPDATE generation_jobs SET status = 'failed', updated_at = ? "
-                "WHERE job_id = ? AND status = 'running'",
-                (timestamp, job_id),
-            )
-            connection.execute(
-                """UPDATE generation_attempts
-                   SET status = 'failed', finished_at = ?, error_message = ?
-                   WHERE attempt_id = ? AND job_id = ? AND status = 'running'""",
-                (timestamp, message, attempt_id, job_id),
-            )
-
     def fail_execution(
         self,
         job_id: str,
@@ -2472,8 +2036,12 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
             if attempt is None or attempt["status"] != "running":
                 return False
             job = connection.execute(
-                """SELECT max_attempts, current_attempt_id, fence_epoch
-                   FROM execution_jobs WHERE job_id = ?""",
+            """SELECT execution.max_attempts, execution.current_attempt_id,
+                      execution.fence_epoch, jobs.adapter_id
+               FROM execution_jobs AS execution
+               JOIN generation_jobs AS jobs
+                 ON jobs.job_id = execution.job_id
+               WHERE execution.job_id = ?""",
                 (job_id,),
             ).fetchone()
             if job is None or job["current_attempt_id"] != attempt_id:
@@ -2556,10 +2124,18 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                     attempt_id,
                 ),
             )
+            admission_before_finalize = AdmissionPersistence.snapshot(connection, job_id)
+            if admission_before_finalize is None:
+                raise RuntimeError("admission failure transition lacks current evidence")
             if resource_state == "quarantined":
                 admission_state = "quarantined"
             elif retry:
-                admission_state = "queued"
+                admission_state = (
+                    "not_required"
+                    if is_lightweight_cpu_adapter_id(job["adapter_id"])
+                    and not admission_before_finalize.has_capacity_evidence
+                    else "queued"
+                )
             else:
                 admission_state = "released"
             admission_finished = AdmissionPersistence.finish(
@@ -2570,12 +2146,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
                 timestamp=timestamp,
             )
             if not admission_finished:
-                admission = AdmissionPersistence.snapshot(connection, job_id)
-                # Only an already-running pre-T06 attempt may finalize without
-                # admission evidence. Its retryable queue remains non-claimable
-                # until a later idempotent re-submission attaches a row.
-                if admission is None or admission.decision != "unrecorded":
-                    raise RuntimeError("admission failure transition was rejected")
+                raise RuntimeError("admission failure transition was rejected")
             return True
 
     def get_request(self, request_id: str) -> GenerationRequestRecord:
@@ -2615,7 +2186,7 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         return self._job_from_row(row)
 
     def get_resolved_output_directory(self, job_id: str) -> str | None:
-        """Return the saved destination, inferring it for legacy artifact rows."""
+        """Return the output directory captured by current job intent."""
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT effective_parameters_json FROM generation_jobs WHERE job_id = ?",
@@ -2638,62 +2209,6 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         if row is None:
             raise RecordNotFoundError(f"artifact not found: {artifact_id}")
         return self._artifact_from_row(row)
-
-    def _legacy_get_provenance(self, job_id: str) -> dict[str, object]:
-        """Return request, resolved job, attempt, and optional artifact snapshots."""
-        with self._connection() as connection:
-            job_row = connection.execute(
-                """SELECT jobs.*, artifacts.artifact_id
-                   FROM generation_jobs AS jobs
-                   LEFT JOIN generation_artifacts AS artifacts ON artifacts.job_id = jobs.job_id
-                   WHERE jobs.job_id = ?""",
-                (job_id,),
-            ).fetchone()
-            if job_row is None:
-                raise RecordNotFoundError(f"job not found: {job_id}")
-            request_row = connection.execute(
-                "SELECT * FROM generation_requests WHERE request_id = ?",
-                (job_row["request_id"],),
-            ).fetchone()
-            attempt_row = connection.execute(
-                "SELECT * FROM generation_attempts WHERE job_id = ? ORDER BY attempt_number DESC LIMIT 1",
-                (job_id,),
-            ).fetchone()
-            artifact_row = connection.execute(
-                "SELECT * FROM generation_artifacts WHERE job_id = ?", (job_id,)
-            ).fetchone()
-
-        assert request_row is not None
-        assert attempt_row is not None
-        request_payload = json.loads(str(request_row["canonical_json"]))
-        request = GenerationRequestRecord(
-            request_id=str(request_row["request_id"]),
-            request=GenerationRequest(**request_payload),
-            request_digest=str(request_row["request_digest"]),
-            created_at=str(request_row["created_at"]),
-        )
-        job = self._job_from_row(job_row)
-        job_payload = job.to_dict()
-        attempt = self._attempt_from_row(attempt_row)
-        artifact = None if artifact_row is None else self._artifact_from_row(artifact_row)
-        return {
-            "job_id": job.job_id,
-            "request": request.to_dict(),
-            "status": job.execution_status or job.status,
-            "adapter_id": job.adapter_id,
-            "adapter_configuration": job_payload["adapter_configuration"],
-            "privacy_compliance": historical_privacy_compliance(
-                job.adapter_id
-            ).to_dict(),
-            "resolved_prompt": job.resolved_prompt,
-            "resolved_seed": job.resolved_seed,
-            "validated_reference_ids": list(job.validated_reference_ids),
-            "output_slot": job.output_slot,
-            "output_slot_id": job.output_slot_id,
-            "effective_parameters": job_payload["effective_parameters"],
-            "attempt": attempt.to_dict(),
-            "artifact": None if artifact is None else artifact.to_dict(),
-        }
 
     def get_provenance(self, job_id: str) -> dict[str, object]:
         """Return request, job, attempt history, artifact, and execution state."""
@@ -2798,19 +2313,13 @@ BEGIN SELECT RAISE(ABORT, 'stale media-generation writer'); END"""
         job_id: str,
         effective_parameters_json: str,
     ) -> str | None:
-        """Load a job's saved destination or infer it from a legacy artifact."""
+        """Return the output directory captured in current job intent."""
+        del connection, job_id
         effective_parameters = json.loads(effective_parameters_json)
         output_directory = effective_parameters.get(_RESOLVED_OUTPUT_DIRECTORY_KEY)
-        if isinstance(output_directory, str) and output_directory:
-            return str(Path(output_directory).expanduser().resolve())
-
-        artifact = connection.execute(
-            "SELECT path FROM generation_artifacts WHERE job_id = ?",
-            (job_id,),
-        ).fetchone()
-        if artifact is None:
+        if not isinstance(output_directory, str) or not output_directory:
             return None
-        return str(Path(str(artifact["path"])).parent.resolve())
+        return str(Path(output_directory).expanduser().resolve())
 
     @staticmethod
     def _job_from_row(row: sqlite3.Row) -> GenerationJob:
@@ -2944,7 +2453,7 @@ def _decode_stored_privacy_compliance(
     except (TypeError, ValueError) as error:
         raise GenerationError(_MALFORMED_STORED_PRIVACY_EVIDENCE) from error
     if not is_privacy_compliance_record(payload) or payload.get("adapter_id") != adapter_id:
-        raise GenerationError(_MALFORMED_STORED_PRIVACY_EVIDENCE)
+            raise GenerationError(_MALFORMED_STORED_PRIVACY_EVIDENCE)
     return payload
 
 
@@ -2952,13 +2461,10 @@ def _stored_privacy_compliance(
     row: sqlite3.Row,
     adapter_id: str,
 ) -> dict[str, object]:
-    """Decode durable evidence while preserving NULL historical compatibility."""
-    if "privacy_compliance_json" not in row.keys():
-        return historical_privacy_compliance(adapter_id).to_dict()
-    raw = row["privacy_compliance_json"]
-    if raw is None:
-        return historical_privacy_compliance(adapter_id).to_dict()
-    return _decode_stored_privacy_compliance(raw, adapter_id)
+    """Decode the required durable privacy evidence for a current job."""
+    return _decode_stored_privacy_compliance(
+        row["privacy_compliance_json"], adapter_id
+    )
 
 
 def _json(value: object) -> str:

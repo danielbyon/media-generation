@@ -65,8 +65,8 @@ def test_pending_admission_is_validated_at_the_persistence_boundary(
         PendingAdmission(
             profile=None,
             demand=None,
-            decision="legacy",
-            reason="admission_not_configured",
+            decision="not_required",
+            reason="lightweight_deterministic_cpu",
             required_bytes={"system_ram": True},
         )
 
@@ -81,6 +81,214 @@ def test_pending_admission_is_validated_at_the_persistence_boundary(
                 admission=cast(PendingAdmission, object()),
                 timestamp="2026-10-27T00:00:00Z",
             )
+
+
+def test_queued_pending_admission_requires_pinned_capacity_evidence() -> None:
+    """A dispatchable decision cannot be constructed without both documents."""
+    from media_generation.admission_store import PendingAdmission
+
+    with pytest.raises(ValueError, match="capacity profile and workload demand"):
+        PendingAdmission(
+            profile=None,
+            demand=None,
+            decision="queued",
+            reason="capacity_fit",
+        )
+
+
+def test_create_rejects_forged_typed_profile_fingerprint(tmp_path: Path) -> None:
+    """Create validation cannot trust a fingerprint carried by a typed object."""
+    import json
+    from dataclasses import replace
+
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from media_generation.admission_store import PendingAdmission
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    demand = parse_workload_demand(
+        workload_demand(system_ram_bytes=20 * GIB, accelerator_memory_bytes=20 * GIB)
+    )
+    generation_request = request()
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        tmp_path / "images",
+        admission_profile=profile,
+    )
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+    forged_profile = replace(profile, fingerprint="sha256:" + "0" * 64)
+
+    with pytest.raises(ValueError, match="profile fingerprint"):
+        service._store.create_queued_execution(
+            request=generation_request,
+            request_digest=generation_request.digest(),
+            idempotency_key="forged-profile-fingerprint",
+            request_id="req_forged_profile_fingerprint",
+            job_id="job_forged_profile_fingerprint",
+            output_slot_id="slot_forged_profile_fingerprint",
+            resolved_seed=1,
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=adapter_configuration_json,
+            privacy_compliance_json=privacy_compliance_json,
+            effective_parameters_json=json.dumps(
+                {"width": generation_request.width, "height": generation_request.height}
+            ),
+            resolved_output_directory=str(service.output_directory),
+            max_attempts=1,
+            containment_contract=None,
+            timestamp="2026-10-28T00:00:00Z",
+            admission=PendingAdmission(
+                profile=forged_profile,
+                demand=demand,
+                decision="queued",
+                reason="capacity_fit",
+                required_bytes={"system_ram": 20 * GIB},
+            ),
+            allow_not_required=False,
+        )
+
+    with service._store._connection() as connection:
+        assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM execution_attempts").fetchone()[0] == 0
+
+
+def test_create_rejects_queued_evidence_that_is_over_budget(tmp_path: Path) -> None:
+    """A typed queued decision cannot contradict recomputed capacity."""
+    import json
+
+    from media_generation.admission import (
+        build_admission_profile,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from media_generation.admission_store import PendingAdmission
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+    from test_resource_admission import GIB, inventory_report, workload_demand
+
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    demand = parse_workload_demand(
+        workload_demand(system_ram_bytes=60 * GIB, accelerator_memory_bytes=20 * GIB)
+    )
+    generation_request = request()
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        tmp_path / "images",
+        admission_profile=profile,
+    )
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+
+    with pytest.raises(ValueError, match="capacity decision"):
+        service._store.create_queued_execution(
+            request=generation_request,
+            request_digest=generation_request.digest(),
+            idempotency_key="forged-over-budget-decision",
+            request_id="req_forged_over_budget_decision",
+            job_id="job_forged_over_budget_decision",
+            output_slot_id="slot_forged_over_budget_decision",
+            resolved_seed=1,
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=adapter_configuration_json,
+            privacy_compliance_json=privacy_compliance_json,
+            effective_parameters_json=json.dumps(
+                {"width": generation_request.width, "height": generation_request.height}
+            ),
+            resolved_output_directory=str(service.output_directory),
+            max_attempts=1,
+            containment_contract=None,
+            timestamp="2026-10-28T00:00:00Z",
+            admission=PendingAdmission(
+                profile=profile,
+                demand=demand,
+                decision="queued",
+                reason="capacity_fit",
+                required_bytes={"system_ram": 80 * GIB},
+            ),
+            allow_not_required=False,
+        )
+
+    with service._store._connection() as connection:
+        assert connection.execute("SELECT count(*) FROM generation_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM execution_attempts").fetchone()[0] == 0
+
+
+def test_store_rejects_not_required_for_non_cpu_adapter(tmp_path: Path) -> None:
+    """The persistence boundary enforces the exact lightweight producer."""
+    import json
+
+    from media_generation.adapters import DeterministicCpuAdapter
+    from media_generation.admission_store import PendingAdmission
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+
+    class NonCpuAdapter(DeterministicCpuAdapter):
+        adapter_id = "heavyweight-test-adapter"
+
+    generation_request = request()
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        tmp_path / "images",
+        adapter=NonCpuAdapter(),
+    )
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+
+    with pytest.raises(ValueError, match="exact lightweight CPU adapter"):
+        service._store.create_queued_execution(
+            request=generation_request,
+            request_digest=generation_request.digest(),
+            idempotency_key="forged-exemption",
+            request_id="req_forged_exemption",
+            job_id="job_forged_exemption",
+            output_slot_id="slot_forged_exemption",
+            resolved_seed=1,
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=adapter_configuration_json,
+            privacy_compliance_json=privacy_compliance_json,
+            effective_parameters_json=json.dumps(
+                {"width": generation_request.width, "height": generation_request.height}
+            ),
+            resolved_output_directory=str(service.output_directory),
+            max_attempts=1,
+            containment_contract=None,
+            timestamp="2026-10-28T00:00:00Z",
+            admission=PendingAdmission.not_required(),
+            allow_not_required=False,
+        )
+
+    with service._store._connection() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM generation_jobs"
+        ).fetchone()[0] == 0
 
 
 def test_queued_admission_transition_requires_queued_execution(
@@ -509,14 +717,125 @@ def test_submit_uses_one_typed_inspection_after_execution(tmp_path: Path) -> Non
     assert inspect_admission.call_count == 1
 
 
-def test_legacy_admission_is_owned_by_the_decision_model() -> None:
-    """Unconfigured admission is a normal decision instead of a caller override."""
+def test_unconfigured_heavyweight_enqueue_fails_before_persistence(
+    tmp_path: Path,
+) -> None:
+    """Missing heavyweight evidence is rejected without orphaned queued work."""
+    from media_generation.adapters import DeterministicCpuAdapter
+    from media_generation.errors import InputValidationError
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+
+    class HeavyweightAdapter(DeterministicCpuAdapter):
+        adapter_id = "heavyweight-test-adapter"
+
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        tmp_path / "images",
+        adapter=HeavyweightAdapter(),
+    )
+
+    with pytest.raises(
+        InputValidationError,
+        match="heavyweight execution requires explicit profile and demand evidence",
+    ):
+        service.enqueue("unconfigured-heavyweight", request())
+
+    with service._store._connection() as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "execution_jobs",
+            "execution_admissions",
+        ):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
     from media_generation.admission import evaluate_admission
 
-    decision = evaluate_admission(None, None)
+    exempt = evaluate_admission(None, None, allow_not_required=True)
+    assert exempt.status == "not_required"
+    assert exempt.reason == "lightweight_deterministic_cpu"
 
-    assert decision.status == "legacy"
-    assert decision.reason == "admission_not_configured"
+
+def test_store_rejects_blocked_heavyweight_admission_without_persisting(
+    tmp_path: Path,
+) -> None:
+    """Persistence cannot accept an incomplete blocked heavyweight record."""
+    import json
+
+    from media_generation.adapters import DeterministicCpuAdapter
+    from media_generation.admission_store import PendingAdmission
+    from media_generation.service import GenerationService
+    from test_durable_execution import request
+
+    class HeavyweightAdapter(DeterministicCpuAdapter):
+        adapter_id = "heavyweight-test-adapter"
+
+    generation_request = request()
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        tmp_path / "images",
+        adapter=HeavyweightAdapter(),
+    )
+    _, configuration_json, _, privacy_json = service._current_privacy_snapshot()
+
+    with pytest.raises(ValueError, match="blocked heavyweight admission"):
+        service._store.create_queued_execution(
+            request=generation_request,
+            request_digest=generation_request.digest(),
+            idempotency_key="blocked-without-evidence",
+            request_id="req_blocked_without_evidence",
+            job_id="job_blocked_without_evidence",
+            output_slot_id="slot_blocked_without_evidence",
+            resolved_seed=1,
+            adapter_id=service.adapter.adapter_id,
+            adapter_configuration_json=configuration_json,
+            privacy_compliance_json=privacy_json,
+            effective_parameters_json=json.dumps(
+                {"width": generation_request.width, "height": generation_request.height}
+            ),
+            resolved_output_directory=str(service.output_directory),
+            max_attempts=1,
+            containment_contract=None,
+            timestamp="2026-10-28T00:00:00Z",
+            admission=PendingAdmission(
+                profile=None,
+                demand=None,
+                decision="blocked",
+                reason="resource_admission_required",
+                unknown_reasons=("admission:required",),
+            ),
+            allow_not_required=False,
+        )
+
+    with service._store._connection() as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "execution_jobs",
+            "execution_admissions",
+        ):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+
+
+def test_lightweight_cpu_exemption_uses_exact_class_and_adapter_identity() -> None:
+    """Central exemption helpers retain exact-class and persistence identity."""
+    from media_generation.adapters import DeterministicCpuAdapter
+    from media_generation.admission import (
+        is_lightweight_cpu_adapter,
+        is_lightweight_cpu_adapter_id,
+    )
+
+    class CpuSubclass(DeterministicCpuAdapter):
+        adapter_id = "cpu-subclass-v1"
+
+    exact = DeterministicCpuAdapter()
+    subclass = CpuSubclass()
+
+    assert is_lightweight_cpu_adapter(exact)
+    assert is_lightweight_cpu_adapter_id(exact.adapter_id)
+    assert not is_lightweight_cpu_adapter(subclass)
+    assert not is_lightweight_cpu_adapter_id(subclass.adapter_id)
 
 
 def test_capacity_reason_is_not_reported_as_an_execution_failure(

@@ -12,6 +12,11 @@ import threading
 import pytest
 
 from media_generation.adapters import DeterministicCpuAdapter, PROCESS_CONTAINED_CONTRACT
+from media_generation.admission import (
+    build_admission_profile,
+    parse_admission_policy,
+    parse_workload_demand,
+)
 from media_generation.domain import GenerationArtifact, GenerationRequest
 from media_generation.errors import GenerationError, RetryableGenerationError
 from media_generation.service import GenerationService
@@ -22,6 +27,35 @@ from test_durable_execution import (
     request,
     service_at,
 )
+from test_resource_admission import GIB, inventory_report, workload_demand
+
+
+def _heavyweight_profile():
+    """Return deterministic capacity evidence for a heavyweight test adapter."""
+    return build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+
+
+def _admitted_service_at(root: Path, **kwargs) -> GenerationService:
+    """Open a heavyweight test service with explicit current admission policy."""
+    kwargs.setdefault("admission_profile", _heavyweight_profile())
+    return service_at(root, **kwargs)
+
+
+def _admit(service: GenerationService, key: str, generation_request, **kwargs):
+    """Enqueue heavyweight test work with explicit current workload demand."""
+    kwargs.setdefault(
+        "workload_demand", parse_workload_demand(workload_demand())
+    )
+    return service.enqueue(key, generation_request, **kwargs)
 
 
 def admission_record(service: GenerationService, job_id: str):
@@ -39,14 +73,15 @@ from pathlib import Path
 from media_generation.adapters import DeterministicCpuAdapter, PROCESS_CONTAINED_CONTRACT
 from media_generation.service import GenerationService
 
-class CrashAdapter(DeterministicCpuAdapter):
-    containment_contract = (
-        PROCESS_CONTAINED_CONTRACT if not bool(int(sys.argv[3])) else None
-    )
-    def generate(self, plan, stream):
-        if sys.argv[2] == 'adapter':
-            os._exit(71)
-        return super().generate(plan, stream)
+adapter = DeterministicCpuAdapter()
+adapter.containment_contract = (
+    PROCESS_CONTAINED_CONTRACT if not bool(int(sys.argv[3])) else None
+)
+def generate(plan, stream):
+    if sys.argv[2] == 'adapter':
+        os._exit(71)
+    return DeterministicCpuAdapter.generate(adapter, plan, stream)
+adapter.generate = generate
 
 def checkpoint(name):
     if name == sys.argv[2]:
@@ -56,7 +91,7 @@ root = Path(sys.argv[1])
 service = GenerationService(
     root / 'studio.sqlite3',
     root / 'images',
-    CrashAdapter(),
+    adapter,
     publication_checkpoint=checkpoint,
 )
 service.work()
@@ -261,15 +296,18 @@ def test_crash_then_persisted_fence_revoke_prevents_reconcile_commit(
 
 
 def test_retry_budget_is_not_reset_by_restart(tmp_path: Path) -> None:
-    class RetryableAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    def retryable_service() -> GenerationService:
+        service = service_at(tmp_path)
 
-        def generate(self, plan, stream):
+        def generate(plan, stream):
             raise RetryableGenerationError("known local transient failure")
+
+        service.adapter.generate = generate
+        return service
 
     queued = service_at(tmp_path).enqueue("bounded", request(), max_attempts=2)
     for _ in range(3):
-        service_at(tmp_path, adapter=RetryableAdapter()).work()
+        retryable_service().work()
 
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
     assert snapshot["status"] == "failed"
@@ -287,8 +325,8 @@ def test_unknown_failure_is_terminal_and_never_automatically_retried(tmp_path: P
         def generate(self, plan, stream):
             raise RuntimeError("unclassified failure")
 
-    service = service_at(tmp_path, adapter=FailedAdapter())
-    queued = service.enqueue("unknown", request(), max_attempts=3)
+    service = _admitted_service_at(tmp_path, adapter=FailedAdapter())
+    queued = _admit(service, "unknown", request(), max_attempts=3)
     service.work(limit=3)
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
     assert snapshot["status"] == "failed"
@@ -305,8 +343,8 @@ def test_failed_external_invocation_quarantines_resource(tmp_path: Path) -> None
         def generate(self, plan, stream):
             raise RuntimeError("external response lost")
 
-    service = service_at(tmp_path, adapter=ExternalFailure())
-    queued = service.enqueue("unknown-external", request(), max_attempts=3)
+    service = _admitted_service_at(tmp_path, adapter=ExternalFailure())
+    queued = _admit(service, "unknown-external", request(), max_attempts=3)
     service.work()
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
     assert snapshot["status"] == "ambiguous"
@@ -343,8 +381,8 @@ def test_stale_identity_cannot_fail_or_complete_successor_attempt(tmp_path: Path
             return super().generate(plan, stream)
 
     adapter = FailThenPause()
-    service = service_at(tmp_path, adapter=adapter)
-    queued = service.enqueue("stale-successor", request(), max_attempts=2)
+    service = _admitted_service_at(tmp_path, adapter=adapter)
+    queued = _admit(service, "stale-successor", request(), max_attempts=2)
     service.work()
     with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
         connection.row_factory = sqlite3.Row
@@ -471,12 +509,12 @@ def test_canceled_external_publication_without_termination_proof_quarantines_res
         if name == "before_commit" and not canceled:
             canceled.append(service_at(tmp_path).cancel(queued.job_id))
 
-    service = service_at(
+    service = _admitted_service_at(
         tmp_path,
         adapter=ExternalAdapter(),
         publication_checkpoint=cancel_at,
     )
-    queued = service.enqueue("external-cancel", request(), max_attempts=2)
+    queued = _admit(service, "external-cancel", request(), max_attempts=2)
     service.work()
 
     assert canceled[0]["outcome"] == "accepted"
@@ -498,8 +536,8 @@ def test_undeclared_containment_does_not_authorize_retry_after_dispatch(
         def generate(self, plan, stream):
             raise RetryableGenerationError("retry only if termination is proven")
 
-    service = service_at(tmp_path, adapter=UndeclaredRetryableAdapter())
-    queued = service.enqueue("undeclared-containment", request(), max_attempts=2)
+    service = _admitted_service_at(tmp_path, adapter=UndeclaredRetryableAdapter())
+    queued = _admit(service, "undeclared-containment", request(), max_attempts=2)
     assert service.work()["status"] == "complete"
 
     snapshot = service.get_provenance(queued.job_id)
@@ -680,12 +718,13 @@ def test_canceled_allocated_attempt_reconciliation_finalizes_attempt_and_resourc
             containment_contract = None
 
         adapter = ExternalAdapter()
+        service = _admitted_service_at(tmp_path, adapter=adapter)
+        queued = _admit(service, "canceled-allocation", request(), max_attempts=2)
     else:
         adapter = DeterministicCpuAdapter()
-
-    queued = service_at(tmp_path, adapter=adapter).enqueue(
-        "canceled-allocation", request(), max_attempts=2
-    )
+        queued = service_at(tmp_path, adapter=adapter).enqueue(
+            "canceled-allocation", request(), max_attempts=2
+        )
     crash_worker(tmp_path, checkpoint="stage_written", external=external)
     assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
 
@@ -764,8 +803,10 @@ def test_live_ready_cancellation_finalizes_before_recovery(
             preserved.append((final, final.stat().st_ino, final.read_bytes()))
         assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
 
-    service = service_at(tmp_path, adapter=Adapter(), publication_checkpoint=cancel_at)
-    queued = service.enqueue("live-ready-cancel", request(), max_attempts=2)
+    service = _admitted_service_at(
+        tmp_path, adapter=Adapter(), publication_checkpoint=cancel_at
+    )
+    queued = _admit(service, "live-ready-cancel", request(), max_attempts=2)
     service.work()
 
     # These assertions intentionally precede every explicit recovery call.
@@ -795,8 +836,8 @@ def test_recovered_external_artifact_reports_quarantine_immediately(tmp_path: Pa
     class ExternalAdapter(DeterministicCpuAdapter):
         containment_contract = None
 
-    service = service_at(tmp_path, adapter=ExternalAdapter())
-    queued = service.enqueue("external-ready", request())
+    service = _admitted_service_at(tmp_path, adapter=ExternalAdapter())
+    queued = _admit(service, "external-ready", request())
     crash_worker(tmp_path, checkpoint="ready_committed", external=True)
 
     report = service.recover()
@@ -838,8 +879,13 @@ def test_cancel_after_reconciliation_snapshot_cannot_restore_retry(
     class CrashAdapter(DeterministicCpuAdapter):
         containment_contract = None if external else PROCESS_CONTAINED_CONTRACT
 
-    service = service_at(tmp_path, adapter=CrashAdapter())
-    queued = service.enqueue("snapshot-cancel-race", request(), max_attempts=max_attempts)
+    service = _admitted_service_at(tmp_path, adapter=CrashAdapter())
+    queued = _admit(
+        service,
+        "snapshot-cancel-race",
+        request(),
+        max_attempts=max_attempts,
+    )
     crash_worker(tmp_path, checkpoint="stage_written", external=external)
     snapshot_read = threading.Event()
     resume_finalization = threading.Event()
