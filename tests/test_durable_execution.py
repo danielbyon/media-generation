@@ -20,6 +20,12 @@ from media_generation.errors import (
     RetryableGenerationError,
 )
 from media_generation.service import GenerationService
+from media_generation.admission import (
+    build_admission_profile,
+    parse_admission_policy,
+    parse_workload_demand,
+)
+from test_resource_admission import GIB, inventory_report, workload_demand
 
 
 PREPUBLICATION_CHECKPOINTS = (
@@ -49,6 +55,25 @@ POSTCOMMIT_CHECKPOINTS = (
 )
 
 ALL_PUBLICATION_CHECKPOINTS = PREPUBLICATION_CHECKPOINTS + POSTCOMMIT_CHECKPOINTS
+
+
+def _heavyweight_profile():
+    """Return deterministic capacity evidence for durable test subclasses."""
+    return build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+
+
+def _heavyweight_demand():
+    """Return an explicit capacity demand that fits the test profile."""
+    return parse_workload_demand(workload_demand())
 
 
 def service_at(root: Path, **kwargs) -> GenerationService:
@@ -260,7 +285,11 @@ def test_cli_enqueue_preserves_omitted_budget_and_rejects_explicit_conflict(
     ("intent", "configuration", "destination", "budget", "output_slot"),
 )
 def test_changed_resolved_work_conflicts_even_after_restart(tmp_path: Path, change: str) -> None:
-    service_at(tmp_path).enqueue("immutable", request(), max_attempts=2)
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    service_at(tmp_path, admission_profile=admission_profile).enqueue(
+        "immutable", request(), max_attempts=2, workload_demand=demand
+    )
     adapter = DeterministicCpuAdapter()
     if change == "configuration":
         class ChangedAdapter(DeterministicCpuAdapter):
@@ -271,7 +300,12 @@ def test_changed_resolved_work_conflicts_even_after_restart(tmp_path: Path, chan
         adapter = ChangedAdapter()
 
     output = tmp_path / ("elsewhere" if change == "destination" else "images")
-    service = GenerationService(tmp_path / "studio.sqlite3", output, adapter)
+    service = GenerationService(
+        tmp_path / "studio.sqlite3",
+        output,
+        adapter,
+        admission_profile=admission_profile,
+    )
     payload = GenerationRequest("Changed intent") if change == "intent" else request()
     if change == "output_slot":
         payload = GenerationRequest(
@@ -287,6 +321,7 @@ def test_changed_resolved_work_conflicts_even_after_restart(tmp_path: Path, chan
             "immutable",
             payload,
             max_attempts=3 if change == "budget" else 2,
+        workload_demand=demand,
         )
 
 
@@ -323,13 +358,23 @@ def test_active_cancellation_fences_publication_until_adapter_stops(tmp_path: Pa
             assert resume.wait(10)
             return super().generate(plan, stream)
 
-    service = service_at(tmp_path, adapter=PausedAdapter())
-    queued = service.enqueue("paused", request(), max_attempts=2)
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    service = service_at(
+        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+    )
+    queued = service.enqueue(
+        "paused", request(), max_attempts=2, workload_demand=demand
+    )
     with ThreadPoolExecutor() as pool:
         running = pool.submit(service.work)
         try:
             assert entered.wait(5)
-            other = service_at(tmp_path)
+            other = service_at(
+                tmp_path,
+                adapter=PausedAdapter(),
+                admission_profile=admission_profile,
+            )
             assert other.cancel(queued.job_id)["outcome"] == "accepted"
             assert other.work()["status"] == "resource_busy"
             assert other.recover()["status"] == "resource_busy"
@@ -338,7 +383,9 @@ def test_active_cancellation_fences_publication_until_adapter_stops(tmp_path: Pa
             resume.set()
         running.result(timeout=10)
 
-    snapshot = service_at(tmp_path).get_provenance(queued.job_id)
+    snapshot = service_at(tmp_path, admission_profile=admission_profile).get_provenance(
+        queued.job_id
+    )
     assert snapshot["status"] == "canceled"
     assert snapshot["attempts"][0]["termination_proven"] is True
     assert snapshot["artifact"] is None
@@ -355,22 +402,28 @@ def test_synchronous_contention_is_explicit_and_reuses_admitted_job(tmp_path: Pa
             assert resume.wait(10)
             return super().generate(plan, stream)
 
-    worker = service_at(tmp_path, adapter=PausedAdapter())
-    worker.enqueue("occupy", request())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    worker = service_at(
+        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+    )
+    worker.enqueue("occupy", request(), workload_demand=demand)
     with ThreadPoolExecutor() as pool:
         running = pool.submit(worker.work)
         try:
             assert entered.wait(5)
-            synchronous = service_at(tmp_path)
+            synchronous = service_at(tmp_path, admission_profile=admission_profile)
             with pytest.raises(ResourceBusyError) as failure:
-                synchronous.submit("contended", request())
+                synchronous.submit("contended", request(), workload_demand=demand)
             job_id = failure.value.job_id
             assert synchronous.get_job(job_id).execution_status == "queued"
         finally:
             resume.set()
         running.result(timeout=10)
 
-    result = service_at(tmp_path).submit("contended", request())
+    result = service_at(tmp_path, admission_profile=admission_profile).submit(
+        "contended", request(), workload_demand=demand
+    )
     assert result.job_id == job_id and result.status == "succeeded"
 
 
@@ -434,8 +487,14 @@ def test_retry_cli_requeues_same_job_then_worker_creates_next_attempt(tmp_path: 
         tmp_path / "studio.sqlite3",
         output,
         adapter=RetryOnceAdapter(),
+        admission_profile=_heavyweight_profile(),
     )
-    queued = service.enqueue("retry-once", request(), max_attempts=2)
+    queued = service.enqueue(
+        "retry-once",
+        request(),
+        max_attempts=2,
+        workload_demand=_heavyweight_demand(),
+    )
     assert service.work()["status"] == "complete"
     retry_state = service.get_provenance(queued.job_id)
     assert retry_state["status"] == "queued"
@@ -525,8 +584,14 @@ def test_expired_lease_does_not_reclaim_a_live_process(tmp_path: Path) -> None:
             assert resume.wait(10)
             return super().generate(plan, stream)
 
-    service = service_at(tmp_path, adapter=PausedAdapter())
-    job = service.enqueue("lease", request(), max_attempts=3)
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    service = service_at(
+        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+    )
+    job = service.enqueue(
+        "lease", request(), max_attempts=3, workload_demand=demand
+    )
     with ThreadPoolExecutor() as pool:
         running = pool.submit(service.work)
         try:
@@ -535,14 +600,18 @@ def test_expired_lease_does_not_reclaim_a_live_process(tmp_path: Path) -> None:
                 connection.execute(
                     "UPDATE execution_attempts SET lease_expires_at = '2000-01-01T00:00:00+00:00'"
                 )
-            restarted = service_at(tmp_path)
+            restarted = service_at(tmp_path, admission_profile=admission_profile)
             assert restarted.recover()["status"] == "resource_busy"
             assert restarted.work()["status"] == "resource_busy"
             assert len(restarted.get_provenance(job.job_id)["attempts"]) == 1
         finally:
             resume.set()
         running.result(timeout=10)
-    assert len(service_at(tmp_path).get_provenance(job.job_id)["attempts"]) == 1
+    assert len(
+        service_at(tmp_path, admission_profile=admission_profile).get_provenance(
+            job.job_id
+        )["attempts"]
+    ) == 1
 
 
 @pytest.mark.parametrize(
@@ -587,12 +656,21 @@ def test_worker_only_claims_matching_adapter_and_destination(tmp_path: Path) -> 
         def configuration(self):
             return {**super().configuration, "worker_variant": 2}
 
-    default = service_at(tmp_path)
-    job = default.enqueue("matching-context", request())
-    assert service_at(tmp_path, adapter=ChangedAdapter()).work()["status"] == "idle"
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    default = service_at(tmp_path, admission_profile=admission_profile)
+    job = default.enqueue("matching-context", request(), workload_demand=demand)
+    assert service_at(
+        tmp_path,
+        adapter=ChangedAdapter(),
+        admission_profile=admission_profile,
+    ).work()["status"] == "idle"
     other_root = tmp_path / "other-images"
     assert GenerationService(
-        tmp_path / "studio.sqlite3", other_root, DeterministicCpuAdapter()
+        tmp_path / "studio.sqlite3",
+        other_root,
+        DeterministicCpuAdapter(),
+        admission_profile=admission_profile,
     ).work()["status"] == "idle"
     assert default.get_job(job.job_id).execution_status == "queued"
     assert default.work()["status"] == "complete"
@@ -657,7 +735,11 @@ def test_process_containment_and_attempt_authority_are_persisted_before_dispatch
                 )
             return super().generate(plan, stream)
 
-    result = service_at(tmp_path, adapter=ObservingAdapter()).submit("contained", request())
+    result = service_at(
+        tmp_path,
+        adapter=ObservingAdapter(),
+        admission_profile=_heavyweight_profile(),
+    ).submit("contained", request(), workload_demand=_heavyweight_demand())
     assert result.status == "succeeded"
     assert len(observed) == 1
     attempt = observed[0]
@@ -763,9 +845,17 @@ def test_queued_job_does_not_report_another_jobs_resource_state(tmp_path: Path) 
                 raise RuntimeError("paused adapter was not released")
             return super().generate(plan, destination)
 
-    service = service_at(tmp_path, adapter=PausedAdapter())
-    owner = service.enqueue("resource-owner", request("resource owner"))
-    other = service.enqueue("resource-other", request("resource other"))
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    service = service_at(
+        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+    )
+    owner = service.enqueue(
+        "resource-owner", request("resource owner"), workload_demand=demand
+    )
+    other = service.enqueue(
+        "resource-other", request("resource other"), workload_demand=demand
+    )
 
     with ThreadPoolExecutor(max_workers=1) as executor:
         working = executor.submit(service.work)
@@ -794,10 +884,18 @@ def test_idempotency_rejects_different_non_null_containment_contract(
     class DifferentContainedAdapter(DeterministicCpuAdapter):
         containment_contract = "different-contained/v1"
 
-    service_at(tmp_path).enqueue("contract-identity", request())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    service_at(tmp_path, admission_profile=admission_profile).enqueue(
+        "contract-identity", request(), workload_demand=demand
+    )
     with pytest.raises(IdempotencyConflictError, match="containment contract"):
-        service_at(tmp_path, adapter=DifferentContainedAdapter()).enqueue(
-            "contract-identity", request()
+        service_at(
+            tmp_path,
+            adapter=DifferentContainedAdapter(),
+            admission_profile=admission_profile,
+        ).enqueue(
+            "contract-identity", request(), workload_demand=demand
         )
 
 
@@ -809,9 +907,15 @@ def test_idempotency_rejects_contract_for_existing_queued_null_job(
     class ExternalAdapter(DeterministicCpuAdapter):
         containment_contract = None
 
-    service_at(tmp_path, adapter=ExternalAdapter()).enqueue("external-queued", request())
+    admission_profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    service_at(
+        tmp_path, adapter=ExternalAdapter(), admission_profile=admission_profile
+    ).enqueue("external-queued", request(), workload_demand=demand)
     with pytest.raises(IdempotencyConflictError, match="containment contract"):
-        service_at(tmp_path).enqueue("external-queued", request())
+        service_at(tmp_path, admission_profile=admission_profile).enqueue(
+            "external-queued", request(), workload_demand=demand
+        )
 
 
 def test_succeeded_reuse_ignores_incoming_budget_without_rewriting_policy(tmp_path: Path) -> None:
@@ -848,8 +952,15 @@ def test_worker_report_preserves_each_claim_outcome_after_retry_success(tmp_path
                 raise RetryableGenerationError("retry once")
             return super().generate(plan, stream)
 
-    service = service_at(tmp_path, adapter=RetryOnce())
-    job = service.enqueue("outcome-retry", request(), max_attempts=2)
+    service = service_at(
+        tmp_path, adapter=RetryOnce(), admission_profile=_heavyweight_profile()
+    )
+    job = service.enqueue(
+        "outcome-retry",
+        request(),
+        max_attempts=2,
+        workload_demand=_heavyweight_demand(),
+    )
     report = service.work(limit=2)
     assert report["status"] == "complete"
     assert report["processed"] == 2
@@ -878,8 +989,15 @@ def test_worker_cli_exit_reflects_claim_outcome(
                 service.cancel(plan.job_id)
             return super().generate(plan, stream)
 
-    service = service_at(tmp_path, adapter=Adapter())
-    job = service.enqueue("outcome-cli", request(), max_attempts=2)
+    service = service_at(
+        tmp_path, adapter=Adapter(), admission_profile=_heavyweight_profile()
+    )
+    job = service.enqueue(
+        "outcome-cli",
+        request(),
+        max_attempts=2,
+        workload_demand=_heavyweight_demand(),
+    )
     monkeypatch.setattr("media_generation.cli.GenerationService", lambda *args, **kwargs: service)
     exit_code = main(["worker", "--db", str(tmp_path / "studio.sqlite3"), "--output-dir", str(tmp_path / "images")])
     report = json.loads(capsys.readouterr().out)
@@ -905,8 +1023,12 @@ def test_worker_contention_preserves_already_processed_claim_outcomes(
     class External(DeterministicCpuAdapter):
         containment_contract = None
 
-    service = service_at(tmp_path, adapter=External())
-    job = service.enqueue("batch-quarantine", request())
+    service = service_at(
+        tmp_path, adapter=External(), admission_profile=_heavyweight_profile()
+    )
+    job = service.enqueue(
+        "batch-quarantine", request(), workload_demand=_heavyweight_demand()
+    )
     monkeypatch.setattr("media_generation.cli.GenerationService", lambda *args, **kwargs: service)
     code = main(["worker", "--db", str(tmp_path / "studio.sqlite3"), "--output-dir", str(tmp_path / "images"), "--limit", "2"])
     result = json.loads(capsys.readouterr().err)

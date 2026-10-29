@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,56 @@ def test_output_replaces_preexisting_symlink_without_following_it(
     payload = json.loads((output / "inventory.json").read_text(encoding="utf-8"))
     assert payload["schema"] == "media-generation.inventory"
     assert not list(output.glob(".*.tmp"))
+
+
+def test_collected_report_satisfies_the_canonical_v1_contract(
+    tmp_path: Path,
+) -> None:
+    """Collected reports use the same validated contract as admission inputs."""
+    from media_generation.inventory import validate_inventory_report
+
+    result = _result(tmp_path)
+
+    validated = validate_inventory_report(result.inventory)
+
+    assert validated.host["memory"] == result.inventory["host"]["memory"]
+    assert validated.fingerprint == result.inventory["environment_fingerprint"]
+
+
+def test_canonical_contract_accepts_valid_inventory_with_unknown_memory(
+    tmp_path: Path,
+) -> None:
+    """A report remains valid when host probes cannot observe system memory."""
+    from media_generation.inventory import validate_inventory_report
+    from media_generation.inventory.fingerprint import build_environment_fingerprint
+
+    document = deepcopy(_result(tmp_path).inventory)
+    memory = document["host"]["memory"]
+    memory["system"]["total_bytes"] = None
+    memory["topology"]["system_total_bytes"] = None
+    memory["topology"]["reported_total_bytes"] = None
+    memory["topology"]["class"] = "unknown"
+    memory["topology"]["allocatable_pools"] = []
+    memory["topology"]["sharing_relationships"] = []
+    document["environment_fingerprint"] = build_environment_fingerprint(
+        document["host"], document["runtimes"]
+    )
+
+    validated = validate_inventory_report(document)
+
+    assert validated.host["memory"]["system"]["total_bytes"] is None
+
+
+def test_canonical_contract_rejects_boolean_schema_version(tmp_path: Path) -> None:
+    """Boolean JSON values cannot impersonate the integer inventory version."""
+    from media_generation.inventory import validate_inventory_report
+    from media_generation.inventory.schema import InventoryValidationError
+
+    document = deepcopy(_result(tmp_path).inventory)
+    document["schema_version"] = True
+
+    with pytest.raises(InventoryValidationError, match="schema_version"):
+        validate_inventory_report(document)
 
 
 def test_output_snapshot_rejects_symlink_substitution_before_open(

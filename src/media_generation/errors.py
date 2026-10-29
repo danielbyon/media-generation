@@ -4,6 +4,11 @@
 class GenerationError(Exception):
     """Base class for expected request and execution failures."""
 
+    def __init__(self, message: str, *, safe_message: str | None = None) -> None:
+        """Retain a local diagnostic while exposing a separate CLI-safe message."""
+        super().__init__(message)
+        self.safe_message = message if safe_message is None else safe_message
+
 
 class InputValidationError(GenerationError):
     """The submitted request or idempotency key is malformed."""
@@ -72,8 +77,10 @@ class PublicationIncompleteError(PublicationError):
     applies to that execution without creating a new request or attempt.
     """
 
-    def __init__(self, job_id: str, message: str) -> None:
-        super().__init__(message)
+    def __init__(
+        self, job_id: str, message: str, *, safe_message: str | None = None
+    ) -> None:
+        super().__init__(message, safe_message=safe_message)
         self.job_id = job_id
         self.recovery = (
             "Run reconcile with the same database and output directory, then "
@@ -88,6 +95,8 @@ class ArtifactIntegrityError(GenerationError):
 class GenerationExecutionError(GenerationError):
     """An adapter failed after a job and attempt were durably created."""
 
-    def __init__(self, job_id: str, message: str) -> None:
-        super().__init__(message)
+    def __init__(
+        self, job_id: str, message: str, *, safe_message: str | None = None
+    ) -> None:
+        super().__init__(message, safe_message=safe_message)
         self.job_id = job_id

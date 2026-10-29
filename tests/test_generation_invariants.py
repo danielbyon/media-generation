@@ -30,6 +30,70 @@ from media_generation.errors import (
     UnsupportedCapabilityError,
 )
 from media_generation.service import GenerationExecutionError, GenerationService
+from media_generation.admission import (
+    build_admission_profile,
+    parse_admission_policy,
+    parse_workload_demand,
+)
+from test_resource_admission import GIB, inventory_report, workload_demand
+
+
+def _heavyweight_profile():
+    """Return deterministic capacity evidence for adapter subclasses."""
+    return build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+
+
+def _heavyweight_demand():
+    """Return explicit demand that fits the deterministic test profile."""
+    return parse_workload_demand(workload_demand())
+
+
+@pytest.mark.parametrize(
+    ("profile_supplied", "demand_supplied"),
+    ((False, False), (True, False), (False, True)),
+    ids=("missing-both", "missing-demand", "missing-profile"),
+)
+def test_heavyweight_enqueue_rejects_incomplete_admission_without_persisting(
+    tmp_path: Path,
+    profile_supplied: bool,
+    demand_supplied: bool,
+) -> None:
+    """Reject absent capacity evidence before creating undispatchable work."""
+    database = tmp_path / "studio.sqlite3"
+    service = GenerationService(
+        database,
+        tmp_path / "images",
+        adapter=_VariantCpuAdapter(),
+        admission_profile=_heavyweight_profile() if profile_supplied else None,
+    )
+
+    with pytest.raises(
+        GenerationError,
+        match="heavyweight execution requires explicit profile and demand evidence",
+    ):
+        service.enqueue(
+            "incomplete-admission",
+            GenerationRequest(prompt="A red fox", width=32, height=32),
+            workload_demand=_heavyweight_demand() if demand_supplied else None,
+        )
+
+    with service._store._connection() as connection:
+        for table in (
+            "generation_requests",
+            "generation_jobs",
+            "execution_jobs",
+            "execution_admissions",
+        ):
+            assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
 
 
 class _VariantCpuAdapter(DeterministicCpuAdapter):
@@ -347,11 +411,16 @@ def test_idempotent_replay_accepts_nested_adapter_configuration(
         database,
         output_directory,
         adapter=_VariantCpuAdapter(configuration=configuration),
+        admission_profile=_heavyweight_profile(),
     )
     request = GenerationRequest(prompt="A glass greenhouse", seed=19)
 
-    original = service.submit("nested-config-retry", request)
-    replay = service.submit("nested-config-retry", request)
+    original = service.submit(
+        "nested-config-retry", request, workload_demand=_heavyweight_demand()
+    )
+    replay = service.submit(
+        "nested-config-retry", request, workload_demand=_heavyweight_demand()
+    )
 
     assert replay == original
 
@@ -365,10 +434,12 @@ def test_provenance_with_nested_adapter_configuration_is_json_serializable(
         tmp_path / "studio.sqlite3",
         tmp_path / "artifacts",
         adapter=_VariantCpuAdapter(configuration=configuration),
+        admission_profile=_heavyweight_profile(),
     )
     submitted = service.submit(
         "nested-config-provenance",
         GenerationRequest(prompt="A glass greenhouse", seed=19),
+        workload_demand=_heavyweight_demand(),
     )
 
     encoded = json.dumps(service.get_provenance(submitted.job_id))
@@ -396,35 +467,67 @@ def test_retired_pending_admission_cannot_create_sidecarless_jobs(tmp_path: Path
     GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
 
 
+@pytest.mark.parametrize("evidence", ("omitted", "none"))
 def test_direct_claim_without_privacy_evidence_rejects_protected_execution(
     tmp_path: Path,
+    evidence: str,
 ) -> None:
-    """Omitted evidence cannot claim a job with durable privacy evidence."""
+    """Omitted or null evidence cannot claim without durable execution authority."""
     service = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "artifacts")
     queued = service.enqueue(
         "legacy-direct-claim", GenerationRequest("Legacy direct claim", seed=9)
     )
+    _, adapter_configuration_json, _, privacy_compliance_json = (
+        service._current_privacy_snapshot()
+    )
+    claim_kwargs = {
+        "attempt_id": "att_fedcba9876543210fedcba9876543210",
+        "owner_id": "worker_legacy",
+        "adapter_id": service.adapter.adapter_id,
+        "adapter_configuration_json": adapter_configuration_json,
+        "resolved_output_directory": str(tmp_path / "artifacts"),
+        "process_contained": True,
+        "containment_contract": PROCESS_CONTAINED_CONTRACT,
+        "timestamp": "2026-10-26T00:00:00+00:00",
+        "lease_expires_at": "2026-10-26T00:01:00+00:00",
+        "job_id": queued.job_id,
+        "allow_not_required": True,
+    }
+    if evidence == "none":
+        claim_kwargs["privacy_compliance_json"] = None
 
     with pytest.raises(
         GenerationError,
-        match="protected execution claim requires exact privacy-compliance evidence",
+        match=f"^protected execution claim requires exact privacy-compliance evidence: {queued.job_id}$",
     ):
-        service._store.claim_next_execution(
-            attempt_id="att_fedcba9876543210fedcba9876543210",
-            owner_id="worker_legacy",
-            adapter_id=service.adapter.adapter_id,
-            adapter_configuration_json=json.dumps(
-                service.adapter.configuration, sort_keys=True, separators=(",", ":")
-            ),
-            resolved_output_directory=str(tmp_path / "artifacts"),
-            process_contained=True,
-            containment_contract=PROCESS_CONTAINED_CONTRACT,
-            timestamp="2026-10-26T00:00:00+00:00",
-            lease_expires_at="2026-10-26T00:01:00+00:00",
-            job_id=queued.job_id,
-        )
+        service._store.claim_next_execution(**claim_kwargs)
 
-    assert service.get_provenance(queued.job_id)["status"] == "queued"
+    with service._store._connection() as connection:
+        execution = connection.execute(
+            "SELECT status, current_attempt_id FROM execution_jobs WHERE job_id = ?",
+            (queued.job_id,),
+        ).fetchone()
+        attempts = connection.execute(
+            "SELECT count(*) FROM execution_attempts WHERE job_id = ?",
+            (queued.job_id,),
+        ).fetchone()[0]
+        resource = connection.execute(
+            "SELECT state, job_id, attempt_id FROM execution_resource WHERE id = 1"
+        ).fetchone()
+    assert execution is not None
+    assert execution["status"] == "queued"
+    assert execution["current_attempt_id"] is None
+    assert attempts == 0
+    assert resource is not None
+    assert tuple(resource) == ("available", None, None)
+
+    claim_kwargs.pop("privacy_compliance_json", None)
+    claim = service._store.claim_next_execution(
+        **claim_kwargs,
+        privacy_compliance_json=privacy_compliance_json,
+    )
+    assert claim is not None
+    assert claim.job_id == queued.job_id
 
 
 def test_artifact_attempt_must_belong_to_the_job_being_completed(
@@ -447,6 +550,7 @@ def test_artifact_attempt_must_belong_to_the_job_being_completed(
         process_contained=True, containment_contract=PROCESS_CONTAINED_CONTRACT,
         timestamp="2026-10-21T00:00:00+00:00",
         lease_expires_at="2026-10-21T00:01:00+00:00", job_id=first.job_id,
+        allow_not_required=True,
     )
     assert first_claim is not None
     artifact = GenerationArtifact(
@@ -488,8 +592,11 @@ def test_idempotent_reuse_checks_current_adapter_capabilities(tmp_path: Path) ->
         database,
         output_directory,
         adapter=_VariantCpuAdapter(),
+        admission_profile=_heavyweight_profile(),
     )
-    original = original_service.submit("adapter-capability-retry", request)
+    original = original_service.submit(
+        "adapter-capability-retry", request, workload_demand=_heavyweight_demand()
+    )
     limited_adapter = _VariantCpuAdapter(
         capabilities=AdapterCapabilities(
             max_width=32,
@@ -498,10 +605,17 @@ def test_idempotent_reuse_checks_current_adapter_capabilities(tmp_path: Path) ->
             max_references=4,
         )
     )
-    retry_service = GenerationService(database, output_directory, adapter=limited_adapter)
+    retry_service = GenerationService(
+        database,
+        output_directory,
+        adapter=limited_adapter,
+        admission_profile=_heavyweight_profile(),
+    )
 
     with pytest.raises(UnsupportedCapabilityError, match="supports width"):
-        retry_service.submit("adapter-capability-retry", request)
+        retry_service.submit(
+            "adapter-capability-retry", request, workload_demand=_heavyweight_demand()
+        )
 
     assert original_service.get_job(original.job_id).status == "succeeded"
 
@@ -531,13 +645,23 @@ def test_idempotent_reuse_rejects_changed_adapter_configuration(
         database,
         output_directory,
         adapter=_VariantCpuAdapter(),
+        admission_profile=_heavyweight_profile(),
     )
-    original_service.submit("adapter-config-retry", request)
+    original_service.submit(
+        "adapter-config-retry", request, workload_demand=_heavyweight_demand()
+    )
     current_adapter = _VariantCpuAdapter(**adapter_overrides)
-    retry_service = GenerationService(database, output_directory, adapter=current_adapter)
+    retry_service = GenerationService(
+        database,
+        output_directory,
+        adapter=current_adapter,
+        admission_profile=_heavyweight_profile(),
+    )
 
     with pytest.raises(IdempotencyConflictError, match="adapter identity or configuration"):
-        retry_service.submit("adapter-config-retry", request)
+        retry_service.submit(
+            "adapter-config-retry", request, workload_demand=_heavyweight_demand()
+        )
 
 
 def test_idempotent_reuse_rejects_changed_output_directory(tmp_path: Path) -> None:
@@ -587,11 +711,17 @@ def test_concurrent_same_key_submissions_check_persisted_adapter_configuration(
         height=48,
     )
     services = (
-        GenerationService(database, output_directory, adapter=_VariantCpuAdapter()),
+        GenerationService(
+            database,
+            output_directory,
+            adapter=_VariantCpuAdapter(),
+            admission_profile=_heavyweight_profile(),
+        ),
         GenerationService(
             database,
             output_directory,
             adapter=_VariantCpuAdapter(**second_adapter_overrides),
+            admission_profile=_heavyweight_profile(),
         ),
     )
     initial_lookup_barrier = Barrier(2)
@@ -608,7 +738,11 @@ def test_concurrent_same_key_submissions_check_persisted_adapter_configuration(
 
     def submit(service: GenerationService) -> object:
         try:
-            return service.submit("concurrent-adapter-retry", request)
+            return service.submit(
+                "concurrent-adapter-retry",
+                request,
+                workload_demand=_heavyweight_demand(),
+            )
         except IdempotencyConflictError as error:
             return error
 
@@ -655,12 +789,27 @@ def test_matching_submit_while_adapter_is_paused_returns_existing_running_state(
                 raise RuntimeError("paused adapter was not released")
             return super().generate(plan, destination)
 
-    first_service = GenerationService(database, output_directory, adapter=PausedAdapter())
-    matching_service = GenerationService(database, output_directory, adapter=PausedAdapter())
+    first_service = GenerationService(
+        database,
+        output_directory,
+        adapter=PausedAdapter(),
+        admission_profile=_heavyweight_profile(),
+    )
+    matching_service = GenerationService(
+        database,
+        output_directory,
+        adapter=PausedAdapter(),
+        admission_profile=_heavyweight_profile(),
+    )
     monkeypatch.setattr(first_service._store, "renew_attempt", lambda *args, **kwargs: False)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        first = executor.submit(first_service.submit, "paused-reuse", request)
+        first = executor.submit(
+            first_service.submit,
+            "paused-reuse",
+            request,
+            workload_demand=_heavyweight_demand(),
+        )
         assert entered.wait(timeout=10)
         with sqlite3.connect(database) as connection:
             connection.execute(
@@ -673,6 +822,7 @@ def test_matching_submit_while_adapter_is_paused_returns_existing_running_state(
                 matching_service.submit,
                 "paused-reuse",
                 request,
+            workload_demand=_heavyweight_demand(),
             )
             reused = matching.result(timeout=2)
             snapshot = matching_service.get_provenance(reused.job_id)
@@ -708,15 +858,20 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
         database,
         original_output_directory,
         adapter=adapter,
+        admission_profile=_heavyweight_profile(),
     )
     adapter.service = original_service
 
     with pytest.raises(GenerationExecutionError) as failure:
-        original_service.submit("failed-output-directory-retry", request)
+        original_service.submit(
+            "failed-output-directory-retry", request, workload_demand=_heavyweight_demand()
+        )
     original_job = original_service.get_job(failure.value.job_id)
 
     same_directory_retry = original_service.submit(
-        "failed-output-directory-retry", request
+        "failed-output-directory-retry",
+        request,
+        workload_demand=_heavyweight_demand(),
     )
     assert same_directory_retry.job_id == original_job.job_id
     assert same_directory_retry.status == "failed"
@@ -725,9 +880,12 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
         database,
         tmp_path / "other-artifacts",
         adapter=_FailAfterWritingAdapter(),
+        admission_profile=_heavyweight_profile(),
     )
     with pytest.raises(IdempotencyConflictError, match="output directory"):
-        different_directory_service.submit("failed-output-directory-retry", request)
+        different_directory_service.submit(
+            "failed-output-directory-retry", request, workload_demand=_heavyweight_demand()
+        )
 
 
 class _FailAfterWritingAdapter:
@@ -795,6 +953,7 @@ def test_falsey_adapter_is_selected_and_used(tmp_path: Path) -> None:
         database_path=tmp_path / "studio.sqlite3",
         output_directory=tmp_path / "artifacts",
         adapter=adapter,
+        admission_profile=_heavyweight_profile(),
     )
 
     assert service.adapter is adapter
@@ -813,6 +972,7 @@ def test_falsey_adapter_is_selected_and_used(tmp_path: Path) -> None:
             height=48,
             output_slot="cover",
         ),
+        workload_demand=_heavyweight_demand(),
     )
     job = service.get_job(submission.job_id)
 
@@ -843,6 +1003,7 @@ def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
         database_path=tmp_path / "studio.sqlite3",
         output_directory=tmp_path / "artifacts",
         adapter=adapter,
+        admission_profile=_heavyweight_profile(),
     )
     adapter.service = service
 
@@ -856,6 +1017,7 @@ def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
                 height=48,
                 output_slot="cover",
             ),
+        workload_demand=_heavyweight_demand(),
         )
 
     job = service.get_job(failure.value.job_id)
@@ -928,7 +1090,10 @@ def test_corrupt_reference_is_rejected_before_adapter_execution(
 
     adapter = _TrackingCpuAdapter()
     consumer_service = GenerationService(
-        database, tmp_path / "consumer-artifacts", adapter=adapter
+        database,
+        tmp_path / "consumer-artifacts",
+        adapter=adapter,
+        admission_profile=_heavyweight_profile(),
     )
     with pytest.raises(GenerationExecutionError) as failure:
         consumer_service.submit(
@@ -940,6 +1105,7 @@ def test_corrupt_reference_is_rejected_before_adapter_execution(
                 height=32,
                 reference_ids=(source_artifact.artifact_id,),
             ),
+        workload_demand=_heavyweight_demand(),
         )
 
     job = consumer_service.get_job(failure.value.job_id)

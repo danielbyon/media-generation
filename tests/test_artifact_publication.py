@@ -55,6 +55,12 @@ from media_generation.errors import (
     ResourceBusyError,
 )
 from media_generation.service import GenerationService
+from media_generation.admission import (
+    build_admission_profile,
+    parse_admission_policy,
+    parse_workload_demand,
+)
+from test_resource_admission import GIB, inventory_report, workload_demand
 
 
 PRE_READY_CHECKPOINTS = (
@@ -86,6 +92,21 @@ ROOT_TOKEN = "user.media_generation.root"
 STAGE_TOKEN = "user.media_generation.publication"
 CLEANUP_TOKEN = "user.media_generation.cleanup"
 CLEANUP_DIRECTORY = ".artifact-cleanup"
+
+
+def _heavyweight_admission():
+    """Return explicit capacity evidence for a publication-adapter subclass."""
+    profile = build_admission_profile(
+        inventory_report(),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    return profile, parse_workload_demand(workload_demand())
 
 
 @dataclass(frozen=True)
@@ -822,12 +843,13 @@ def test_t03_io_partial_write_failure_abandons_only_owned_stage(
 ) -> None:
     """T03 I/O: partial writes cannot expose an artifact or remove unrelated destination files."""
     adapter = _FailingWriteAdapter(error_number)
-    service = workspace.service(adapter=adapter)
+    admission_profile, demand = _heavyweight_admission()
+    service = workspace.service(adapter=adapter, admission_profile=admission_profile)
     workspace.output.mkdir()
     unknown = workspace.output / "keep.png"
     original = _write_png(unknown)
     with pytest.raises(GenerationExecutionError, match="injected staging write failure"):
-        service.submit("write-error", _request())
+        service.submit("write-error", _request(), workload_demand=demand)
     assert adapter.calls == 1
     record = _only_publication(workspace)
     assert record["state"] == "abandoned"
