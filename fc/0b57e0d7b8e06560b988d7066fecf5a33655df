@@ -1,0 +1,45 @@
+tests/test_candidate_preparation.py
+  s_494d337aef2948::t_d66b34a46a4e98 1-7420
+src/media_generation/_candidate_evaluation.py
+  s_494d337aef2948::t_b8936e0205d464 1-1130
+README.md
+  s_494d337aef2948::t_977983c97c21a2 374-469
+docs/adr/0002-declared-candidate-preparation.md
+  s_494d337aef2948::t_b86358e9895ad3 1-241
+docs/architecture/candidate-preparation.md
+  s_494d337aef2948::t_35ea7fd63bab0a 1-706
+src/media_generation/_candidate_acquisition.py
+  s_494d337aef2948::t_4f89254c9db710 1-2410
+src/media_generation/_candidate_contract.py
+  s_494d337aef2948::t_4e70b392393ec1 1-1712
+src/media_generation/_candidate_transport.py
+  s_494d337aef2948::t_e29f819adcd55c 1-470
+src/media_generation/candidate.py
+  s_494d337aef2948::t_ae5539f710e07f 1-44
+src/media_generation/cli.py
+  s_494d337aef2948::t_76cccd76a03ea2 31-40,222-264,273-274,408-413,441-469
+tests/candidate_linux_fakes.py
+  s_494d337aef2948::t_f4b11501a6cdb7 1-98
+tests/test_candidate_entry_integrity.py
+  s_494d337aef2948::t_5072c90720688d 1-576
+tests/test_candidate_linux_staging.py
+  s_494d337aef2948::t_dbe6ef032373c0 1-879
+tests/test_candidate_transport.py
+  s_494d337aef2948::t_035632facd7ad8 1-1105
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fc0b57e0d7b8e06560b988d7066fecf5a33655df",
+  "prompts": {},
+  "sessions": {
+    "s_494d337aef2948": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a18599-8f8a-7100-9df4-2f3f887fd048",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
