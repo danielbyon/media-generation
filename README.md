@@ -371,6 +371,102 @@ See [the inventory architecture guide](docs/architecture/inventory.md) for the
 manifest format, memory semantics, bounded header limits, fingerprint inputs,
 and the operator workflow for running on a target host.
 
+## Declared candidate preparation
+
+Prepare one exact engine, recipe, and model bundle with independently pinned
+full-file sizes and SHA-256 values:
+
+```sh
+PYTHONPATH=src python3.14 -m media_generation candidate verify \
+  --declaration /path/outside-the-repository/candidate.json \
+  --trusted-evidence /path/outside-the-repository/trusted-evidence.json
+
+PYTHONPATH=src python3.14 -m media_generation candidate prepare \
+  --declaration /path/outside-the-repository/candidate.json \
+  --trusted-evidence /path/outside-the-repository/trusted-evidence.json \
+  --manifest-output /path/outside-the-repository/prepared.json \
+  --journal-output /path/outside-the-repository/acquisition-journal.json
+```
+
+Verification is offline and non-mutating. It checks complete file bytes,
+required component roles, recipe compatibility evidence, architecture flags,
+adapter order and strength, conversion lineage, precision, quantization, and
+separate software and model license evidence. Missing, corrupt, incompatible,
+or unverifiable evidence blocks readiness.
+
+The Qwen Image Edit 2511 rule is version-specific. The evaluator reads declared
+engine, recipe, and component identifiers; engine and recipe version fields; and
+provenance publisher, revision, and canonical URL values. It requires a Qwen
+Image Edit match and a separate `2511` match in that set. Artifact pins,
+filenames, license or conversion evidence paths, and broad family labels do not
+trigger the rule.
+Both the engine and recipe must explicitly enable
+`qwen_image_zero_cond_t=true`, and pinned compatibility evidence
+must cover that flag and bind the exact engine identity and version, recipe
+identity, component roles and bytes, adapter configuration, and architecture
+flags. The same trusted compatibility contract binds every component's
+`precision` and `quantization`; unknown or evidence-mismatched values cannot
+produce a ready result.
+
+`--trusted-evidence` names a separate, host-controlled JSON file containing
+the expected size, SHA-256 value, and normalized contract for reviewed evidence
+documents. Candidate declarations do not provide this authority. Without an
+exact matching record, evidence remains `unverified`; there is no built-in trust
+store or candidate-ready default. Control JSON files are read as one stable,
+bounded snapshot: an opened symlink target is accepted, while identity, size, or
+metadata changes during the read fail validation closed. The command rejects
+output manifests and journals inside a Git worktree.
+Manifest and journal destinations are also rejected when they are the same
+physical file as the declaration, a declared artifact or evidence document,
+the acquisition configuration, or the `--trusted-evidence` input, including
+hard-link and symbolic-link aliases of those control files. For a control-file
+symlink, aliases of its referent are rejected as well.
+An acquisition destination is rejected when Git metadata appears in its parent
+chain between the declared root and the file, including a nested repository
+inside an otherwise acceptable root.
+
+Acquisition requires both `--acquire` and a separate transport
+configuration with exact allowed HTTPS origins, origin-scoped credentials, and
+bounded redirect, timeout, retry, and byte limits. The command fills missing
+artifacts through descriptor-bound atomic publication and records redacted,
+durable journal events. Linux stages bytes in an unnamed mode-0600 inode on
+the destination filesystem using `O_TMPFILE`. The retained descriptor is
+hashed and synchronized, then published without replacing an existing entry
+using `linkat` with `AT_EMPTY_PATH`, or the descriptor reference
+`/proc/self/fd/<stage-descriptor>` with `AT_SYMLINK_FOLLOW` when needed.
+Publication verifies that the final directory entry still names the verified
+inode. Unpublished staging cleanup closes the descriptor; there are no named
+staging files, operation directories, or quarantine entries to remove.
+Acquisition fails closed with exit `8` on macOS and other unsupported platforms,
+or when the filesystem cannot provide `O_TMPFILE` and descriptor-bound
+publication. Offline inspection, verification, and preparation remain available
+on macOS. Linux syscall injection on macOS does not qualify native Linux
+behavior. T02 inventory URLs never trigger
+downloads. `Content-Length` is validated when present; streamed byte count,
+streamed SHA-256, and configured byte limits remain authoritative when it is
+absent. Publication and recovery hash and synchronize the same nonblocking,
+no-follow descriptor, and a same-size replacement inode cannot record success.
+
+Offline preparation fails closed when the journal requires publication
+recovery after an interrupted attempt or synchronization failure. Explicit
+`--acquire` recovery synchronizes and re-verifies the existing destination
+before it can record success; the verified artifact is not downloaded again.
+Offline and acquisition journal transactions use the same bounded advisory
+lock. Existing manifests are made non-ready before journal or acquisition
+mutation, and a ready manifest is published only after the matching journal
+is ready. Preparation reloads the journal and evaluates the current files once
+more after writing its final status; any changed result is written to the
+journal before the manifest and report are produced. Artifact and journal reads
+retain the parent directory descriptor and compare the opened file's identity
+and metadata with a no-follow stat of its filename. Final reconciliation rejects
+a replaced journal, and its entry is checked again before manifest publication.
+
+`ready` means static preparation only. It is not model loading, inference,
+APEX execution, T08 admission, or T19 capability qualification.
+
+See [candidate preparation architecture](docs/architecture/candidate-preparation.md)
+and [ADR 0002](docs/adr/0002-declared-candidate-preparation.md).
+
 ## Validation and generated outputs
 
 Run the full test suite with `make test`. The tests generate real PNG
