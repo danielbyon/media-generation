@@ -28,6 +28,16 @@ from .errors import (
     ArtifactIntegrityError,
     ResourceBusyError,
 )
+from .candidate import (
+    CandidateAcquisitionError,
+    CandidateOutputError,
+    CandidateValidationError,
+    candidate_exit_code,
+    inspect_candidate,
+    parse_trusted_evidence,
+    prepare_candidate,
+    verify_candidate,
+)
 from .service import GenerationService
 from .inventory import (
     InventoryOptions,
@@ -209,6 +219,49 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = commands.add_parser("reconcile", help="recover owned publications and inspect integrity")
     reconcile.add_argument("--db", required=True, type=Path)
     reconcile.add_argument("--output-dir", required=True, type=Path)
+    candidate = commands.add_parser(
+        "candidate", help="inspect, verify, or prepare an exact declared model candidate"
+    )
+    candidate_commands = candidate.add_subparsers(dest="candidate_command", required=True)
+    for name, help_text in (
+        ("inspect", "inspect one strict candidate declaration"),
+        ("verify", "repeat offline static verification without writing"),
+        ("prepare", "write an offline-ready manifest and acquisition journal"),
+    ):
+        command = candidate_commands.add_parser(name, help=help_text)
+        command.add_argument(
+            "--declaration",
+            required=True,
+            type=Path,
+            help="strict T07 candidate declaration JSON",
+        )
+        command.add_argument(
+            "--trusted-evidence",
+            type=Path,
+            help="separate host-owned pins for candidate evidence documents",
+        )
+        if name == "prepare":
+            command.add_argument(
+                "--manifest-output",
+                required=True,
+                type=Path,
+                help="prepared manifest destination outside declared artifact paths",
+            )
+            command.add_argument(
+                "--journal-output",
+                type=Path,
+                help="durable redacted journal; defaults beside the manifest",
+            )
+            command.add_argument(
+                "--acquire",
+                action="store_true",
+                help="explicitly permit bounded transfer of missing declared artifacts",
+            )
+            command.add_argument(
+                "--acquisition-config",
+                type=Path,
+                help="separate transport authorization and credentials file",
+            )
     return parser
 
 
@@ -217,6 +270,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     options = parser.parse_args(arguments)
     try:
+        if options.command == "candidate":
+            return _run_candidate(options)
         if options.command == "inventory":
             return _run_inventory(options)
         if options.command == "submit":
@@ -350,6 +405,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("generation_error", str(error), 1)
     except OSError as error:
         return _write_error("storage_error", str(error), 1)
+    except CandidateValidationError as error:
+        return _write_error("candidate_validation_error", str(error), 2)
+    except CandidateOutputError as error:
+        return _write_error("candidate_output_error", str(error), 7)
+    except CandidateAcquisitionError as error:
+        return _write_error("candidate_acquisition_error", str(error), 8)
     except InventoryValidationError as error:
         return _write_error("admission_validation_error", str(error), 2)
     except (json.JSONDecodeError, UnicodeError, ValueError) as error:
@@ -375,6 +436,35 @@ def _run_inventory(options: argparse.Namespace) -> int:
         return _write_error("inventory_output_error", str(error), 3)
     _write_json({**published.summary, **(published.publication or {})}, sys.stdout)
     return published.exit_code
+
+
+def _run_candidate(options: argparse.Namespace) -> int:
+    """Run one bounded candidate operation and preserve its static status."""
+    trusted_evidence = (
+        ()
+        if options.trusted_evidence is None
+        else parse_trusted_evidence(options.trusted_evidence)
+    )
+    if options.candidate_command == "inspect":
+        report = inspect_candidate(
+            options.declaration, trusted_evidence=trusted_evidence
+        )
+    elif options.candidate_command == "verify":
+        report = verify_candidate(
+            options.declaration, trusted_evidence=trusted_evidence
+        )
+    else:
+        report = prepare_candidate(
+            options.declaration,
+            manifest_output=options.manifest_output,
+            journal_output=options.journal_output,
+            acquire=options.acquire,
+            acquisition_config=options.acquisition_config,
+            trusted_evidence_path=options.trusted_evidence,
+            trusted_evidence=trusted_evidence,
+        )
+    _write_json(report, sys.stdout)
+    return candidate_exit_code(str(report["status"]))
 
 
 def _parse_request(source: str) -> GenerationRequest:
