@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from test_cpu_adapter_support import cpu_adapter
 from media_generation.adapters import (
     DeterministicCpuAdapter,
     PROCESS_CONTAINED_CONTRACT,
@@ -118,23 +119,19 @@ def test_privacy_profile_accepts_boolean_configuration_compliance(
     assert profile.supports_configuration_compliance is value
 
 
-class _FixturePrivacyAdapter(DeterministicCpuAdapter):
-    """Deterministic renderer with exact fixture privacy configuration."""
+def _fixture_privacy_adapter(
+    configuration: Mapping[str, object],
+) -> DeterministicCpuAdapter:
+    """Return the exact CPU adapter carrying fixture privacy configuration."""
+    adapter = cpu_adapter(adapter_id=FIXTURE_ADAPTER_ID, configuration=dict(configuration))
 
-    adapter_id = FIXTURE_ADAPTER_ID
-    containment_contract = PROCESS_CONTAINED_CONTRACT
-
-    def __init__(self, configuration: Mapping[str, object]) -> None:
-        self._configuration = dict(configuration)
-
-    @property
-    def configuration(self) -> dict[str, object]:
-        return dict(self._configuration)
-
-    def set_control(self, control: PrivacyControl, value: object) -> None:
-        inference = self._configuration["inference"]
+    def set_control(control: PrivacyControl, value: object) -> None:
+        inference = adapter.configuration["inference"]
         assert isinstance(inference, dict)
         inference[control.value] = value
+
+    adapter.set_control = set_control  # type: ignore[attr-defined]
+    return adapter
 
 
 class _HashableMapping(Mapping[str, object]):
@@ -270,7 +267,7 @@ def test_non_json_adapter_configuration_extension_values_set_fails_admission_wit
         GenerationService(
             database,
             tmp_path / "images",
-            adapter=_FixturePrivacyAdapter(configuration),
+            adapter=_fixture_privacy_adapter(configuration),
         )
 
     result = raised.value.result
@@ -333,7 +330,7 @@ def test_non_json_adapter_configuration_unserializable_setting_fails_admission_w
         GenerationService(
             database,
             tmp_path / "images",
-            adapter=_FixturePrivacyAdapter(configuration),
+            adapter=_fixture_privacy_adapter(configuration),
         )
 
     result_json = raised.value.result.to_json()
@@ -527,7 +524,7 @@ def test_container_credentials_are_rejected_before_persistence(
     nested_configuration: dict[str, object],
 ) -> None:
     database = tmp_path / "studio.sqlite3"
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     service = GenerationService(
         database,
         tmp_path / "images",
@@ -718,7 +715,7 @@ def test_strict_admission_accepts_only_configuration_pass(tmp_path: Path) -> Non
     admission_service = GenerationService(
         tmp_path / "accepted.sqlite3",
         tmp_path / "accepted-images",
-        adapter=_FixturePrivacyAdapter(_compliant_configuration()),
+        adapter=_fixture_privacy_adapter(_compliant_configuration()),
         privacy_policy=policy,
         require_privacy_pass=True,
         admission_profile=admission_profile,
@@ -737,7 +734,7 @@ def test_strict_admission_accepts_only_configuration_pass(tmp_path: Path) -> Non
         GenerationService(
             tmp_path / "unverified.sqlite3",
             tmp_path / "unverified-images",
-            adapter=_FixturePrivacyAdapter(_compliant_configuration(configuration_version=2)),
+            adapter=_fixture_privacy_adapter(_compliant_configuration(configuration_version=2)),
             privacy_policy=policy,
             require_privacy_pass=True,
         )
@@ -750,7 +747,7 @@ def test_supported_profile_cannot_admit_unverified_configuration_implicitly(
         GenerationService(
             tmp_path / "studio.sqlite3",
             tmp_path / "images",
-            adapter=_FixturePrivacyAdapter(_compliant_configuration(configuration_version=2)),
+            adapter=_fixture_privacy_adapter(_compliant_configuration(configuration_version=2)),
             privacy_policy=_policy(),
         )
 
@@ -767,7 +764,7 @@ def test_known_prohibited_behavior_fails_even_without_strict_admission(
         GenerationService(
             tmp_path / "studio.sqlite3",
             tmp_path / "images",
-            adapter=_FixturePrivacyAdapter(configuration),
+            adapter=_fixture_privacy_adapter(configuration),
             privacy_policy=_policy(),
         )
 
@@ -857,7 +854,7 @@ def _execution_state_snapshot(
 def test_policy_version_change_cannot_reuse_stale_pass(tmp_path: Path) -> None:
     database = tmp_path / "studio.sqlite3"
     output = tmp_path / "images"
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     first = GenerationService(
@@ -890,7 +887,7 @@ def test_strict_idempotent_retry_rejects_completed_unverified_job(
     """Strict admission cannot reuse a completed job with unverified evidence."""
     database = tmp_path / "studio.sqlite3"
     output = tmp_path / "images"
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     permissive = GenerationService(
@@ -943,7 +940,7 @@ def test_strict_idempotent_retry_rejects_completed_unverified_job(
 def test_worker_does_not_claim_job_with_stale_privacy_evidence(tmp_path: Path) -> None:
     database = tmp_path / "studio.sqlite3"
     output = tmp_path / "images"
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     first = GenerationService(
@@ -980,7 +977,7 @@ def test_omitted_privacy_claim_allows_only_valid_unverified_evidence(
     service = GenerationService(tmp_path / "unverified.sqlite3", output, adapter=adapter)
     unverified = service.enqueue("unverified-privacy", _request("unverified"))
 
-    passed_adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    passed_adapter = _fixture_privacy_adapter(_compliant_configuration())
     passed_output = tmp_path / "passed-images"
     passed = GenerationService(
         tmp_path / "passed.sqlite3",
@@ -1326,7 +1323,7 @@ def test_invalid_caller_privacy_evidence_is_rejected_before_claim(
 
 def test_pass_evidence_requires_exact_non_null_claim(tmp_path: Path) -> None:
     """Stored pass evidence cannot be nulled or substituted at claim time."""
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     output = tmp_path / "images"
@@ -1471,7 +1468,7 @@ def test_unverified_evidence_requires_exact_non_null_caller_evidence(
     assert claim is not None
     assert claim.job_id == queued.job_id
 def test_worker_reevaluates_current_settings_before_claim(tmp_path: Path) -> None:
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     service = GenerationService(
@@ -1636,7 +1633,7 @@ def test_unprofiled_unverified_record_preserves_observed_configuration_version()
 def test_worker_rechecks_privacy_before_each_claim_in_batch(
     tmp_path: Path,
 ) -> None:
-    adapter = _FixturePrivacyAdapter(_compliant_configuration())
+    adapter = _fixture_privacy_adapter(_compliant_configuration())
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
 
@@ -1667,3 +1664,15 @@ def test_worker_rechecks_privacy_before_each_claim_in_batch(
 
     assert service.get_provenance(first.job_id)["status"] == "succeeded"
     assert service.get_provenance(second.job_id)["status"] == "queued"
+
+
+def test_containment_contract_is_not_trusted_for_subclasses() -> None:
+    """A subclass cannot opt into trust by declaring the contract constant."""
+
+    class SubclassedAdapter(DeterministicCpuAdapter):
+        containment_contract = PROCESS_CONTAINED_CONTRACT
+
+    assert trusted_containment_contract(DeterministicCpuAdapter()) == (
+        PROCESS_CONTAINED_CONTRACT
+    )
+    assert trusted_containment_contract(SubclassedAdapter()) is None

@@ -100,3 +100,43 @@ class GenerationExecutionError(GenerationError):
     ) -> None:
         super().__init__(message, safe_message=safe_message)
         self.job_id = job_id
+
+
+BACKEND_PREPARATION_CODES = frozenset(
+    {
+        "bundle_missing",
+        "bundle_corrupt",
+        "bundle_incompatible",
+        "bundle_unverified",
+        "runtime_platform_mismatch",
+        "runtime_evidence_incomplete",
+        "engine_launch_failed",
+        "recipe_invalid",
+        "operation_unsupported",
+        "resolved_execution_mismatch",
+    }
+)
+
+
+class BackendPreparationError(GenerationError):
+    """A declared backend refused execution before any process was started.
+
+    The stable code identifies the refused preparation stage. These failures
+    are terminal preparation outcomes; they never mean that an inference
+    process ran and produced an uncertain result.
+    """
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        if code not in BACKEND_PREPARATION_CODES:
+            raise ValueError(f"unsupported backend preparation code: {code}")
+        super().__init__(message or code, safe_message=code)
+        self.code = code
+
+
+class BackendEvidenceError(GenerationError):
+    """Durable backend execution evidence is missing, malformed, or unwritable.
+
+    The service treats this as a fail-closed condition: an attempt whose
+    process termination or evidence persistence cannot be proven must never
+    release the singleton heavyweight resource.
+    """

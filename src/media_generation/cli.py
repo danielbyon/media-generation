@@ -16,6 +16,8 @@ from .admission import (
 )
 from .domain import GenerationRequest, ArtifactSource
 from .errors import (
+    BackendEvidenceError,
+    BackendPreparationError,
     GenerationExecutionError,
     GenerationError,
     IdempotencyConflictError,
@@ -28,6 +30,7 @@ from .errors import (
     ArtifactIntegrityError,
     ResourceBusyError,
 )
+from .engine import StableDiffusionCppAdapter
 from .candidate import (
     CandidateAcquisitionError,
     CandidateOutputError,
@@ -100,6 +103,37 @@ def _admission_inputs(
     )
 
 
+def _add_engine_arguments(command: argparse.ArgumentParser) -> None:
+    """Add the optional declared local engine selection to one command."""
+    command.add_argument(
+        "--engine-candidate",
+        type=Path,
+        help="strict T07 candidate declaration for pinned local inference",
+    )
+    command.add_argument(
+        "--engine-trusted-evidence",
+        type=Path,
+        help="host-owned evidence pins; requires --engine-candidate",
+    )
+
+
+def _engine_adapter(
+    options: argparse.Namespace, output_directory: Path
+) -> StableDiffusionCppAdapter | None:
+    """Build the optional engine adapter without falling back on refusal."""
+    if options.engine_trusted_evidence is not None and options.engine_candidate is None:
+        raise InputValidationError(
+            "--engine-trusted-evidence requires --engine-candidate"
+        )
+    if options.engine_candidate is None:
+        return None
+    return StableDiffusionCppAdapter(
+        candidate_path=options.engine_candidate,
+        output_directory=output_directory,
+        trusted_evidence_path=options.engine_trusted_evidence,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the documented local-only command surface."""
     parser = _JsonArgumentParser(
@@ -118,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="engine-neutral JSON request; use - to read JSON from standard input",
     )
     _add_admission_arguments(submit)
+    _add_engine_arguments(submit)
 
     enqueue = commands.add_parser("enqueue", help="durably admit a generation request")
     enqueue.add_argument("--db", required=True, type=Path)
@@ -131,11 +166,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="total attempts for a new admission; omit to use or preserve policy",
     )
     _add_admission_arguments(enqueue)
+    _add_engine_arguments(enqueue)
 
     worker = commands.add_parser("worker", help="execute compatible queued jobs")
     worker.add_argument("--db", required=True, type=Path)
     worker.add_argument("--output-dir", required=True, type=Path)
     worker.add_argument("--limit", type=int, default=1)
+    _add_engine_arguments(worker)
 
     cancel = commands.add_parser("cancel", help="fence a queued or active job")
     cancel.add_argument("--db", required=True, type=Path)
@@ -171,6 +208,15 @@ def build_parser() -> argparse.ArgumentParser:
     provenance = commands.add_parser("provenance", help="retrieve request, job, attempt, and artifact")
     provenance.add_argument("--db", required=True, type=Path, help="SQLite database path")
     provenance.add_argument("--job-id", required=True, help="generation job ID")
+    execution = commands.add_parser(
+        "execution", help="retrieve full validated backend execution records"
+    )
+    execution.add_argument("--db", required=True, type=Path, help="SQLite database path")
+    execution.add_argument("--job-id", required=True, help="generation job ID")
+    execution.add_argument(
+        "--attempt-id",
+        help="attempt ID; defaults to the job's current attempt",
+    )
     admission = commands.add_parser(
         "admission", help="inspect a pinned capacity decision and reservation"
     )
@@ -277,9 +323,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if options.command == "submit":
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
-            service = GenerationService(
-                options.db, options.output_dir, admission_profile=profile
-            )
+            adapter = _engine_adapter(options, options.output_dir)
+            if adapter is None:
+                service = GenerationService(
+                    options.db, options.output_dir, admission_profile=profile
+                )
+            else:
+                service = GenerationService(
+                    options.db,
+                    options.output_dir,
+                    adapter=adapter,
+                    admission_profile=profile,
+                )
             result = service.submit(
                 options.idempotency_key, request, workload_demand=demand
             )
@@ -289,9 +344,18 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if options.command == "enqueue":
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
-            service = GenerationService(
-                options.db, options.output_dir, admission_profile=profile
-            )
+            adapter = _engine_adapter(options, options.output_dir)
+            if adapter is None:
+                service = GenerationService(
+                    options.db, options.output_dir, admission_profile=profile
+                )
+            else:
+                service = GenerationService(
+                    options.db,
+                    options.output_dir,
+                    adapter=adapter,
+                    admission_profile=profile,
+                )
             result = service.enqueue(
                 options.idempotency_key,
                 request,
@@ -310,7 +374,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 0
 
         if options.command == "worker":
-            service = GenerationService(options.db, options.output_dir)
+            adapter = _engine_adapter(options, options.output_dir)
+            if adapter is None:
+                service = GenerationService(options.db, options.output_dir)
+            else:
+                service = GenerationService(
+                    options.db, options.output_dir, adapter=adapter
+                )
             report = service.work(limit=options.limit)
             if report["status"] == "resource_busy":
                 return _write_error(
@@ -339,6 +409,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
         if options.command == "retry":
             service = GenerationService(options.db, options.output_dir)
             _write_json(service.retry(options.job_id).to_dict(), sys.stdout)
+            return 0
+
+        if options.command == "execution":
+            service = GenerationService(options.db, Path.cwd())
+            _write_json(
+                service.get_execution(options.job_id, options.attempt_id),
+                sys.stdout,
+            )
             return 0
 
         if options.command in {"import", "reconcile"}:
@@ -386,6 +464,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("unknown_reference", str(error), 2)
     except IdempotencyConflictError as error:
         return _write_error("idempotency_conflict", str(error), 3)
+    except BackendPreparationError as error:
+        return _write_error(
+            "backend_preparation_failed", str(error), 1, code=error.code
+        )
+    except BackendEvidenceError as error:
+        return _write_error("backend_evidence_error", str(error), 1)
     except RecordNotFoundError as error:
         return _write_error("not_found", str(error), 4)
     except ResourceBusyError as error:
@@ -473,7 +557,15 @@ def _parse_request(source: str) -> GenerationRequest:
     payload = json.loads(raw, object_pairs_hook=_unique_object_pairs)
     if not isinstance(payload, dict):
         raise InputValidationError("request JSON must contain an object")
-    allowed_fields = {"prompt", "seed", "width", "height", "reference_ids", "output_slot"}
+    allowed_fields = {
+        "prompt",
+        "seed",
+        "width",
+        "height",
+        "reference_ids",
+        "reference_roles",
+        "output_slot",
+    }
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:
         raise InputValidationError(f"unsupported request fields: {', '.join(unknown_fields)}")

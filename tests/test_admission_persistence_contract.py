@@ -7,6 +7,8 @@ from typing import cast
 
 import pytest
 
+from test_cpu_adapter_support import cpu_adapter, heavyweight_adapter
+
 
 def test_inspection_exposes_a_typed_admission_record(tmp_path: Path) -> None:
     """Inspection exposes one typed record instead of a loose dictionary."""
@@ -249,14 +251,11 @@ def test_store_rejects_not_required_for_non_cpu_adapter(tmp_path: Path) -> None:
     from media_generation.service import GenerationService
     from test_durable_execution import request
 
-    class NonCpuAdapter(DeterministicCpuAdapter):
-        adapter_id = "heavyweight-test-adapter"
-
     generation_request = request()
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=NonCpuAdapter(),
+        adapter=heavyweight_adapter(),
     )
     _, adapter_configuration_json, _, privacy_compliance_json = (
         service._current_privacy_snapshot()
@@ -461,9 +460,6 @@ def test_successful_admission_transition_rolls_back_execution_finalization(
     from test_durable_execution import request
     from test_resource_admission import GIB, inventory_report, workload_demand
 
-    class ProcessContainedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
-
     profile = build_admission_profile(
         inventory_report(),
         parse_admission_policy(
@@ -477,7 +473,7 @@ def test_successful_admission_transition_rolls_back_execution_finalization(
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=ProcessContainedAdapter(),
+        adapter=cpu_adapter(),
         admission_profile=profile,
     )
     queued = service.enqueue(
@@ -676,11 +672,10 @@ def test_submit_uses_one_typed_inspection_after_execution(tmp_path: Path) -> Non
     from test_durable_execution import request
     from test_resource_admission import GIB, inventory_report, workload_demand
 
-    class FailingAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    def failing_generate(plan, destination):
+        raise RuntimeError("fixture adapter failure")
 
-        def generate(self, plan, destination):
-            raise RuntimeError("fixture adapter failure")
+    adapter = cpu_adapter(generate=failing_generate)
 
     profile = build_admission_profile(
         inventory_report(),
@@ -698,7 +693,7 @@ def test_submit_uses_one_typed_inspection_after_execution(tmp_path: Path) -> Non
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=FailingAdapter(),
+        adapter=adapter,
         admission_profile=profile,
     )
 
@@ -726,13 +721,10 @@ def test_unconfigured_heavyweight_enqueue_fails_before_persistence(
     from media_generation.service import GenerationService
     from test_durable_execution import request
 
-    class HeavyweightAdapter(DeterministicCpuAdapter):
-        adapter_id = "heavyweight-test-adapter"
-
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=HeavyweightAdapter(),
+        adapter=heavyweight_adapter(),
     )
 
     with pytest.raises(
@@ -768,14 +760,11 @@ def test_store_rejects_blocked_heavyweight_admission_without_persisting(
     from media_generation.service import GenerationService
     from test_durable_execution import request
 
-    class HeavyweightAdapter(DeterministicCpuAdapter):
-        adapter_id = "heavyweight-test-adapter"
-
     generation_request = request()
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=HeavyweightAdapter(),
+        adapter=heavyweight_adapter(),
     )
     _, configuration_json, _, privacy_json = service._current_privacy_snapshot()
 
@@ -862,11 +851,10 @@ def test_capacity_reason_is_not_reported_as_an_execution_failure(
     from test_durable_execution import request
     from test_resource_admission import GIB, inventory_report, workload_demand
 
-    class FailingAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    def failing_generate(plan, destination):
+        raise RuntimeError("fixture adapter failure")
 
-        def generate(self, plan, destination):
-            raise RuntimeError("fixture adapter failure")
+    adapter = cpu_adapter(generate=failing_generate)
 
     profile = build_admission_profile(
         inventory_report(),
@@ -884,7 +872,7 @@ def test_capacity_reason_is_not_reported_as_an_execution_failure(
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=FailingAdapter(),
+        adapter=adapter,
         admission_profile=profile,
     )
     stale_capacity_inspection = AdmissionInspection(

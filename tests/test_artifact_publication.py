@@ -827,6 +827,7 @@ class _FailingWriteAdapter(DeterministicCpuAdapter):
     """Write a real partial file before surfacing a device or capacity failure."""
 
     def __init__(self, error_number: int) -> None:
+        super().__init__()
         self.error_number = error_number
         self.calls = 0
 

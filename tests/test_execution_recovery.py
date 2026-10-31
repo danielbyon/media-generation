@@ -11,6 +11,7 @@ import threading
 
 import pytest
 
+from test_cpu_adapter_support import cpu_adapter
 from media_generation.adapters import DeterministicCpuAdapter, PROCESS_CONTAINED_CONTRACT
 from media_generation.admission import (
     build_admission_profile,
@@ -319,13 +320,13 @@ def test_retry_budget_is_not_reset_by_restart(tmp_path: Path) -> None:
 
 
 def test_unknown_failure_is_terminal_and_never_automatically_retried(tmp_path: Path) -> None:
-    class FailedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
 
-        def generate(self, plan, stream):
-            raise RuntimeError("unclassified failure")
+    def generate(plan, stream):
+        raise RuntimeError("unclassified failure")
 
-    service = _admitted_service_at(tmp_path, adapter=FailedAdapter())
+    adapter.generate = generate
+    service = _admitted_service_at(tmp_path, adapter=adapter)
     queued = _admit(service, "unknown", request(), max_attempts=3)
     service.work(limit=3)
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
@@ -368,19 +369,19 @@ def test_budget_one_crash_never_replays(tmp_path: Path) -> None:
 def test_stale_identity_cannot_fail_or_complete_successor_attempt(tmp_path: Path) -> None:
     entered, resume = threading.Event(), threading.Event()
 
-    class FailThenPause(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
-        calls = 0
+    adapter = cpu_adapter()
+    calls = 0
 
-        def generate(self, plan, stream):
-            self.calls += 1
-            if self.calls == 1:
-                raise RetryableGenerationError("retry once")
-            entered.set()
-            assert resume.wait(10)
-            return super().generate(plan, stream)
+    def generate(plan, stream):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableGenerationError("retry once")
+        entered.set()
+        assert resume.wait(10)
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
 
-    adapter = FailThenPause()
+    adapter.generate = generate
     service = _admitted_service_at(tmp_path, adapter=adapter)
     queued = _admit(service, "stale-successor", request(), max_attempts=2)
     service.work()
@@ -790,9 +791,6 @@ def test_live_ready_cancellation_finalizes_before_recovery(
     tmp_path: Path, checkpoint: str, external: bool
 ) -> None:
     """A returned worker cannot leave its canceled ready journal owning a claim."""
-    class Adapter(DeterministicCpuAdapter):
-        containment_contract = None if external else PROCESS_CONTAINED_CONTRACT
-
     preserved = []
 
     def cancel_at(name):
@@ -804,7 +802,11 @@ def test_live_ready_cancellation_finalizes_before_recovery(
         assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
 
     service = _admitted_service_at(
-        tmp_path, adapter=Adapter(), publication_checkpoint=cancel_at
+        tmp_path,
+        adapter=cpu_adapter(
+            containment_contract=None if external else PROCESS_CONTAINED_CONTRACT
+        ),
+        publication_checkpoint=cancel_at,
     )
     queued = _admit(service, "live-ready-cancel", request(), max_attempts=2)
     service.work()
@@ -876,10 +878,12 @@ def test_cancel_after_reconciliation_snapshot_cannot_restore_retry(
     tmp_path: Path, monkeypatch, external: bool, max_attempts: int,
 ) -> None:
     """A committed cancellation outranks an earlier crash-recovery snapshot."""
-    class CrashAdapter(DeterministicCpuAdapter):
-        containment_contract = None if external else PROCESS_CONTAINED_CONTRACT
-
-    service = _admitted_service_at(tmp_path, adapter=CrashAdapter())
+    service = _admitted_service_at(
+        tmp_path,
+        adapter=cpu_adapter(
+            containment_contract=None if external else PROCESS_CONTAINED_CONTRACT
+        ),
+    )
     queued = _admit(
         service,
         "snapshot-cancel-race",

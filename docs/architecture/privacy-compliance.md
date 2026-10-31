@@ -66,6 +66,22 @@ the result to be `unverified`. Credential-like keys and nested model-acquisition
 configuration cause `fail`. The service owns the expectation; an adapter
 cannot choose its profile or submit a pass status.
 
+For a supervised backend-execution adapter, the service selects the profile from
+an application-owned registry keyed by the exact adapter identity, engine
+identity, engine version, and configuration version. A policy object exposed by
+the adapter is ignored, so an adapter cannot widen the controls that apply to it
+and an unregistered identity is refused instead of evaluated permissively.
+
+The real-engine registration pins the engine version to
+`master-975-95b3090-2-gb13a482`. That value is the revision identity reported
+by the pinned stable-diffusion.cpp source tree through `git describe --tags`, and it
+denotes commit `b13a48219d5cdf408edcb93da6cd69b612ed03d3`. It is an opaque
+source-revision identity rather than a semantic release number. Registration
+and dispatch compare the value literally with the candidate declaration's
+`engine.version`; a different describe string, branch, or commit is a different
+engine identity and is refused. The application does not normalize versions or
+accept a prefix, range, or approximate match.
+
 The result contains its schema and status, exact adapter/profile/tool/version
 identifiers, stable fingerprints, per-control redacted evidence, stable reason
 codes, and fixed limitations. Fingerprints use canonical compact JSON with
@@ -79,7 +95,7 @@ claim.
 
 ## Database contract
 
-The current persistent schema is version 5. Opening an empty database creates
+The current persistent schema is version 6. Opening an empty database creates
 that schema atomically. Opening an existing database uses a read-only connection
 and validates the exact version, tables, indexes, triggers, singleton resource
 row, execution/admission relationships, and current privacy records.
@@ -144,10 +160,11 @@ carry explicit current capacity evidence and a valid workload demand. Only the
 exact bundled deterministic CPU adapter receives `not_required`. A subclass
 does not inherit that exemption.
 
-Process-termination proof also remains independent. The containment contract
-states whether a dead adapter process is known to have terminated; it makes no
-statement about privacy. Publication, fencing, retry, cancellation, recovery,
-quarantine, and artifact lineage continue to use their own authorities.
+Process-termination proof also remains independent. A containment contract, or
+a validated supervisor observation of a reaped direct child, states whether the
+backend process is known to have terminated; neither says anything about
+privacy. Publication, fencing, retry, cancellation, recovery, quarantine, and
+artifact lineage continue to use their own authorities.
 
 ## Integration responsibilities
 
@@ -155,7 +172,9 @@ The following work belongs to later real-tool integrations:
 
 1. Determine and test each tool's actual privacy settings.
 2. Add exact profiles after those settings are documented and implemented in
-   the adapter.
+   the application. A supervised backend-execution adapter does not supply its
+   own control values; the application derives them from the resolved argument
+   vector and the environment it passes to the child process.
 3. Exercise representative local execution and fallback paths for each exact
    tool and version.
 4. Qualify exact APEX runtime configurations separately; the privacy contract
@@ -168,3 +187,41 @@ privacy settings, the application-owned profile covers every control, strict
 admission is enabled where local-only behavior is required, and the
 configuration and policy versions are stable. A profile applies only to the
 exact tool and configuration version it names.
+
+For the real stable-diffusion.cpp engine the application owns the settings
+record. It scans the resolved argument vector for URL schemes and for remote,
+host, listen, server, API, proxy, download, update, telemetry, and fallback
+tokens, and it records whether proxy variables or other network-enabling keys
+appear in the child environment. A prohibited token produces `fail`; an
+unrecognized flag or environment name stays `unverified` and blocks execution.
+An explicit caller-supplied policy cannot replace the application-owned profile
+that the service selects by adapter identity, engine identity, engine version,
+and configuration version. The profile evaluates the resolved argv and child
+environment.
+
+The service repeats the derivation at dispatch instead of trusting the stored
+map. It recomputes the settings from the argv and child environment it is about
+to spawn, requires an exact match with the resolved record, and requires
+`pass` before it inserts evidence or starts a process. The resolved record's
+argv and environment must also match that prepared invocation.
+
+The gate also binds the resolved record to the restart-stable configuration
+persisted with the claim. Candidate identity, declaration digest, engine
+identity and executable digest, recipe identity and document digest, required
+component rows, adapters, and the CLI and invocation contracts must match that
+admission selection. The `argv[0]` path must end with the selected executable
+pin, and that one file is read again to confirm the pinned SHA-256; model and
+component files are not hashed a second time. The gate compares the reported
+component rows but does not bind the model-path values in the remaining `argv`
+entries to the corresponding component artifact pins; that path mapping remains
+inside the in-process adapter boundary. Substitutions of the candidate,
+declaration, executable build or bytes, recipe, required component rows,
+adapters, or contracts fail closed as `resolved_execution_mismatch` before
+evidence is written or a process starts. An engine identity or version
+mismatch against the application-owned registration fails earlier with the
+privacy reason `resolved_engine_mismatch`.
+The binding still consumes the configuration the adapter exposes at admission,
+so an adapter that fabricates both its configuration and its resolution remains
+an in-process trust boundary. The launch record captures the argv and child
+environment that the supervisor passed without proving that the process opened
+the same bytes the application verified after launch.

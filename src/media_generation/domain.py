@@ -49,6 +49,7 @@ class GenerationRequest:
     width: int = 64
     height: int = 64
     reference_ids: tuple[str, ...] = ()
+    reference_roles: tuple[str, ...] = ()
     output_slot: str = "primary"
 
     def __post_init__(self) -> None:
@@ -59,6 +60,8 @@ class GenerationRequest:
         )
         if not normalized_prompt:
             raise InputValidationError("prompt must not be empty")
+        if "\x00" in normalized_prompt:
+            raise InputValidationError("prompt must not contain NUL bytes")
         object.__setattr__(self, "prompt", normalized_prompt)
 
         if self.seed is not None and (
@@ -82,6 +85,24 @@ class GenerationRequest:
             raise InputValidationError("reference_ids must not contain duplicates")
         object.__setattr__(self, "reference_ids", references)
 
+        if not isinstance(self.reference_roles, (tuple, list)):
+            raise InputValidationError("reference_roles must be a list of roles")
+        roles = tuple(self.reference_roles)
+        if roles and len(roles) != len(references):
+            raise InputValidationError(
+                "reference_roles must be empty or match reference_ids positionally"
+            )
+        if any(
+            not isinstance(role, str) or role not in {"reference", "source"}
+            for role in roles
+        ):
+            raise InputValidationError(
+                "reference_roles may contain only reference or source"
+            )
+        if roles.count("source") > 1:
+            raise InputValidationError("only one source image may be edited")
+        object.__setattr__(self, "reference_roles", roles)
+
         if not isinstance(self.output_slot, str) or not _OUTPUT_SLOT.fullmatch(self.output_slot):
             raise InputValidationError(
                 "output_slot must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens"
@@ -89,7 +110,7 @@ class GenerationRequest:
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable, JSON-compatible representation used for hashing."""
-        return {
+        payload: dict[str, object] = {
             "prompt": self.prompt,
             "seed": self.seed,
             "width": self.width,
@@ -97,6 +118,9 @@ class GenerationRequest:
             "reference_ids": list(self.reference_ids),
             "output_slot": self.output_slot,
         }
+        if any(role != "reference" for role in self.reference_roles):
+            payload["reference_roles"] = list(self.reference_roles)
+        return payload
 
     def canonical_json(self) -> str:
         """Serialize intent with stable key ordering and no insignificant space."""
@@ -133,6 +157,7 @@ class ResolvedReference:
     artifact_id: str
     content_sha256: str
     path: Path
+    role: str = "reference"
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,13 +15,13 @@ relative filename, observed source identity and timestamps, and import time.
 The source bytes are copied unchanged, including metadata and orientation.
 Later edits to the source file cannot change the stored artifact.
 
-The current schema is `user_version = 5`. A new database creates artifact,
-lineage, publication, execution, privacy, and admission structures directly in
-one transaction. An existing database reopens through a read-only connection
-and must match the complete current schema exactly. Older, newer, partial,
-malformed-current, and nonempty unversioned databases are rejected without
-mutation. There is no migration, backfill, historical publication repair, or
-old-job compatibility path.
+The current schema is `user_version = 6`. A new database creates artifact,
+lineage, publication, execution, backend-evidence, privacy, and admission
+structures directly in one transaction. An existing database reopens through a
+read-only connection and must match the complete current schema exactly. Older,
+newer, partial, malformed-current, and nonempty unversioned databases are
+rejected without mutation. There is no migration, backfill, historical
+publication repair, or old-job compatibility path.
 
 Every current generation job has an `execution_jobs` sidecar with non-null
 privacy-compliance evidence and exactly one `execution_admissions` row. The
@@ -122,14 +122,16 @@ persisted attempt budget remains. The default budget is one total attempt. A
 worker restart does not reset it. Unknown outcomes are quarantined and never
 replayed automatically; retry keeps the request, job, output slot, and budget.
 
-Termination proof is accepted only from a containment contract declared
-directly by the adapter. An adapter identity, inherited class behavior, or
-successful return does not establish that an external process stopped. A valid
-artifact produced without trusted proof remains committed and inspectable, but
-its attempt records `termination_proven=false` and the resource stays
-quarantined. A noncanceled failure without proof reports the durable job as
-`ambiguous`, retains its underlying failure classification, and cannot
-authorize replay.
+Termination proof is accepted from one of two authorities: a containment
+contract declared directly by the adapter, or validated observation produced by
+the application-owned process supervisor showing that the direct child was
+reaped and its exit status was recorded. An adapter identity, inherited class
+behavior, successful return, elapsed time, or a descendant process exiting does
+not establish that the backend process stopped. A valid artifact produced
+without trusted proof remains committed and inspectable, but its attempt
+records `termination_proven=false` and the resource stays quarantined. A
+noncanceled failure without proof reports the durable job as `ambiguous`,
+retains its underlying failure classification, and cannot authorize replay.
 
 The public retry operation may acknowledge an eligible bounded retry while it is already queued. Repeated requests are idempotent and preserve the job, request, output slot, attempt history, and budget while the job remains queued, within budget, and the resource is available. A later worker claim, recovery failure, or another job's resource claim can invalidate a subsequent retry acknowledgement; only a worker claim starts the next attempt. The singleton resource state appears in provenance's execution context with owner IDs where applicable. Individual job snapshots do not imply resource ownership.
 

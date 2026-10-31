@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from media_generation.inventory.host import _classify_vram, resolve_memory_topology
+from media_generation.inventory.host import (
+    _classify_vram,
+    parse_carveout_index,
+    parse_carveout_options,
+    resolve_memory_topology,
+)
 
 
 GIB = 1024**3
@@ -298,6 +303,56 @@ def test_conflicting_pools_on_one_accelerator_are_ambiguous() -> None:
     assert topology["class"] == "ambiguous"
     assert topology["reported_total_bytes"] is None
     assert topology["confidence"] == "low"
+
+
+def test_carveout_parser_reads_firmware_labels_and_binary_sizes() -> None:
+    """Options use leading indices and MB/GB sizes, not byte counts."""
+    assert parse_carveout_options(
+        "0: Minimum (512 MB)\n1: (1 GB)\n2: Medium (16 GB)\n9: High (32 GB)\n"
+    ) == {
+        0: 512 * 1024**2,
+        1: 1024**3,
+        2: 16 * 1024**3,
+        9: 32 * 1024**3,
+    }
+    assert parse_carveout_index("2\n") == 2
+    assert parse_carveout_index("-1\n") is None
+    assert parse_carveout_index("0x2\n") is None
+    assert parse_carveout_options("0: Minimum (0 MB)\n") is None
+    assert parse_carveout_options("0: Minimum (512 MB)\n0: Duplicate (1 GB)\n") is None
+    assert parse_carveout_options("0: Minimum 512 MB\n") is None
+    assert parse_carveout_options("") is None
+    assert parse_carveout_options("0: Minimum (-1 MB)\n") is None
+
+
+def test_gtt_aperture_alone_is_not_shared_allocatable_evidence() -> None:
+    """GTT and a visible alias never prove an allocatable unified pool."""
+    topology, findings = resolve_memory_topology(
+        system_total_bytes=64 * GIB,
+        accelerators=[
+            _accelerator(
+                "drm:card1",
+                "0x1002",
+                "0x030000",
+                [
+                    _pool("vis_vram", "visible_vram_alias", 512 * 1024**2),
+                    _pool("gtt", "shared_gtt", 32 * GIB),
+                ],
+            )
+        ],
+    )
+
+    assert topology["class"] == "unknown"
+    assert topology["reported_total_bytes"] == 64 * GIB
+    assert [pool["id"] for pool in topology["allocatable_pools"]] == ["system_ram"]
+    relationships = {
+        item["relationship"] for item in topology["sharing_relationships"]
+    }
+    assert "shared_system_aperture" in relationships
+    assert "duplicate_alias_not_additive" in relationships
+    assert "carveout_within_system_ram" not in relationships
+    assert topology["warnings"] == ["no_gpu_memory_pools_observed"]
+    assert [finding.code for finding in findings] == ["no_gpu_memory_pools_observed"]
 
 
 def test_incomplete_gpu_memory_evidence_stays_unknown() -> None:
