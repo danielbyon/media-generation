@@ -2,10 +2,10 @@
 
 `media-generation` is a small, local image-generation service with synchronous
 submission, an opt-in durable worker CLI, versioned resource admission, and
-SQLite persistence. It provides an
-engine-neutral request contract and a deterministic CPU adapter so application
-and adapter work can be exercised without a GPU, model download, or network
-service.
+SQLite persistence. It provides an engine-neutral request contract, a
+deterministic CPU adapter, and an opt-in adapter for an operator-pinned
+stable-diffusion.cpp candidate. The CPU path needs no GPU, model download, or
+network service.
 
 ## Setup
 
@@ -70,13 +70,15 @@ media-generation provenance --db ./studio.sqlite3 --job-id <job-id-from-submit>
 ```
 
 `--request-json -` reads the JSON object from standard input. Requests accept a
-prompt, optional seed, width, height, a list of persisted artifact IDs, and a
-semantic output-slot name. They do not accept adapter workflow syntax or input
-file paths and URLs. A reference must be an existing logical artifact ID; an
-unknown ID, malformed path-like value, unsupported dimension, or unsupported
-adapter capability produces a structured error and a nonzero exit status. Before
-execution, the service verifies that every referenced file still exists and
-matches the SHA-256 value stored with its artifact record.
+prompt, optional seed, width, height, a list of persisted artifact IDs, optional
+positional `reference_roles`, and a semantic output-slot name. A role is
+`reference` or `source`; at most one source image may be edited. They do not
+accept adapter workflow syntax or input file paths and URLs. A reference must
+be an existing logical artifact ID; an unknown ID, malformed path-like value,
+unsupported dimension, or unsupported adapter capability produces a structured
+error and a nonzero exit status. Before execution, the service verifies that
+every referenced file still exists and matches the SHA-256 value stored with its
+artifact record.
 
 Repeating a submission reuses the existing job when the canonical request
 intent, adapter identity, adapter configuration, and resolved output directory
@@ -151,6 +153,18 @@ qualification. Credential-like and model-acquisition settings are rejected from
 runtime configuration because credentials and acquisition concerns must remain
 separate from inference settings.
 
+The real stable-diffusion.cpp profile derives its control values from the
+resolved argument vector and the environment the application will pass to the
+child. A URL scheme, a remote, host, listen, server, API, proxy, download,
+update, telemetry, or fallback token marks the matching control prohibited, as
+does any proxy variable in the environment. Settings the application cannot
+classify stay `unverified`. Callers cannot substitute their own policy for this
+application-owned profile.
+
+The service recomputes those settings from the argv and environment it is about
+to spawn, rejects a resolved record that differs, and requires `pass` before
+it writes evidence or starts a process.
+
 The service rejects `fail` configuration. A matching compliance-capable profile
 also rejects `unverified` values automatically. Callers can set
 `require_privacy_pass=True` to reject an adapter that has no trusted profile at
@@ -164,7 +178,7 @@ for the profile contract, redaction rules, and integration responsibilities.
 
 ## Current database schema
 
-This release supports SQLite schema version 5 only. Opening a new database
+This release supports SQLite schema version 6 only. Opening a new database
 creates every table, index, trigger, singleton resource row, and the schema
 version marker in one transaction. Opening an existing database validates its
 complete structure and required admission evidence through a read-only
@@ -249,13 +263,14 @@ successful publication recovery, an available resource, and remaining
 persisted budget. An unknown outcome is quarantined and is never replayed
 automatically. Restarting a worker does not reset the budget.
 
-Termination proof comes only from a containment contract declared directly by
-the adapter. Adapter identity, configuration, or a subclassed adapter's
-inherited behavior is not proof. A valid artifact produced without that proof
-remains committed and inspectable, while its attempt records
-`termination_proven=false` and the heavyweight resource remains quarantined.
-A noncanceled failure without proof is reported as `ambiguous`, retains its
-failure classification, and cannot authorize replay.
+Termination proof comes from a containment contract declared directly by an
+in-process adapter, or from a validated backend observation written after the
+application-owned supervisor reaped the direct child. Adapter identity,
+configuration, a resolved plan, or a launch record alone is not proof. A valid
+artifact produced without proof remains committed and inspectable, while its
+attempt records `termination_proven=false` and the heavyweight resource remains
+quarantined. A noncanceled failure without proof is reported as `ambiguous`,
+retains its failure classification, and cannot authorize replay.
 
 Inspect or control durable work with:
 
@@ -326,15 +341,16 @@ filesystem limitations.
 
 ## Current limits
 
-This slice proves the local request-to-image and provenance path. The bundled
-adapter creates a deterministic test image, not a production model result.
-There is no HTTP API, graphical interface, distributed worker pool, or benchmark
-orchestration. All cooperating workers must use the same SQLite database and
-local output directory; the database enforces one heavyweight attempt at a time.
-The bundled deterministic CPU adapter is the only real adapter in this context.
-Its privacy evidence is configuration-unverified and does not qualify a real
-inference tool. APEX hardware, real GPU inference, model quality, network
-confinement, and hardware reliability are unverified.
+This slice proves the local request-to-image and provenance path and the software
+contracts for supervised engine execution. The bundled CPU adapter creates a
+deterministic test image, not a production model result. There is no HTTP API,
+graphical interface, distributed worker pool, or benchmark orchestration. All
+cooperating workers must use the same SQLite database and local output
+directory; the database enforces one heavyweight attempt at a time. The
+stable-diffusion.cpp adapter is opt-in and has no repository-supplied production
+candidate. Its privacy profile proves application configuration only. APEX
+hardware, real GPU inference, model quality, process-tree containment, network
+confinement, and hardware reliability remain unverified.
 
 ## Read-only host inventory
 
@@ -466,6 +482,96 @@ APEX execution, T08 admission, or T19 capability qualification.
 
 See [candidate preparation architecture](docs/architecture/candidate-preparation.md)
 and [ADR 0002](docs/adr/0002-declared-candidate-preparation.md).
+
+## Supervised local engine execution
+
+Real-engine execution is opt-in. Adapter construction parses the T07
+declaration and trusted evidence and validates the engine identity, recipe,
+CLI contract, executable access, and declared capabilities. Immediately before
+dispatch, `resolve_execution` repeats the authoritative T07 evaluation,
+requires static preparation and independent evidence authority to be ready,
+and re-hashes every pinned file. The deterministic CPU adapter remains the
+default when no engine flags are supplied.
+
+Admission and execution can run in separate processes:
+
+```sh
+media-generation enqueue \
+  --db ./studio.sqlite3 \
+  --output-dir ./artifacts \
+  --idempotency-key qwen-edit-001 \
+  --request-json '{"prompt":"replace the frame with oak","seed":7,"width":1024,"height":1024,"reference_ids":["art_..."],"reference_roles":["source"]}' \
+  --inventory-report /path/outside-the-repository/inventory.json \
+  --admission-policy /path/outside-the-repository/admission-policy.json \
+  --workload-demand /path/outside-the-repository/workload-demand.json \
+  --engine-candidate /path/outside-the-repository/candidate.json \
+  --engine-trusted-evidence /path/outside-the-repository/trusted-evidence.json
+
+media-generation worker \
+  --db ./studio.sqlite3 \
+  --output-dir ./artifacts \
+  --limit 1 \
+  --engine-candidate /path/outside-the-repository/candidate.json \
+  --engine-trusted-evidence /path/outside-the-repository/trusted-evidence.json
+
+media-generation execution --db ./studio.sqlite3 --job-id <job-id>
+```
+
+`submit`, `enqueue`, and `worker` accept engine flags. T06 inventory and
+capacity documents belong only to `submit` and `enqueue`; a worker validates
+the exact admission evidence stored with the queued job. Its candidate
+configuration must match the queued selection exactly. A mismatch is a hard
+error, not a fallback.
+
+Each real-engine attempt records three distinct facts. The resolved plan holds
+the candidate and fresh per-attempt `verification_id`, engine, recipe,
+ordered components and conditioning, effective sampling, exact argv,
+environment allowlist, runtime fingerprint, and model-facing prompt. The launch
+record is written only after the direct child starts, and it stores the exact
+argument vector and environment that were spawned so the service can compare
+them with the resolved plan. The observation record is
+written only after that child is reaped and contains the exit code or signal,
+byte counts, complete stream digests, a bounded text-free output
+classification, and an explicit `process_tree_containment: false` value.
+Captured stdout and stderr are never stored, because subprocess text can repeat
+a prompt or a credential. A resolved plan never proves launch, and a launch
+never proves termination.
+
+The observation also records whether an inherited pipe still had a live
+writer after the bounded post-reap drain, and whether a failed read left
+stream state unknown. Only an empty read establishes EOF; a failed read
+keeps stream state unknown. Either retained-writer or unknown-stream evidence
+keeps termination unproven, so the resource stays quarantined even when the
+artifact publishes. Neither fact rules out a descendant process: a descendant
+that closes or redirects inherited streams is invisible, so reaping and stream
+observation prove only that the direct child ended without keeping its pipes
+open. Descendants are not tracked or terminated.
+
+The pinned invocation recipe must match the declared engine, use the strict
+versioned schema, and declare `sd_cpp_cli_contract` as `bare-flag/v1` or
+`model-args/v1` on both engine and recipe. This records which documented Qwen
+zero-conditioning syntax the selected build supports instead of probing or
+guessing. Sampling parameters are bounded, and the application enforces
+independent ceilings of 64 through 2048 pixels, dimension multiples of 8, at
+most three conditioning images, and at most one source. Ordered `-r` arguments
+carry every conditioning image, including one declared with role `source`.
+`-i`/`--init-img` and `--strength` are refused for the Qwen edit operation.
+Each model family declares the roles its operations require; the Qwen image edit
+profile needs diffusion model, VAE, and language model, and maps an optional
+vision encoder to `--llm_vision`. The adapter refuses a declared role it cannot
+map instead of dropping it.
+
+Engine output is written to a private mode-0700 scratch directory outside the
+output directory and Git. The adapter validates and streams it into the
+publisher's open staging descriptor and removes scratch after success or
+failure. `execution` returns complete validated records for the current
+attempt, or selects an exact historical attempt with `--attempt-id`.
+`provenance` includes the compact `backend_execution` summary in addition to its
+existing fields.
+
+See [backend execution architecture](docs/architecture/backend-execution.md)
+and [ADR 0003](docs/adr/0003-supervised-backend-execution.md). These results do
+not claim APEX execution, process-tree containment, or OS network confinement.
 
 ## Validation and generated outputs
 

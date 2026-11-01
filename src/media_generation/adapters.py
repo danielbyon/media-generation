@@ -7,12 +7,16 @@ import json
 import struct
 import zlib
 from dataclasses import dataclass
-from typing import BinaryIO, Protocol
+from typing import TYPE_CHECKING, BinaryIO, Protocol
 
 from .domain import GenerationPlan
 
+if TYPE_CHECKING:
+    from .supervisor import ProcessSupervisor
+
 
 PROCESS_CONTAINED_CONTRACT = "process-contained/v1"
+BACKEND_EXECUTION_CONTRACT_VERSION = "backend-execution/v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +27,12 @@ class AdapterCapabilities:
     max_height: int
     supports_references: bool
     max_references: int
+    supports_editing: bool = False
+    max_source_images: int = 0
+    dimension_multiple: int = 1
+    supported_operations: frozenset[str] = frozenset({"generate"})
+    min_width: int = 1
+    min_height: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +69,36 @@ class GenerationAdapter(Protocol):
         """
 
 
+class BackendExecutionAdapter(Protocol):
+    """A declared adapter that resolves and executes one local backend process.
+
+    The version string must be declared directly on the concrete class or on a
+    concrete instance. Inheriting it through a subclass does not qualify.
+    """
+
+    backend_contract_version: str
+    adapter_id: str
+    capabilities: AdapterCapabilities
+
+    def resolve_execution(self, plan: GenerationPlan) -> object:
+        """Re-verify declared inputs and return one immutable execution plan."""
+
+    def execute(
+        self,
+        plan: GenerationPlan,
+        destination: BinaryIO,
+        *,
+        supervisor: ProcessSupervisor,
+    ) -> ImageMetadata:
+        """Run the resolved direct child through the application supervisor.
+
+        The service constructs the supervisor with the claimed attempt
+        authority and the exact argv and environment from resolution. Adapter
+        code calls :meth:`ProcessSupervisor.run` exactly once and streams the
+        validated output. It cannot record launch or termination facts itself.
+        """
+
+
 class DeterministicCpuAdapter:
     """Generate a deterministic RGB PNG using only Python's standard library.
 
@@ -79,10 +119,23 @@ class DeterministicCpuAdapter:
         max_references=4,
     )
 
-    @property
-    def configuration(self) -> dict[str, object]:
-        """Describe the implementation version retained in job provenance."""
-        return {"configuration_version": 1, "image_format": "PNG", "pattern_version": 1}
+    # Default runtime settings are also exposed on the class so a subclass
+    # that defines __init__ without calling super().__init__ still resolves
+    # them. Every exact instance receives its own copy in __init__.
+    configuration: dict[str, object] = {
+        "configuration_version": 1,
+        "image_format": "PNG",
+        "pattern_version": 1,
+    }
+
+    def __init__(self) -> None:
+        """Retain the implementation version persisted with every job.
+
+        The value is an ordinary instance attribute so an exact bundled adapter
+        can be configured by the application or a test without defining a new
+        class. Containment trust remains bound to the exact class identity.
+        """
+        self.configuration = dict(type(self).configuration)
 
     def generate(self, plan: GenerationPlan, destination: BinaryIO) -> ImageMetadata:
         """Write a valid RGB PNG whose bytes are stable for equivalent plan input."""
@@ -131,19 +184,39 @@ class DeterministicCpuAdapter:
 
 
 def trusted_containment_contract(adapter: GenerationAdapter) -> str | None:
-    """Return a directly declared containment contract, if one is trusted.
+    """Return the bundled static containment contract, if one is trusted.
 
-    Inheritance is deliberately excluded. A subclass that reuses the
-    deterministic adapter's identity, configuration, or ``process_contained``
-    boolean does not become process contained unless its concrete class or an
-    instance explicitly declares the versioned contract.
+    Trust is bound to the exact bundled :class:`DeterministicCpuAdapter` class,
+    matching the exact-type stance used by the lightweight CPU admission check.
+    A subclass that reuses the adapter identity, configuration, or
+    ``process_contained`` boolean cannot opt in by declaring the version string.
     """
+    if type(adapter) is not DeterministicCpuAdapter:
+        return None
     instance_values = getattr(adapter, "__dict__", {})
     if "containment_contract" in instance_values:
         declared = instance_values["containment_contract"]
     else:
         declared = type(adapter).__dict__.get("containment_contract")
     return PROCESS_CONTAINED_CONTRACT if declared == PROCESS_CONTAINED_CONTRACT else None
+
+
+def backend_execution_contract(adapter: object) -> str | None:
+    """Return a directly declared backend execution contract version.
+
+    Inheritance is deliberately excluded. A subclass that inherits the
+    execution methods from another adapter does not become a trusted backend
+    execution adapter unless it declares the version string on its own
+    concrete class or instance.
+    """
+    instance_values = getattr(adapter, "__dict__", {})
+    if "backend_contract_version" in instance_values:
+        declared = instance_values["backend_contract_version"]
+    else:
+        declared = type(adapter).__dict__.get("backend_contract_version")
+    if declared == BACKEND_EXECUTION_CONTRACT_VERSION:
+        return BACKEND_EXECUTION_CONTRACT_VERSION
+    return None
 
 
 def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:

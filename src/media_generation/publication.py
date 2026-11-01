@@ -300,8 +300,11 @@ class PublicationManager:
         owner_id = None if attempt['owner_id'] is None else str(attempt['owner_id'])
         epoch = int(attempt['claim_epoch'])
         contained = (
-            attempt['containment_contract'] is not None
-            and bool(attempt['process_contained'])
+            (
+                attempt['containment_contract'] is not None
+                and bool(attempt['process_contained'])
+            )
+            or self.store.termination_evidence_proven(job_id, attempt_id)
         )
         failure_class = (
             'canceled'

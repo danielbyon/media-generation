@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -1066,6 +1067,209 @@ def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+LOCAL_INFERENCE_CONFIGURATION_VERSION = "sd-cpp-local/v1"
+LOCAL_INFERENCE_ENGINE_VERSION = "master-975-95b3090-2-gb13a482"
+"""Exact stable-diffusion.cpp revision identity the local profile covers.
+
+The value is the revision identity reported by the pinned stable-diffusion.cpp
+source tree through git describe --tags. It denotes commit
+b13a48219d5cdf408edcb93da6cd69b612ed03d3 on the observed master development
+history. It is an opaque source-revision identity, not a semantic release
+number.
+The governing upstream tag is lightweight, so the --tags form is required;
+plain git describe reports no annotated tag for this commit.
+
+The string must match a candidate declaration's engine.version exactly. A
+different git describe --tags value, branch, or commit identifies different engine
+source and is refused by the application-owned privacy registration; the
+application does not normalize versions or compare them by prefix.
+"""
+
+_INVOCATION_CONTROL_TOKENS: dict[PrivacyControl, frozenset[str]] = {
+    PrivacyControl.EXTERNAL_API: frozenset({"api", "external_api"}),
+    PrivacyControl.CLOUD_INFERENCE: frozenset({"cloud", "cloud_inference"}),
+    PrivacyControl.TELEMETRY: frozenset({"telemetry", "analytics", "metrics"}),
+    PrivacyControl.CONTENT_UPLOAD: frozenset({"upload", "multipart"}),
+    PrivacyControl.AUTOMATIC_NETWORK_FETCH_OR_UPDATE: frozenset(
+        {"download", "fetch", "update", "upgrade"}
+    ),
+    PrivacyControl.REMOTE_ENDPOINT_OR_PROXY: frozenset(
+        {"remote", "host", "listen", "server", "proxy", "endpoint"}
+    ),
+    PrivacyControl.CLOUD_FALLBACK: frozenset({"fallback", "cloud_fallback"}),
+}
+
+_PROMPT_FLAGS = frozenset({"-p", "--prompt"})
+_SAFE_INVOCATION_FLAGS = frozenset(
+    {
+        "--diffusion-model",
+        "--vae",
+        "--llm",
+        "--llm_vision",
+        "-p",
+        "--prompt",
+        "-W",
+        "-H",
+        "--seed",
+        "--sampling-method",
+        "--steps",
+        "--cfg-scale",
+        "--flow-shift",
+        "-r",
+        "--model-args",
+        "--qwen-image-zero-cond-t",
+        "-o",
+    }
+)
+_SAFE_MODEL_ARGUMENT_KEYS = frozenset({"qwen_image_zero_cond_t"})
+_SAFE_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "ROCM_PATH",
+        "HIP_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+    }
+)
+_REMOTE_URL = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _token_words(value: str) -> set[str]:
+    """Split one argument or variable name into lowercase alphanumeric words."""
+    return set(_WORD.findall(value.lower()))
+
+
+def _apply_control_tokens(
+    settings: dict[str, bool | None], value: str
+) -> None:
+    """Mark controls named by one token and report a remote URL scheme."""
+    words = _token_words(value)
+    for control, keywords in _INVOCATION_CONTROL_TOKENS.items():
+        if words & keywords:
+            settings[control.value] = True
+
+
+def invocation_privacy_settings(
+    argv: Iterable[str],
+    environment: Mapping[str, str],
+) -> dict[str, bool | None]:
+    """Derive local-only controls from the exact child invocation.
+
+    The settings are observable facts about the program name, argument vector,
+    and child environment the application passes to the engine. Remote URLs,
+    proxy variables, and tokens that name network, upload, update, telemetry, or
+    fallback behavior set the matching control to a prohibited value. An
+    argument or environment name the application cannot classify leaves the
+    controls unverified instead of assuming they are absent.
+
+    Free-form prompt text and numeric dimensions are data, not configuration.
+    The result therefore describes invocation settings only; it is not proof
+    that the engine makes no network request.
+    """
+    settings: dict[str, bool | None] = {
+        control.value: False for control in PrivacyControl
+    }
+    tokens = list(argv)
+    unknown = False
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not isinstance(token, str):
+            raise ValueError("argv entries must be strings")
+        if token in _PROMPT_FLAGS:
+            index += 2
+            continue
+        if token == "--model-args":
+            value = tokens[index + 1] if index + 1 < len(tokens) else ""
+            for entry in value.split(","):
+                key, separator, model_value = entry.partition("=")
+                if not separator or not key or not model_value:
+                    unknown = True
+                    continue
+                if _matches_remote_token(key):
+                    _apply_control_tokens(settings, key)
+                elif key not in _SAFE_MODEL_ARGUMENT_KEYS:
+                    unknown = True
+            index += 2
+            continue
+        if token.startswith("-"):
+            if token not in _SAFE_INVOCATION_FLAGS:
+                if _matches_remote_token(token):
+                    _apply_control_tokens(settings, token)
+                else:
+                    unknown = True
+            index += 1
+            continue
+        if _REMOTE_URL.search(token):
+            settings[PrivacyControl.REMOTE_ENDPOINT_OR_PROXY.value] = True
+        _apply_control_tokens(settings, token)
+        index += 1
+
+    for name, value in environment.items():
+        normalized = name.lower()
+        if normalized.endswith("_proxy"):
+            settings[PrivacyControl.REMOTE_ENDPOINT_OR_PROXY.value] = True
+        elif name not in _SAFE_ENVIRONMENT_NAMES:
+            if _matches_remote_token(name):
+                _apply_control_tokens(settings, name)
+            else:
+                unknown = True
+        if _REMOTE_URL.search(value):
+            settings[PrivacyControl.REMOTE_ENDPOINT_OR_PROXY.value] = True
+
+    if unknown:
+        for control, value in settings.items():
+            if value is False:
+                settings[control] = None
+    return settings
+
+
+def _matches_remote_token(value: str) -> bool:
+    """Return whether a token names remote or network behavior."""
+    words = _token_words(value)
+    return any(words & keywords for keywords in _INVOCATION_CONTROL_TOKENS.values())
+
+
+def local_inference_privacy_profile(
+    *,
+    adapter_id: str,
+    tool_version: str,
+    configuration_version: object = LOCAL_INFERENCE_CONFIGURATION_VERSION,
+) -> PrivacyProfile:
+    """Return the application-owned profile for one pinned local engine build.
+
+    Every control maps to an explicit setting that the application constructs
+    for the declared invocation: only local artifact paths are passed, the
+    environment is rebuilt from a fixed allowlist, and no remote, telemetry,
+    upload, update, proxy, or fallback path is configured. The profile proves
+    configuration compliance only. It does not prove that the engine makes no
+    network call and does not provide operating-system network confinement.
+    """
+    if not isinstance(tool_version, str) or not tool_version.strip():
+        raise ValueError("tool_version must be a non-empty string")
+    requirements = tuple(
+        PrivacySettingRule(
+            control=control,
+            path=("privacy", control.value),
+            expected=False,
+            prohibited=(True,),
+        )
+        for control in PrivacyControl
+    )
+    return PrivacyProfile(
+        schema_version=PRIVACY_PROFILE_SCHEMA_VERSION,
+        profile_id="stable-diffusion-cpp-local",
+        profile_version=1,
+        adapter_id=adapter_id,
+        tool_id="stable-diffusion.cpp",
+        tool_version=tool_version,
+        configuration_version=configuration_version,
+        requirements=requirements,
+        supports_configuration_compliance=True,
+    )
+
+
 DETERMINISTIC_CPU_PRIVACY_PROFILE = PrivacyProfile(
     schema_version=PRIVACY_PROFILE_SCHEMA_VERSION,
     profile_id="deterministic-cpu-png-v1/unqualified",
@@ -1079,3 +1283,138 @@ DETERMINISTIC_CPU_PRIVACY_PROFILE = PrivacyProfile(
 )
 
 DEFAULT_PRIVACY_POLICY = PrivacyCompliancePolicy((DETERMINISTIC_CPU_PRIVACY_PROFILE,))
+
+@dataclass(frozen=True, slots=True)
+class LocalInferencePrivacyRegistration:
+    """Application-owned binding for one local inference adapter.
+
+    The registration names the exact adapter identity, engine identity,
+    engine version, and configuration version the application is willing to
+    evaluate. The profile is created from these pinned values, never from an
+    adapter-supplied policy or an arbitrary candidate declaration.
+    """
+
+    adapter_id: str
+    tool_id: str
+    tool_version: str
+    configuration_version: bool | int | str
+
+    def __post_init__(self) -> None:
+        """Reject incomplete or non-scalar registration values."""
+
+        for name in ("adapter_id", "tool_id", "tool_version"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if self.configuration_version is None or not _is_json_scalar(
+            self.configuration_version
+        ):
+            raise ValueError(
+                "configuration_version must be a non-null JSON scalar"
+            )
+
+    def profile(self) -> PrivacyProfile:
+        """Return the exact pinned profile this registration authorizes."""
+
+        return local_inference_privacy_profile(
+            adapter_id=self.adapter_id,
+            tool_version=self.tool_version,
+            configuration_version=self.configuration_version,
+        )
+
+APPLICATION_PRIVACY_REGISTRATIONS = (
+    LocalInferencePrivacyRegistration(
+        adapter_id="stable-diffusion-cpp-local-v1",
+        tool_id="stable-diffusion.cpp",
+        tool_version=LOCAL_INFERENCE_ENGINE_VERSION,
+        configuration_version=LOCAL_INFERENCE_CONFIGURATION_VERSION,
+    ),
+)
+"""Application-owned registrations that may evaluate as local inference.
+
+The registry lives in application code and never in an adapter. Adding an entry
+is the only way to authorize another adapter identity, and every entry names
+the exact engine identity, engine version, and configuration version it covers.
+"""
+
+APPLICATION_PRIVACY_REGISTRY = {
+    registration.adapter_id: registration
+    for registration in APPLICATION_PRIVACY_REGISTRATIONS
+}
+
+
+def application_privacy_registration(
+    adapter_id: object,
+) -> LocalInferencePrivacyRegistration:
+    """Return the app-owned registration for an exact adapter identity."""
+
+    if not isinstance(adapter_id, str) or not adapter_id:
+        raise ValueError("backend execution adapter must declare adapter_id")
+    registration = APPLICATION_PRIVACY_REGISTRY.get(adapter_id)
+    if registration is None:
+        raise ValueError(
+            f"no application-owned privacy registration for adapter {adapter_id!r}"
+        )
+    return registration
+
+
+def application_privacy_profile(
+    adapter_id: object, configuration: object
+) -> PrivacyProfile:
+    """Return the app-owned profile for one exact adapter configuration.
+
+    Selection never consults a policy object supplied by the adapter. The
+    registration must match the adapter identifier, engine identifier, engine
+    version, and configuration version exactly. Any mismatch raises instead of
+    degrading into partial evaluation.
+    """
+
+    registration = application_privacy_registration(adapter_id)
+    if not isinstance(configuration, Mapping):
+        raise ValueError(
+            "backend execution configuration must declare a mapping"
+        )
+    engine = configuration.get("engine")
+    if not isinstance(engine, Mapping):
+        raise ValueError(
+            "backend execution configuration must declare an engine mapping"
+        )
+    if engine.get("id") != registration.tool_id:
+        raise ValueError(
+            "backend execution engine does not match application-owned "
+            "registration"
+        )
+    tool_version = engine.get("version")
+    if not isinstance(tool_version, str) or not tool_version.strip():
+        raise ValueError(
+            "backend execution configuration must declare engine version"
+        )
+    if tool_version != registration.tool_version:
+        raise ValueError(
+            "backend execution engine version does not match "
+            "application-owned registration"
+        )
+    if not _same_json_scalar(
+        configuration.get("configuration_version"),
+        registration.configuration_version,
+    ):
+        raise ValueError(
+            "backend execution configuration version does not match "
+            "application-owned registration"
+        )
+    return registration.profile()
+
+
+def application_privacy_policy(
+    adapter: object,
+) -> PrivacyCompliancePolicy:
+    """Return the application-owned policy for one registered backend adapter."""
+
+    return PrivacyCompliancePolicy(
+        (
+            application_privacy_profile(
+                getattr(adapter, "adapter_id", None),
+                getattr(adapter, "configuration", None),
+            ),
+        )
+    )

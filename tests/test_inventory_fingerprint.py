@@ -84,7 +84,7 @@ def _runtimes() -> list[dict[str, object]]:
 
 
 def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
-    """Probe ordering and free/used memory must not affect the digest."""
+    """Probe ordering and non-identity memory detail must not affect the digest."""
     host = _host()
     accelerators = host["accelerators"]
     assert isinstance(accelerators, list)
@@ -99,6 +99,11 @@ def test_fingerprint_is_stable_across_order_and_transient_values() -> None:
     system = memory["system"]
     assert isinstance(system, dict)
     system["available_bytes"] = 1
+    accelerators[0]["uma_carveout"] = {
+        "index": 0,
+        "size_bytes": 512 * 1024**2,
+        "source": "/sys/class/drm/card1/device/uma/carveout_options",
+    }
     host["identity"]["hostname"] = "different-host"  # type: ignore[index]
     host["accelerators"] = list(reversed(host["accelerators"]))
     runtimes = list(reversed(_runtimes()))

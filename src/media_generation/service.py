@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import fcntl
 import threading
 import uuid
+from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO, Iterator
@@ -16,6 +18,7 @@ from typing import BinaryIO, Iterator
 from .adapters import (
     DeterministicCpuAdapter,
     GenerationAdapter,
+    backend_execution_contract,
     trusted_containment_contract,
 )
 from .admission import (
@@ -35,6 +38,8 @@ from .domain import (
     ResolvedReference,
 )
 from .errors import (
+    BackendEvidenceError,
+    BackendPreparationError,
     GenerationExecutionError,
     GenerationError,
     ArtifactIntegrityError,
@@ -52,8 +57,19 @@ from .privacy import (
     PrivacyComplianceResult,
     PrivacyCompliancePolicy,
     PrivacyComplianceStatus,
+    application_privacy_profile,
+    application_privacy_policy,
+    application_privacy_registration,
+    invocation_privacy_settings,
 )
+from .backend_provenance import environment_record
 from .store import ExecutionClaim, QueuedExecution, SQLiteStore
+from .supervisor import (
+    ExecutionEvidenceAuthority,
+    LaunchFact,
+    ProcessObservation,
+    ProcessSupervisor,
+)
 from .images import ImageInfo, open_approved_source, copy_source
 from .publication import PublicationManager, Checkpoint
 
@@ -85,6 +101,163 @@ class SubmissionResult:
 # configuration.
 _NON_JSON_PRIVACY_CONFIGURATION: dict[str, object] = {"marker": object()}
 
+_RESOLVED_EXECUTION_MISMATCH = "resolved_execution_mismatch"
+_EXECUTABLE_HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def _resolved_execution_mismatch(detail: str) -> BackendPreparationError:
+    """Return one fail-closed refusal for a substituted resolution."""
+    return BackendPreparationError(_RESOLVED_EXECUTION_MISMATCH, detail)
+
+
+def _require_selected_value(
+    observed: object, selected: object, *, label: str
+) -> None:
+    """Require one resolved value to equal the admission selection."""
+    if observed != selected:
+        raise _resolved_execution_mismatch(
+            f"resolved execution {label} does not match the selected candidate"
+        )
+
+
+def _require_selected_field(
+    record: Mapping[str, object],
+    selected: Mapping[str, object],
+    name: str,
+    *,
+    label: str | None = None,
+) -> None:
+    """Compare one scalar field whose name is shared by both mappings."""
+    _require_selected_value(
+        record.get(name), selected.get(name), label=label or name
+    )
+
+
+def _sha256_regular_file(path: str) -> str:
+    """Hash one executable the supervisor will start, in bounded chunks."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        while chunk := stream.read(_EXECUTABLE_HASH_CHUNK_BYTES):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _selected_components(
+    configuration: Mapping[str, object], reference_roles: tuple[str, ...]
+) -> list[dict[str, object]]:
+    """Return the component rows the selected operation requires, in order."""
+    operations = configuration.get("operations")
+    if not isinstance(operations, Mapping):
+        raise _resolved_execution_mismatch(
+            "selected candidate has no operation contract"
+        )
+    operation_name = "edit" if "source" in reference_roles else "generate"
+    operation = operations.get(operation_name)
+    if not isinstance(operation, Mapping):
+        raise _resolved_execution_mismatch(
+            f"selected candidate does not declare the {operation_name} operation"
+        )
+    required_roles = operation.get("required_roles")
+    if not isinstance(required_roles, list) or not all(
+        isinstance(role, str) for role in required_roles
+    ):
+        raise _resolved_execution_mismatch(
+            "selected candidate has an invalid required-role contract"
+        )
+    declared = configuration.get("components")
+    if not isinstance(declared, list):
+        raise _resolved_execution_mismatch("selected candidate has no components")
+    by_role: dict[str, dict[str, object]] = {}
+    for component in declared:
+        if not isinstance(component, Mapping):
+            raise _resolved_execution_mismatch(
+                "selected candidate has an invalid component"
+            )
+        role = component.get("role")
+        if not isinstance(role, str) or role in by_role:
+            raise _resolved_execution_mismatch(
+                "selected candidate has an ambiguous component role"
+            )
+        by_role[role] = dict(component)
+    selected: list[dict[str, object]] = []
+    for role in required_roles:
+        component = by_role.get(role)
+        if component is None:
+            raise _resolved_execution_mismatch(
+                f"selected candidate is missing required component role {role!r}"
+            )
+        selected.append(component)
+    return selected
+
+
+def _record_reference_roles(record: Mapping[str, object]) -> tuple[str, ...]:
+    """Return the conditioning roles the resolved record describes."""
+    conditioning = record.get("conditioning")
+    if not isinstance(conditioning, list):
+        raise _resolved_execution_mismatch(
+            "resolved execution conditioning is missing"
+        )
+    roles: list[str] = []
+    for entry in conditioning:
+        if not isinstance(entry, Mapping):
+            raise _resolved_execution_mismatch(
+                "resolved execution conditioning is invalid"
+            )
+        role = entry.get("role")
+        if not isinstance(role, str):
+            raise _resolved_execution_mismatch(
+                "resolved execution conditioning role is invalid"
+            )
+        roles.append(role)
+    return tuple(roles)
+
+
+class _StoreExecutionAuthority(ExecutionEvidenceAuthority):
+    """Persist application-supervised facts for one claimed attempt."""
+
+    def __init__(self, store: SQLiteStore, claim: ExecutionClaim) -> None:
+        self._store = store
+        self._claim = claim
+
+    @property
+    def attempt_id(self) -> str:
+        return self._claim.attempt_id
+
+    def verify_current(self) -> bool:
+        """Return whether the bound claim still has execution authority."""
+        return self._store.assert_attempt_authority(
+            self._claim.job_id,
+            self._claim.attempt_id,
+            self._claim.owner_id,
+            self._claim.claim_epoch,
+        )
+
+    def record_launch(self, fact: LaunchFact) -> None:
+        """Record the launch fact only after a successful spawn."""
+        if not isinstance(fact, LaunchFact):
+            raise TypeError("launch fact must be a LaunchFact")
+        self._store.mark_execution_launched(
+            job_id=self._claim.job_id,
+            attempt_id=self._claim.attempt_id,
+            owner_id=self._claim.owner_id,
+            claim_epoch=self._claim.claim_epoch,
+            record=fact.to_mapping(),
+            timestamp=_now(),
+        )
+
+    def record_observation(self, fact: ProcessObservation) -> None:
+        """Record reaped direct-child facts for the current attempt."""
+        if not isinstance(fact, ProcessObservation):
+            raise TypeError("observation fact must be a ProcessObservation")
+        self._store.mark_execution_observed(
+            job_id=self._claim.job_id,
+            attempt_id=self._claim.attempt_id,
+            owner_id=self._claim.owner_id,
+            claim_epoch=self._claim.claim_epoch,
+            record=fact.to_mapping(),
+            timestamp=_now(),
+        )
+
 
 class GenerationService:
     """Validate, persist, execute, and expose one local generation request.
@@ -113,6 +286,14 @@ class GenerationService:
         self.adapter: GenerationAdapter = (
             adapter if adapter is not None else DeterministicCpuAdapter()
         )
+        self._backend_execution_contract = backend_execution_contract(self.adapter)
+        if self._backend_execution_contract is not None and (
+            not callable(getattr(self.adapter, "resolve_execution", None))
+            or not callable(getattr(self.adapter, "execute", None))
+        ):
+            raise ValueError(
+                "backend execution adapter must declare resolve_execution and execute"
+            )
         if not isinstance(require_privacy_pass, bool):
             raise ValueError("require_privacy_pass must be a boolean")
         if privacy_policy is not None and not isinstance(
@@ -124,8 +305,17 @@ class GenerationService:
         ):
             raise ValueError("admission_profile must be an AdmissionProfile")
         self._admission_profile = admission_profile
-        self._privacy_policy = privacy_policy or DEFAULT_PRIVACY_POLICY
-        self._require_privacy_pass = require_privacy_pass
+        if self._backend_execution_contract is not None:
+            if privacy_policy is not None:
+                raise ValueError(
+                    "an explicit privacy policy cannot replace the "
+                    "application-owned policy for a backend execution adapter"
+                )
+            self._privacy_policy = application_privacy_policy(self.adapter)
+            self._require_privacy_pass = True
+        else:
+            self._privacy_policy = privacy_policy or DEFAULT_PRIVACY_POLICY
+            self._require_privacy_pass = require_privacy_pass
         self._current_privacy_snapshot()
         self._store = SQLiteStore(database_path)
         self.output_directory = output_directory.expanduser().resolve()
@@ -180,6 +370,10 @@ class GenerationService:
                 raw_adapter_configuration,
             )
             raise PrivacyComplianceError(privacy_compliance) from None
+        if self._backend_execution_contract is not None:
+            application_privacy_profile(
+                self.adapter.adapter_id, adapter_configuration
+            )
         privacy_compliance = self._privacy_policy.evaluate(
             self.adapter.adapter_id,
             adapter_configuration,
@@ -474,8 +668,11 @@ class GenerationService:
         owner_id = None if attempt["owner_id"] is None else str(attempt["owner_id"])
         epoch = int(attempt["claim_epoch"])
         contained = (
-            attempt["containment_contract"] is not None
-            and bool(attempt["process_contained"])
+            (
+                attempt["containment_contract"] is not None
+                and bool(attempt["process_contained"])
+            )
+            or self._store.termination_evidence_proven(job_id, attempt_id)
         )
         timestamp = _now()
         if attempt["job_status"] == "canceled":
@@ -628,6 +825,9 @@ class GenerationService:
         heartbeat_thread.start()
         metadata = None
         adapter_dispatched = False
+        execute_entered = False
+        prepared_execution = None
+        supervisor: ProcessSupervisor | None = None
         try:
             plan = GenerationPlan(
                 job_id=claim.job_id,
@@ -641,12 +841,37 @@ class GenerationService:
                 output_slot_id=claim.output_slot_id,
             )
             self._validate_reference_artifacts(claim.references)
+            if self._backend_execution_contract is not None:
+                prepared_execution = self.adapter.resolve_execution(plan)
+                self._require_execution_privacy(prepared_execution, claim=claim)
+                self._store.insert_resolved_execution(
+                    job_id=claim.job_id,
+                    attempt_id=claim.attempt_id,
+                    owner_id=claim.owner_id,
+                    claim_epoch=claim.claim_epoch,
+                    record=prepared_execution.resolved_record,
+                    timestamp=_now(),
+                )
             generated_artifact_id = _new_id("art")
 
             def write_image(destination: Path, staged: BinaryIO) -> None:
-                nonlocal metadata, adapter_dispatched
-                adapter_dispatched = True
-                metadata = self.adapter.generate(plan, staged)
+                nonlocal metadata, adapter_dispatched, execute_entered, supervisor
+                if prepared_execution is not None:
+                    supervisor = ProcessSupervisor(
+                        _StoreExecutionAuthority(self._store, claim),
+                        expected_argv=prepared_execution.argv,
+                        expected_environment=prepared_execution.environment,
+                    )
+                    execute_entered = True
+                    metadata = self.adapter.execute(
+                        plan,
+                        staged,
+                        supervisor=supervisor,
+                    )
+                    self._verify_execution_evidence(claim, prepared_execution)
+                else:
+                    adapter_dispatched = True
+                    metadata = self.adapter.generate(plan, staged)
 
             def make_artifact(info: ImageInfo, destination: Path) -> GenerationArtifact:
                 if metadata is None or (
@@ -681,7 +906,10 @@ class GenerationService:
                 artifact_id=generated_artifact_id,
                 job_id=claim.job_id,
                 attempt_id=claim.attempt_id,
-                sources=tuple(ArtifactSource(reference.artifact_id) for reference in claim.references),
+                sources=tuple(
+                    ArtifactSource(reference.artifact_id, reference.role)
+                    for reference in claim.references
+                ),
                 attempt_owner_id=claim.owner_id,
                 claim_epoch=claim.claim_epoch,
             )
@@ -691,6 +919,16 @@ class GenerationService:
             if snapshot["artifact"] is not None and snapshot["status"] == "succeeded":
                 return None
             if snapshot["status"] == "canceled":
+                canceled_termination = (
+                    claim.containment_contract is not None
+                    or (
+                        supervisor is not None
+                        and not supervisor.process_started
+                    )
+                    or self._store.termination_evidence_proven(
+                        claim.job_id, claim.attempt_id
+                    )
+                )
                 finalized = self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
@@ -699,18 +937,37 @@ class GenerationService:
                     attempt_owner_id=claim.owner_id,
                     claim_epoch=claim.claim_epoch,
                     failure_class="canceled",
-                    termination_proven=claim.containment_contract is not None,
+                    termination_proven=canceled_termination,
                 )
                 if not finalized:
                     return PublicationIncompleteError(
                         claim.job_id, "canceled attempt could not be durably finalized"
                     )
                 return error
-            if not adapter_dispatched:
+            process_started = supervisor is not None and supervisor.process_started
+            preparation_error: BackendPreparationError | None = None
+            cursor: BaseException | None = error
+            while cursor is not None:
+                if isinstance(cursor, BackendPreparationError):
+                    preparation_error = cursor
+                    break
+                cursor = cursor.__cause__
+            if not adapter_dispatched and (
+                not execute_entered
+                or (
+                    not process_started
+                    and preparation_error is not None
+                )
+            ):
+                preparation_message = "execution_preparation_failed"
+                if preparation_error is not None:
+                    preparation_message = (
+                        f"execution_preparation_failed: {preparation_error.code}"
+                    )
                 self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
-                    "execution_preparation_failed",
+                    preparation_message,
                     _now(),
                     attempt_owner_id=claim.owner_id,
                     claim_epoch=claim.claim_epoch,
@@ -725,7 +982,13 @@ class GenerationService:
                     retryable_failure = True
                     break
                 cursor = cursor.__cause__
-            if claim.containment_contract is None:
+            termination_proven = (
+                claim.containment_contract is not None
+                or self._store.termination_evidence_proven(
+                    claim.job_id, claim.attempt_id
+                )
+            )
+            if not termination_proven:
                 self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
@@ -752,6 +1015,273 @@ class GenerationService:
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=max(0.1, self._heartbeat_seconds * 2))
+            cleanup = getattr(self.adapter, "cleanup_execution", None)
+            if prepared_execution is not None and callable(cleanup):
+                cleanup(prepared_execution)
+
+    def _require_selected_candidate_binding(
+        self,
+        configuration: Mapping[str, object],
+        reference_roles: tuple[str, ...],
+        prepared: object,
+    ) -> None:
+        """Require resolved fields to match the candidate claimed by admission.
+
+        Resolution performs the T07 evaluation and builds the resolved record.
+        The record cannot be its own authority: every field that selects a
+        candidate, engine, recipe, or component must match the restart-stable
+        configuration selected for the attempt. The program named by argv[0]
+        must also be the selected executable pin, so an adapter cannot obtain a
+        privacy pass for a different program.
+        """
+        record = getattr(prepared, "resolved_record", None)
+        if not isinstance(record, dict):
+            raise _resolved_execution_mismatch("resolved execution record missing")
+        for name in (
+            "candidate_id",
+            "declaration_sha256",
+            "backend_kind",
+            "invocation_contract",
+            "cli_contract",
+        ):
+            _require_selected_field(record, configuration, name)
+        record_engine = record.get("engine")
+        selected_engine = configuration.get("engine")
+        if not isinstance(record_engine, Mapping) or not isinstance(
+            selected_engine, Mapping
+        ):
+            raise _resolved_execution_mismatch(
+                "resolved execution engine identity missing"
+            )
+        for name in ("id", "version", "build", "executable_sha256"):
+            _require_selected_field(
+                record_engine, selected_engine, name, label=f"engine.{name}"
+            )
+        record_recipe = record.get("recipe")
+        selected_recipe = configuration.get("recipe")
+        if not isinstance(record_recipe, Mapping) or not isinstance(
+            selected_recipe, Mapping
+        ):
+            raise _resolved_execution_mismatch(
+                "resolved execution recipe identity missing"
+            )
+        for name in ("id", "document_sha256"):
+            _require_selected_field(
+                record_recipe, selected_recipe, name, label=f"recipe.{name}"
+            )
+        _require_selected_value(
+            record.get("components"),
+            _selected_components(configuration, reference_roles),
+            label="components",
+        )
+        _require_selected_value(
+            record.get("adapters"),
+            configuration.get("adapters"),
+            label="adapters",
+        )
+        self._require_selected_executable(
+            record_engine, selected_engine, prepared
+        )
+
+    def _require_selected_executable(
+        self,
+        record_engine: Mapping[str, object],
+        selected_engine: Mapping[str, object],
+        prepared: object,
+    ) -> None:
+        """Require argv[0] to identify and contain the selected executable."""
+        pin = selected_engine.get("executable")
+        if not isinstance(pin, Mapping):
+            raise _resolved_execution_mismatch(
+                "selected candidate has no executable pin"
+            )
+        relative_path = pin.get("path")
+        selected_digest = pin.get("sha256")
+        if (
+            not isinstance(relative_path, str)
+            or not relative_path
+            or not isinstance(selected_digest, str)
+        ):
+            raise _resolved_execution_mismatch(
+                "selected candidate has an invalid executable pin"
+            )
+        _require_selected_value(
+            record_engine.get("executable_sha256"),
+            selected_digest,
+            label="engine.executable_sha256",
+        )
+        argv = tuple(getattr(prepared, "argv", ()))
+        if not argv or not isinstance(argv[0], str) or not os.path.isabs(argv[0]):
+            raise _resolved_execution_mismatch(
+                "resolved argv[0] is not an absolute executable path"
+            )
+        parts = Path(relative_path).parts
+        if not parts or tuple(Path(argv[0]).parts[-len(parts) :]) != parts:
+            raise _resolved_execution_mismatch(
+                "resolved argv[0] does not match the selected executable path"
+            )
+        try:
+            observed_digest = _sha256_regular_file(argv[0])
+        except OSError as error:
+            raise _resolved_execution_mismatch(
+                "resolved argv[0] cannot be read for executable verification"
+            ) from error
+        if observed_digest != selected_digest:
+            raise _resolved_execution_mismatch(
+                "resolved argv[0] bytes do not match the selected executable"
+            )
+
+    def _require_execution_privacy(
+        self, prepared: object, *, claim: ExecutionClaim | None = None
+    ) -> None:
+        """Require PASS for the exact resolved invocation before any spawn.
+
+        The service does not trust the record's privacy map. It recomputes the
+        settings from the argv and environment it is about to spawn, requires
+        that the record matches that recomputation, and requires the
+        application-owned policy to return PASS. The profile is selected by
+        the application-owned registry from the exact adapter identity, engine
+        identity, engine version, and configuration version; a policy object
+        exposed by the adapter is never consulted. A caller-supplied policy
+        cannot relax this gate, and ``require_privacy_pass=False`` does not
+        apply to backend execution adapters.
+
+        The resolved candidate and executable are also bound to the
+        configuration selected at admission. A direct caller without a claim
+        uses the adapter's current configuration.
+        """
+        record = getattr(prepared, "resolved_record", None)
+        if not isinstance(record, dict):
+            raise BackendEvidenceError("resolved execution record is missing")
+        if claim is None:
+            configuration = self.adapter.configuration
+            reference_roles = _record_reference_roles(record)
+        else:
+            try:
+                configuration = json.loads(claim.adapter_configuration_json)
+            except (TypeError, ValueError) as error:
+                raise _resolved_execution_mismatch(
+                    "claimed adapter configuration is not valid JSON"
+                ) from error
+            reference_roles = tuple(
+                reference.role for reference in claim.references
+            )
+        if not isinstance(configuration, Mapping):
+            raise _resolved_execution_mismatch(
+                "adapter configuration is not an object"
+            )
+        argv = tuple(getattr(prepared, "argv"))
+        environment = dict(getattr(prepared, "environment"))
+        if record.get("argv") != list(argv):
+            raise BackendEvidenceError(
+                "resolved argv record does not match the prepared invocation"
+            )
+        if record.get("environment") != environment_record(environment):
+            raise BackendEvidenceError(
+                "resolved environment record does not match the prepared invocation"
+            )
+        registration = application_privacy_registration(self.adapter.adapter_id)
+        engine = record.get("engine")
+        if not isinstance(engine, Mapping):
+            raise BackendEvidenceError(
+                "resolved execution engine identity missing"
+            )
+        privacy = invocation_privacy_settings(argv, environment)
+        configuration_version = configuration.get("configuration_version")
+        result = self._privacy_policy.evaluate(
+            self.adapter.adapter_id,
+            {"configuration_version": configuration_version, "privacy": privacy},
+        )
+        if (
+            engine.get("id") != registration.tool_id
+            or engine.get("version") != registration.tool_version
+        ):
+            raise PrivacyComplianceError(
+                replace(
+                    result,
+                    status=PrivacyComplianceStatus.FAIL,
+                    reasons=(
+                        *result.reasons,
+                        {
+                            "code": "resolved_engine_mismatch",
+                            "detail": (
+                                "Resolved engine identity does not match "
+                                "the application-owned privacy registration."
+                            ),
+                        },
+                    ),
+                )
+            )
+        self._require_selected_candidate_binding(
+            configuration, reference_roles, prepared
+        )
+        if record.get("privacy") != privacy:
+            raise PrivacyComplianceError(
+                replace(
+                    result,
+                    status=PrivacyComplianceStatus.FAIL,
+                    reasons=(
+                        *result.reasons,
+                        {
+                            "code": "resolved_privacy_mismatch",
+                            "detail": (
+                                "Resolved privacy settings do not match the "
+                                "recomputed invocation."
+                            ),
+                        },
+                    ),
+                )
+            )
+        if result.status is not PrivacyComplianceStatus.PASS:
+            raise PrivacyComplianceError(result)
+
+    def _verify_execution_evidence(self, claim: ExecutionClaim, prepared: object) -> None:
+        """Reject publication unless persisted launch facts match resolution.
+
+        The supervisor records the exact argv and environment it spawned. A
+        mismatch with the resolved plan, a missing launch record, or a missing
+        reaped-child observation fails closed before the publisher commits.
+        """
+        record = self._store.get_backend_execution(claim.job_id, claim.attempt_id)
+        if record is None:
+            raise BackendEvidenceError(
+                "backend execution evidence is missing after execution"
+            )
+        state = record.get("state")
+        if state not in {"launched", "observed"}:
+            raise BackendEvidenceError(
+                "backend execution did not persist launch evidence"
+            )
+        resolved = record.get("resolved")
+        if not isinstance(resolved, dict):
+            raise BackendEvidenceError("backend execution resolved evidence is missing")
+        expected_argv = list(getattr(prepared, "argv"))
+        if resolved.get("argv") != expected_argv:
+            raise BackendEvidenceError(
+                "persisted resolved argv does not match the resolved invocation"
+            )
+        expected_environment = dict(getattr(prepared, "environment"))
+        if resolved.get("environment") != environment_record(expected_environment):
+            raise BackendEvidenceError(
+                "persisted resolved environment does not match the resolved invocation"
+            )
+        launch = record.get("launch")
+        if not isinstance(launch, dict):
+            raise BackendEvidenceError("backend execution launch evidence is missing")
+        recorded_argv = launch.get("argv")
+        if recorded_argv != expected_argv:
+            raise BackendEvidenceError(
+                "persisted launch argv does not match the resolved invocation"
+            )
+        recorded_environment = launch.get("environment")
+        if recorded_environment != expected_environment:
+            raise BackendEvidenceError(
+                "persisted launch environment does not match the resolved invocation"
+            )
+        if state != "observed" or not isinstance(record.get("observed"), dict):
+            raise BackendEvidenceError(
+                "backend execution did not persist a reaped-child observation"
+            )
 
     @contextmanager
     def _resource_lock(self) -> Iterator[bool]:
@@ -861,6 +1391,17 @@ class GenerationService:
         """Retrieve the request, adapter attempt, and output provenance snapshot."""
         return self._store.get_provenance(job_id)
 
+    def get_execution(
+        self, job_id: str, attempt_id: str | None = None
+    ) -> dict[str, object]:
+        """Return full validated backend execution records for one attempt."""
+        record = self._store.get_backend_execution(job_id, attempt_id)
+        if record is None:
+            raise RecordNotFoundError(
+                f"backend execution evidence not found for job {job_id}"
+            )
+        return record
+
     def inspect_admission(self, job_id: str) -> AdmissionInspection | None:
         """Return one consistent job-scoped admission and reservation view."""
         return self._store.inspect_admission(job_id)
@@ -872,6 +1413,24 @@ class GenerationService:
 
     def _validate_capabilities(self, request: GenerationRequest) -> None:
         capabilities = self.adapter.capabilities
+        multiple = capabilities.dimension_multiple
+        if multiple < 1:
+            raise ValueError("adapter dimension_multiple must be positive")
+        if request.width < capabilities.min_width:
+            raise UnsupportedCapabilityError(
+                f"adapter {self.adapter.adapter_id!r} supports width from "
+                f"{capabilities.min_width}"
+            )
+        if request.height < capabilities.min_height:
+            raise UnsupportedCapabilityError(
+                f"adapter {self.adapter.adapter_id!r} supports height from "
+                f"{capabilities.min_height}"
+            )
+        if request.width % multiple or request.height % multiple:
+            raise UnsupportedCapabilityError(
+                f"adapter {self.adapter.adapter_id!r} requires dimensions that "
+                f"are multiples of {multiple}"
+            )
         if request.width > capabilities.max_width:
             raise UnsupportedCapabilityError(
                 f"adapter {self.adapter.adapter_id!r} supports width up to {capabilities.max_width}"
@@ -888,6 +1447,24 @@ class GenerationService:
             raise UnsupportedCapabilityError(
                 f"adapter {self.adapter.adapter_id!r} supports at most "
                 f"{capabilities.max_references} reference images"
+            )
+        roles = request.reference_roles or ("reference",) * len(request.reference_ids)
+        source_count = roles.count("source")
+        operation = "edit" if source_count else "generate"
+        if operation not in capabilities.supported_operations:
+            raise UnsupportedCapabilityError(
+                f"adapter {self.adapter.adapter_id!r} does not support "
+                f"{operation} requests"
+            )
+        if source_count and not capabilities.supports_editing:
+            raise UnsupportedCapabilityError(
+                f"adapter {self.adapter.adapter_id!r} does not support editing "
+                "a source image"
+            )
+        if source_count > capabilities.max_source_images:
+            raise UnsupportedCapabilityError(
+                f"adapter {self.adapter.adapter_id!r} supports at most "
+                f"{capabilities.max_source_images} source images"
             )
 
     def _submission_for_job(self, job_id: str) -> SubmissionResult:

@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 from .admission import is_lightweight_cpu_adapter_id
+from .backend_provenance import (
+    EXECUTION_STATES,
+    canonical_json as backend_canonical_json,
+    digest as backend_digest,
+    observation_proves_reaped_child,
+    validate_launch_record,
+    validate_observed_record,
+    validate_resolved_record,
+)
 from .admission_store import (
     AdmissionInspection,
     AdmissionPersistence,
@@ -26,6 +36,7 @@ from .domain import (
     ResolvedReference,
 )
 from .errors import (
+    BackendEvidenceError,
     GenerationError,
     IdempotencyConflictError,
     RecordNotFoundError,
@@ -41,9 +52,9 @@ _PRIVACY_CLAIM_EVIDENCE_REQUIRED = (
 _PRIVACY_CLAIM_CONFIGURATION_REQUIRED = (
     "protected execution claim requires exact adapter-configuration evidence"
 )
-_WRITER_EPOCH = 5
+_WRITER_EPOCH = 6
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_CURRENT_SCHEMA_VERSION = 5
+_CURRENT_SCHEMA_VERSION = 6
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -58,6 +69,8 @@ _WRITER_GUARDS = (
     ("artifact_integrity", "UPDATE"),
     ("execution_admissions", "INSERT"),
     ("execution_admissions", "UPDATE"),
+    ("backend_executions", "INSERT"),
+    ("backend_executions", "UPDATE"),
 )
 
 
@@ -98,6 +111,65 @@ _EXECUTION_ATTEMPTS_DDL = """CREATE TABLE execution_attempts (
     completed_at TEXT,
     UNIQUE (job_id, attempt_number)
 )"""
+
+_BACKEND_EXECUTIONS_DDL = """CREATE TABLE backend_executions (
+    attempt_id TEXT PRIMARY KEY REFERENCES execution_attempts(attempt_id),
+    job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
+    backend_kind TEXT NOT NULL CHECK (length(backend_kind) BETWEEN 1 AND 64),
+    candidate_id TEXT NOT NULL CHECK (
+        length(candidate_id) = 71 AND substr(candidate_id, 1, 7) = 'sha256:'),
+    resolved_json TEXT NOT NULL,
+    resolved_digest TEXT NOT NULL CHECK (length(resolved_digest) = 64),
+    resolved_at TEXT NOT NULL,
+    launch_json TEXT,
+    launch_at TEXT,
+    observed_json TEXT,
+    observed_at TEXT,
+    state TEXT NOT NULL CHECK (state IN ('resolved','launched','observed')),
+    CHECK ((state = 'resolved' AND launch_json IS NULL AND launch_at IS NULL
+            AND observed_json IS NULL AND observed_at IS NULL)
+        OR (state = 'launched' AND launch_json IS NOT NULL AND launch_at IS NOT NULL
+            AND observed_json IS NULL AND observed_at IS NULL)
+        OR (state = 'observed' AND launch_json IS NOT NULL AND launch_at IS NOT NULL
+            AND observed_json IS NOT NULL AND observed_at IS NOT NULL))
+)"""
+
+_BACKEND_EXECUTIONS_STAGE_INSERT_DDL = """CREATE TRIGGER backend_executions_stage_insert
+BEFORE INSERT ON backend_executions
+WHEN NEW.state != 'resolved' OR NEW.launch_json IS NOT NULL
+    OR NEW.launch_at IS NOT NULL OR NEW.observed_json IS NOT NULL
+    OR NEW.observed_at IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'backend execution must start in resolved state');
+END"""
+
+_BACKEND_EXECUTIONS_STAGE_TRANSITION_DDL = """CREATE TRIGGER backend_executions_stage_transition
+BEFORE UPDATE ON backend_executions
+BEGIN
+    SELECT RAISE(ABORT, 'backend execution resolved evidence is immutable')
+    WHERE NEW.attempt_id IS NOT OLD.attempt_id
+       OR NEW.job_id IS NOT OLD.job_id
+       OR NEW.backend_kind IS NOT OLD.backend_kind
+       OR NEW.candidate_id IS NOT OLD.candidate_id
+       OR NEW.resolved_json IS NOT OLD.resolved_json
+       OR NEW.resolved_digest IS NOT OLD.resolved_digest
+       OR NEW.resolved_at IS NOT OLD.resolved_at;
+    SELECT RAISE(ABORT, 'backend execution stage transition is invalid')
+    WHERE NOT ((OLD.state = 'resolved' AND NEW.state = 'launched'
+            AND NEW.launch_json IS NOT NULL AND NEW.launch_at IS NOT NULL
+            AND NEW.observed_json IS NULL AND NEW.observed_at IS NULL)
+        OR (OLD.state = 'launched' AND NEW.state = 'observed'
+            AND NEW.launch_json IS OLD.launch_json
+            AND NEW.launch_at IS OLD.launch_at
+            AND NEW.observed_json IS NOT NULL
+            AND NEW.observed_at IS NOT NULL));
+END"""
+
+_BACKEND_EXECUTIONS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER backend_executions_immutable_delete
+BEFORE DELETE ON backend_executions
+BEGIN
+    SELECT RAISE(ABORT, 'backend execution evidence is immutable');
+END"""
 
 _EXECUTION_RESOURCE_DDL = """CREATE TABLE execution_resource (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -142,6 +214,9 @@ _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL = """CREATE INDEX execution_attempts_runni
 
 _EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL = """CREATE INDEX execution_admissions_dispatch_idx
     ON execution_admissions(decision, created_at, job_id)"""
+
+_BACKEND_EXECUTIONS_JOB_INDEX_DDL = """CREATE INDEX backend_executions_job_idx
+    ON backend_executions(job_id, resolved_at)"""
 
 _GENERATION_REQUESTS_DDL = """CREATE TABLE generation_requests (
     request_id TEXT PRIMARY KEY,
@@ -316,6 +391,7 @@ _EXECUTION_TABLE_DDL: dict[str, str] = {
     "execution_resource": _EXECUTION_RESOURCE_DDL,
     "artifact_publication_authority": _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
     "execution_admissions": _EXECUTION_ADMISSIONS_DDL,
+    "backend_executions": _BACKEND_EXECUTIONS_DDL,
 }
 
 
@@ -337,6 +413,7 @@ _CURRENT_INDEX_DDL: dict[str, str] = {
     "execution_jobs_queued_idx": _EXECUTION_JOBS_QUEUED_INDEX_DDL,
     "execution_attempts_running_idx": _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
     "execution_admissions_dispatch_idx": _EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL,
+    "backend_executions_job_idx": _BACKEND_EXECUTIONS_JOB_INDEX_DDL,
 }
 
 _STATIC_TRIGGER_DDL: dict[str, str] = {
@@ -356,6 +433,9 @@ _STATIC_TRIGGER_DDL: dict[str, str] = {
     "artifact_edges_immutable_update": _ARTIFACT_EDGES_IMMUTABLE_UPDATE_DDL,
     "artifact_edges_immutable_delete": _ARTIFACT_EDGES_IMMUTABLE_DELETE_DDL,
     "artifact_edges_sealed": _ARTIFACT_EDGES_SEALED_DDL,
+    "backend_executions_stage_insert": _BACKEND_EXECUTIONS_STAGE_INSERT_DDL,
+    "backend_executions_stage_transition": _BACKEND_EXECUTIONS_STAGE_TRANSITION_DDL,
+    "backend_executions_immutable_delete": _BACKEND_EXECUTIONS_IMMUTABLE_DELETE_DDL,
 }
 
 
@@ -770,13 +850,20 @@ END"""
     ) -> tuple[ResolvedReference, ...]:
         """Reconstruct the ordered reference identities frozen on a job."""
         row = connection.execute(
-            "SELECT validated_reference_ids_json FROM generation_jobs WHERE job_id = ?",
+            """SELECT jobs.validated_reference_ids_json, execution.resolved_plan_json
+               FROM generation_jobs AS jobs
+               JOIN execution_jobs AS execution ON execution.job_id = jobs.job_id
+               WHERE jobs.job_id = ?""",
             (job_id,),
         ).fetchone()
         if row is None:
             raise RecordNotFoundError(f"job not found: {job_id}")
+        plan = json.loads(str(row["resolved_plan_json"]))
+        roles = [str(item.get("role", "reference")) for item in plan["references"]]
         references: list[ResolvedReference] = []
-        for artifact_id in json.loads(str(row["validated_reference_ids_json"])):
+        for position, artifact_id in enumerate(
+            json.loads(str(row["validated_reference_ids_json"]))
+        ):
             artifact = connection.execute(
                 "SELECT artifact_id, sha256, path FROM generation_artifacts WHERE artifact_id = ?",
                 (artifact_id,),
@@ -788,6 +875,7 @@ END"""
                     artifact_id=str(artifact["artifact_id"]),
                     content_sha256=str(artifact["sha256"]),
                     path=Path(str(artifact["path"])),
+                    role=roles[position] if position < len(roles) else "reference",
                 )
             )
         return tuple(references)
@@ -812,6 +900,7 @@ END"""
                         "artifact_id": reference.artifact_id,
                         "content_sha256": reference.content_sha256,
                         "path": str(reference.path),
+                        "role": reference.role,
                     }
                     for reference in references
                 ],
@@ -971,7 +1060,9 @@ END"""
                     self._references_for_job(connection, str(existing["job_id"])),
                 )
 
-            references = self._resolve_references(connection, request.reference_ids)
+            references = self._resolve_references(
+                connection, request.reference_ids, request.reference_roles
+            )
             parameters = json.loads(effective_parameters_json)
             parameters[_RESOLVED_OUTPUT_DIRECTORY_KEY] = str(
                 Path(resolved_output_directory).expanduser().resolve()
@@ -1046,9 +1137,10 @@ END"""
     def _resolve_references(
         connection: sqlite3.Connection,
         artifact_ids: tuple[str, ...],
+        roles: tuple[str, ...] = (),
     ) -> tuple[ResolvedReference, ...]:
         references: list[ResolvedReference] = []
-        for artifact_id in artifact_ids:
+        for position, artifact_id in enumerate(artifact_ids):
             row = connection.execute(
                 "SELECT artifact_id, sha256, path FROM generation_artifacts WHERE artifact_id = ?",
                 (artifact_id,),
@@ -1060,6 +1152,7 @@ END"""
                     artifact_id=str(row["artifact_id"]),
                     content_sha256=str(row["sha256"]),
                     path=Path(str(row["path"])),
+                    role=roles[position] if position < len(roles) else "reference",
                 )
             )
         return tuple(references)
@@ -1286,6 +1379,7 @@ END"""
                     artifact_id=str(item["artifact_id"]),
                     content_sha256=str(item["content_sha256"]),
                     path=Path(str(item["path"])),
+                    role=str(item.get("role", "reference")),
                 )
                 for item in plan["references"]
             )
@@ -1503,6 +1597,306 @@ END"""
             )
             return updated.rowcount == 1
 
+    @staticmethod
+    def _attempt_termination_evidence(
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Return whether a validated reaped-child observation is persisted.
+
+        Missing or pre-observation rows are not proof. Malformed persisted
+        evidence raises so finalization cannot convert it into a release.
+        """
+        row = connection.execute(
+            "SELECT * FROM backend_executions WHERE job_id = ? AND attempt_id = ?",
+            (job_id, attempt_id),
+        ).fetchone()
+        if row is None:
+            return False
+        record = SQLiteStore._decode_backend_execution(row)
+        if record["state"] != "observed":
+            return False
+        observed = record["observed"]
+        if not isinstance(observed, dict):
+            raise BackendEvidenceError("observed backend execution evidence is missing")
+        return observation_proves_reaped_child(observed)
+
+    def termination_evidence_proven(self, job_id: str, attempt_id: str) -> bool:
+        """Read whether this attempt has durable, validated reaped-child proof."""
+        with self._connection() as connection:
+            return self._attempt_termination_evidence(connection, job_id, attempt_id)
+
+    @staticmethod
+    def _decode_backend_execution(row: sqlite3.Row) -> dict[str, object]:
+        """Validate one persisted execution row and return its full records."""
+        attempt_id = str(row["attempt_id"])
+        try:
+            resolved = json.loads(str(row["resolved_json"]))
+            launch = (
+                None if row["launch_json"] is None else json.loads(str(row["launch_json"]))
+            )
+            observed = (
+                None
+                if row["observed_json"] is None
+                else json.loads(str(row["observed_json"]))
+            )
+        except (TypeError, ValueError) as error:
+            raise BackendEvidenceError(
+                "stored backend execution evidence is not valid JSON"
+            ) from error
+        if not isinstance(resolved, dict):
+            raise BackendEvidenceError("stored resolved evidence must be an object")
+        validate_resolved_record(resolved)
+        if resolved.get("attempt_id") != attempt_id:
+            raise BackendEvidenceError("resolved evidence identifies a different attempt")
+        if resolved.get("candidate_id") != str(row["candidate_id"]):
+            raise BackendEvidenceError("resolved evidence candidate identity diverged")
+        if resolved.get("backend_kind") != str(row["backend_kind"]):
+            raise BackendEvidenceError("resolved evidence backend kind diverged")
+        if backend_digest(resolved) != str(row["resolved_digest"]):
+            raise BackendEvidenceError("resolved evidence digest does not match its bytes")
+        state = str(row["state"])
+        if state not in EXECUTION_STATES:
+            raise BackendEvidenceError("stored backend execution has an unknown state")
+        if state in {"launched", "observed"}:
+            if launch is None or row["launch_at"] is None:
+                raise BackendEvidenceError("launched evidence is missing its launch record")
+            if not isinstance(launch, dict):
+                raise BackendEvidenceError("stored launch evidence must be an object")
+            validate_launch_record(launch)
+            if launch.get("attempt_id") != attempt_id:
+                raise BackendEvidenceError("launch evidence identifies a different attempt")
+            SQLiteStore._validate_launch_matches_resolved(resolved, launch)
+        elif launch is not None or row["launch_at"] is not None:
+            raise BackendEvidenceError("resolved evidence carries an unexpected launch record")
+        if state == "observed":
+            if observed is None or row["observed_at"] is None:
+                raise BackendEvidenceError("observed evidence is missing its observation record")
+            if not isinstance(observed, dict):
+                raise BackendEvidenceError("stored observation evidence must be an object")
+            validate_observed_record(observed)
+            if observed.get("attempt_id") != attempt_id:
+                raise BackendEvidenceError(
+                    "observation evidence identifies a different attempt"
+                )
+        elif observed is not None or row["observed_at"] is not None:
+            raise BackendEvidenceError(
+                "pre-observation evidence carries an unexpected observation record"
+            )
+        return {
+            "job_id": str(row["job_id"]),
+            "attempt_id": attempt_id,
+            "backend_kind": str(row["backend_kind"]),
+            "candidate_id": str(row["candidate_id"]),
+            "state": state,
+            "resolved_digest": str(row["resolved_digest"]),
+            "resolved_at": str(row["resolved_at"]),
+            "launch_at": None if row["launch_at"] is None else str(row["launch_at"]),
+            "observed_at": (
+                None if row["observed_at"] is None else str(row["observed_at"])
+            ),
+            "resolved": resolved,
+            "launch": launch,
+            "observed": observed,
+        }
+
+    @staticmethod
+    def _validate_launch_matches_resolved(
+        resolved: Mapping[str, object], launch: Mapping[str, object]
+    ) -> None:
+        """Refuse launch evidence that names a different invocation.
+
+        The launch record is written by the application-owned supervisor with
+        the exact argv and environment it spawned. Comparing it with the
+        immutable resolved plan ties a later observation to the process the
+        pre-dispatch policy approved.
+        """
+        if launch.get("argv") != resolved.get("argv"):
+            raise BackendEvidenceError(
+                "launch argv does not match the resolved invocation"
+            )
+        environment = resolved.get("environment")
+        if not isinstance(environment, Mapping):
+            raise BackendEvidenceError("resolved environment evidence is malformed")
+        names = environment.get("names")
+        values = environment.get("values")
+        if not isinstance(names, list) or not isinstance(values, Mapping):
+            raise BackendEvidenceError("resolved environment evidence is malformed")
+        launch_environment = launch.get("environment")
+        if not isinstance(launch_environment, Mapping):
+            raise BackendEvidenceError("launch environment evidence is malformed")
+        if set(launch_environment) != set(names):
+            raise BackendEvidenceError(
+                "launch environment names do not match the resolved invocation"
+            )
+        for name, value in values.items():
+            if launch_environment.get(name) != value:
+                raise BackendEvidenceError(
+                    "launch environment values do not match the resolved invocation"
+                )
+
+    def get_backend_execution(
+        self,
+        job_id: str,
+        attempt_id: str | None = None,
+    ) -> dict[str, object] | None:
+        """Return full validated execution records for one attempt.
+
+        With no explicit attempt, only the job's current attempt is considered.
+        A missing evidence row returns ``None``; a malformed row raises.
+        """
+        with self._connection() as connection:
+            if attempt_id is None:
+                row = connection.execute(
+                    """SELECT executions.*
+                       FROM execution_jobs AS jobs
+                       JOIN backend_executions AS executions
+                         ON executions.attempt_id = jobs.current_attempt_id
+                       WHERE jobs.job_id = ?""",
+                    (job_id,),
+                ).fetchone()
+            else:
+                attempt = connection.execute(
+                    "SELECT 1 FROM execution_attempts WHERE job_id = ? AND attempt_id = ?",
+                    (job_id, attempt_id),
+                ).fetchone()
+                if attempt is None:
+                    raise RecordNotFoundError(
+                        f"attempt {attempt_id} does not belong to job {job_id}"
+                    )
+                row = connection.execute(
+                    "SELECT * FROM backend_executions WHERE job_id = ? AND attempt_id = ?",
+                    (job_id, attempt_id),
+                ).fetchone()
+        if row is None:
+            return None
+        return self._decode_backend_execution(row)
+
+    @staticmethod
+    def _require_backend_authority(
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str | None,
+        claim_epoch: int | None,
+    ) -> None:
+        """Refuse evidence writes from a stale owner, epoch, or attempt."""
+        if not SQLiteStore._attempt_authorized(
+            connection, job_id, attempt_id, owner_id, claim_epoch
+        ):
+            raise BackendEvidenceError(
+                "attempt ownership, epoch, or current-job authority is stale; "
+                "execution evidence was not written"
+            )
+
+    def insert_resolved_execution(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str | None,
+        claim_epoch: int | None,
+        record: dict[str, object],
+        timestamp: str,
+    ) -> str:
+        """Insert the immutable resolved plan for one current attempt.
+
+        The record is validated before the transaction. The digest is computed
+        from the same canonical bytes that a later read recomputes. Only one
+        resolved insert is accepted per attempt.
+        """
+        validate_resolved_record(record)
+        if record.get("attempt_id") != attempt_id:
+            raise BackendEvidenceError("resolved evidence identifies a different attempt")
+        resolved_json = backend_canonical_json(record)
+        resolved_digest = backend_digest(record)
+        with self._connection(transaction=True) as connection:
+            self._require_backend_authority(
+                connection, job_id, attempt_id, owner_id, claim_epoch
+            )
+            try:
+                connection.execute(
+                    """INSERT INTO backend_executions
+                       (attempt_id, job_id, backend_kind, candidate_id, resolved_json,
+                        resolved_digest, resolved_at, launch_json, launch_at,
+                        observed_json, observed_at, state)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 'resolved')""",
+                    (
+                        attempt_id,
+                        job_id,
+                        str(record["backend_kind"]),
+                        str(record["candidate_id"]),
+                        resolved_json,
+                        resolved_digest,
+                        timestamp,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise BackendEvidenceError(
+                    "resolved execution evidence already exists for this attempt"
+                ) from error
+        return resolved_digest
+
+    def mark_execution_launched(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str | None,
+        claim_epoch: int | None,
+        record: dict[str, object],
+        timestamp: str,
+    ) -> None:
+        """Record exactly one resolved-to-launched transition."""
+        validate_launch_record(record)
+        if record.get("attempt_id") != attempt_id:
+            raise BackendEvidenceError("launch evidence identifies a different attempt")
+        with self._connection(transaction=True) as connection:
+            self._require_backend_authority(
+                connection, job_id, attempt_id, owner_id, claim_epoch
+            )
+            updated = connection.execute(
+                """UPDATE backend_executions
+                   SET launch_json = ?, launch_at = ?, state = 'launched'
+                   WHERE job_id = ? AND attempt_id = ? AND state = 'resolved'""",
+                (backend_canonical_json(record), timestamp, job_id, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise BackendEvidenceError(
+                    "backend execution is not resolved; launch evidence was not written"
+                )
+
+    def mark_execution_observed(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str | None,
+        claim_epoch: int | None,
+        record: dict[str, object],
+        timestamp: str,
+    ) -> None:
+        """Record exactly one launched-to-observed transition."""
+        validate_observed_record(record)
+        if record.get("attempt_id") != attempt_id:
+            raise BackendEvidenceError("observation evidence identifies a different attempt")
+        with self._connection(transaction=True) as connection:
+            self._require_backend_authority(
+                connection, job_id, attempt_id, owner_id, claim_epoch
+            )
+            updated = connection.execute(
+                """UPDATE backend_executions
+                   SET observed_json = ?, observed_at = ?, state = 'observed'
+                   WHERE job_id = ? AND attempt_id = ? AND state = 'launched'""",
+                (backend_canonical_json(record), timestamp, job_id, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise BackendEvidenceError(
+                    "backend execution was not launched; observation evidence "
+                    "was not written"
+                )
+
     def complete_execution(
         self, artifact: GenerationArtifact, timestamp: str, *,
         publication_id: str | None = None, sources: tuple[ArtifactSource, ...] = (),
@@ -1595,7 +1989,12 @@ END"""
                     attempt_owner_id=attempt_owner_id,
                     claim_epoch=claim_epoch,
                 )
-            termination_proven = attempt["containment_contract"] is not None
+            termination_proven = (
+                attempt["containment_contract"] is not None
+                or self._attempt_termination_evidence(
+                    connection, artifact.job_id, artifact.attempt_id
+                )
+            )
             connection.execute(
                 """UPDATE execution_attempts
                    SET status = 'succeeded', completed_at = ?, failure_class = NULL,
@@ -2050,8 +2449,12 @@ END"""
                 "SELECT attempt_number FROM execution_attempts WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()[0]
-            retry = (
+            effective_termination_proven = (
                 termination_proven
+                or self._attempt_termination_evidence(connection, job_id, attempt_id)
+            )
+            retry = (
+                effective_termination_proven
                 and failure_class in {"retryable", "crash"}
                 and int(number) < int(job["max_attempts"])
             )
@@ -2059,7 +2462,7 @@ END"""
                 "canceled"
                 if failure_class == "canceled"
                 else "ambiguous"
-                if failure_class == "ambiguous" or not termination_proven
+                if failure_class == "ambiguous" or not effective_termination_proven
                 else "queued"
                 if retry
                 else "failed"
@@ -2079,7 +2482,7 @@ END"""
                 (
                     attempt_status,
                     failure_class,
-                    int(termination_proven),
+                    int(effective_termination_proven),
                     timestamp,
                     attempt_id,
                     job_id,
@@ -2105,7 +2508,7 @@ END"""
             )
             resource_state = (
                 "quarantined"
-                if failure_class == "ambiguous" or not termination_proven
+                if failure_class == "ambiguous" or not effective_termination_proven
                 else "available"
             )
             connection.execute(
@@ -2220,6 +2623,7 @@ END"""
                           execution.retry_eligible, execution.failure_message,
                           execution.containment_contract,
                           execution.privacy_compliance_json,
+                          execution.current_attempt_id,
                           resource.state AS resource_state,
                           resource.job_id AS resource_job_id,
                           resource.attempt_id AS resource_attempt_id,
@@ -2274,6 +2678,21 @@ END"""
             )
             privacy_compliance = _stored_privacy_compliance(job_row, job.adapter_id)
             admission_record = AdmissionPersistence.snapshot(connection, job_id)
+            backend_execution = None
+            current_attempt_id = job_row["current_attempt_id"]
+            if current_attempt_id is not None:
+                execution_row = connection.execute(
+                    "SELECT * FROM backend_executions WHERE job_id = ? AND attempt_id = ?",
+                    (job_id, str(current_attempt_id)),
+                ).fetchone()
+                if execution_row is not None:
+                    full_execution = self._decode_backend_execution(execution_row)
+                    backend_execution = {
+                        "attempt_id": full_execution["attempt_id"],
+                        "state": full_execution["state"],
+                        "resolved_digest": full_execution["resolved_digest"],
+                        "observed_at": full_execution["observed_at"],
+                    }
             return {
                 "job_id": job.job_id,
                 "request": request.to_dict(),
@@ -2293,6 +2712,7 @@ END"""
                 "admission": (
                     None if admission_record is None else admission_record.to_dict()
                 ),
+                "backend_execution": backend_execution,
                 "execution": {
                     "status": execution_status,
                     "max_attempts": int(job_row["max_attempts"] or 1),

@@ -12,6 +12,7 @@ from threading import Barrier, Event
 
 import pytest
 
+from test_cpu_adapter_support import cpu_adapter, heavyweight_adapter
 from media_generation.adapters import (
     PROCESS_CONTAINED_CONTRACT,
     AdapterCapabilities,
@@ -72,7 +73,7 @@ def test_heavyweight_enqueue_rejects_incomplete_admission_without_persisting(
     service = GenerationService(
         database,
         tmp_path / "images",
-        adapter=_VariantCpuAdapter(),
+        adapter=heavyweight_adapter(),
         admission_profile=_heavyweight_profile() if profile_supplied else None,
     )
 
@@ -96,29 +97,6 @@ def test_heavyweight_enqueue_rejects_incomplete_admission_without_persisting(
             assert connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
 
 
-class _VariantCpuAdapter(DeterministicCpuAdapter):
-    """Run the real CPU adapter with controlled identity, config, or limits."""
-
-    def __init__(
-        self,
-        *,
-        adapter_id: str = "deterministic-cpu-png-v1",
-        configuration: dict[str, object] | None = None,
-        capabilities: AdapterCapabilities | None = None,
-    ) -> None:
-        self.adapter_id = adapter_id
-        self._configuration = (
-            super().configuration if configuration is None else configuration
-        )
-        if capabilities is not None:
-            self.capabilities = capabilities
-
-    @property
-    def configuration(self) -> dict[str, object]:
-        """Return the configuration variant used by this test adapter."""
-        return dict(self._configuration)
-
-
 @pytest.mark.parametrize(
     "unsupported_value",
     ({"set-member"}, float("nan"), object()),
@@ -129,8 +107,8 @@ def test_non_json_adapter_configuration_fails_before_admission_without_leaking_v
     unsupported_value: object,
 ) -> None:
     """Non-JSON settings fail with redacted privacy evidence and persist no job."""
-    configuration = {"configuration_version": 1}
-    adapter = _VariantCpuAdapter(configuration=configuration)
+    configuration: dict[str, object] = {"configuration_version": 1}
+    adapter = heavyweight_adapter(configuration=configuration)
     database_path = tmp_path / "studio.sqlite3"
     service = GenerationService(
         database_path,
@@ -187,14 +165,13 @@ def test_cyclic_adapter_configuration_fails_before_admission_without_recursion(
 ) -> None:
     """Cyclic settings fail with redacted evidence before persistence."""
     configuration: dict[str, object] = {"configuration_version": 1}
-    adapter = _VariantCpuAdapter(configuration=configuration)
+    adapter = heavyweight_adapter(configuration=configuration)
     database_path = tmp_path / "studio.sqlite3"
     service = GenerationService(
         database_path,
         tmp_path / "artifacts",
         adapter=adapter,
     )
-
     sensitive_value = "private-cyclic-configuration-value"
     configuration["api_key"] = sensitive_value
     if cycle_kind == "mapping":
@@ -253,7 +230,7 @@ def test_nested_adapter_configuration_with_credential_fails_before_admission_wit
         "configuration_version": 1,
         "nested": nested,
     }
-    adapter = _VariantCpuAdapter(configuration=configuration)
+    adapter = cpu_adapter(configuration=configuration)
     database_path = tmp_path / "studio.sqlite3"
     with pytest.raises(
         PrivacyComplianceError,
@@ -298,7 +275,7 @@ def test_raw_configuration_serialization_recursion_fails_before_admission_withou
         "serialization_probe": serialization_probe,
         "credential": {"api_key": sensitive_value},
     }
-    adapter = _VariantCpuAdapter(configuration=configuration)
+    adapter = cpu_adapter(configuration=configuration)
     database_path = tmp_path / "studio.sqlite3"
     original_dumps = json.dumps
     rejected_raw_configuration = False
@@ -410,7 +387,7 @@ def test_idempotent_replay_accepts_nested_adapter_configuration(
     service = GenerationService(
         database,
         output_directory,
-        adapter=_VariantCpuAdapter(configuration=configuration),
+        adapter=cpu_adapter(configuration=configuration),
         admission_profile=_heavyweight_profile(),
     )
     request = GenerationRequest(prompt="A glass greenhouse", seed=19)
@@ -433,7 +410,7 @@ def test_provenance_with_nested_adapter_configuration_is_json_serializable(
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "artifacts",
-        adapter=_VariantCpuAdapter(configuration=configuration),
+        adapter=cpu_adapter(configuration=configuration),
         admission_profile=_heavyweight_profile(),
     )
     submitted = service.submit(
@@ -591,13 +568,13 @@ def test_idempotent_reuse_checks_current_adapter_capabilities(tmp_path: Path) ->
     original_service = GenerationService(
         database,
         output_directory,
-        adapter=_VariantCpuAdapter(),
+        adapter=cpu_adapter(),
         admission_profile=_heavyweight_profile(),
     )
     original = original_service.submit(
         "adapter-capability-retry", request, workload_demand=_heavyweight_demand()
     )
-    limited_adapter = _VariantCpuAdapter(
+    limited_adapter = cpu_adapter(
         capabilities=AdapterCapabilities(
             max_width=32,
             max_height=256,
@@ -644,13 +621,13 @@ def test_idempotent_reuse_rejects_changed_adapter_configuration(
     original_service = GenerationService(
         database,
         output_directory,
-        adapter=_VariantCpuAdapter(),
+        adapter=cpu_adapter(),
         admission_profile=_heavyweight_profile(),
     )
     original_service.submit(
         "adapter-config-retry", request, workload_demand=_heavyweight_demand()
     )
-    current_adapter = _VariantCpuAdapter(**adapter_overrides)
+    current_adapter = cpu_adapter(**adapter_overrides)
     retry_service = GenerationService(
         database,
         output_directory,
@@ -714,13 +691,13 @@ def test_concurrent_same_key_submissions_check_persisted_adapter_configuration(
         GenerationService(
             database,
             output_directory,
-            adapter=_VariantCpuAdapter(),
+            adapter=cpu_adapter(),
             admission_profile=_heavyweight_profile(),
         ),
         GenerationService(
             database,
             output_directory,
-            adapter=_VariantCpuAdapter(**second_adapter_overrides),
+            adapter=cpu_adapter(**second_adapter_overrides),
             admission_profile=_heavyweight_profile(),
         ),
     )
@@ -782,23 +759,26 @@ def test_matching_submit_while_adapter_is_paused_returns_existing_running_state(
     entered = Event()
     release = Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        def generate(self, plan: GenerationPlan, destination: BinaryIO):
-            entered.set()
-            if not release.wait(timeout=10):
-                raise RuntimeError("paused adapter was not released")
-            return super().generate(plan, destination)
+    adapter = cpu_adapter()
+
+    def generate(plan: GenerationPlan, destination: BinaryIO):
+        entered.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError("paused adapter was not released")
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = generate
 
     first_service = GenerationService(
         database,
         output_directory,
-        adapter=PausedAdapter(),
+        adapter=adapter,
         admission_profile=_heavyweight_profile(),
     )
     matching_service = GenerationService(
         database,
         output_directory,
-        adapter=PausedAdapter(),
+        adapter=adapter,
         admission_profile=_heavyweight_profile(),
     )
     monkeypatch.setattr(first_service._store, "renew_attempt", lambda *args, **kwargs: False)
@@ -853,7 +833,7 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
         width=48,
         height=48,
     )
-    adapter = _FailAfterWritingAdapter()
+    adapter = _fail_after_writing_adapter()
     original_service = GenerationService(
         database,
         original_output_directory,
@@ -879,7 +859,7 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
     different_directory_service = GenerationService(
         database,
         tmp_path / "other-artifacts",
-        adapter=_FailAfterWritingAdapter(),
+        adapter=_fail_after_writing_adapter(),
         admission_profile=_heavyweight_profile(),
     )
     with pytest.raises(IdempotencyConflictError, match="output directory"):
@@ -888,62 +868,73 @@ def test_failed_job_replay_binds_resolved_output_directory(tmp_path: Path) -> No
         )
 
 
-class _FailAfterWritingAdapter:
-
-    containment_contract = PROCESS_CONTAINED_CONTRACT
-    """Leave a partial file to verify service cleanup and durable failure state."""
-
-    adapter_id = "test-failure-adapter"
-    configuration = {"version": 1}
-    capabilities = AdapterCapabilities(
-        max_width=256,
-        max_height=256,
-        supports_references=True,
-        max_references=4,
+def _fail_after_writing_adapter() -> DeterministicCpuAdapter:
+    """Build the trusted CPU adapter whose renderer writes a partial file."""
+    adapter = cpu_adapter(
+        adapter_id="test-failure-adapter",
+        configuration={"version": 1},
+        capabilities=AdapterCapabilities(
+            max_width=256,
+            max_height=256,
+            supports_references=True,
+            max_references=4,
+        ),
     )
+    adapter.service = None  # type: ignore[attr-defined]
+    adapter.persisted_job = None  # type: ignore[attr-defined]
+    adapter.persisted_request = None  # type: ignore[attr-defined]
+    adapter.persisted_attempt = None  # type: ignore[attr-defined]
+    adapter.persisted_output_directory = None  # type: ignore[attr-defined]
 
-    def __init__(self) -> None:
-        self.service: GenerationService | None = None
-        self.persisted_job = None
-        self.persisted_request = None
-        self.persisted_attempt = None
-        self.persisted_output_directory: str | None = None
-
-    def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
-        assert self.service is not None
-        self.persisted_job = self.service.get_job(plan.job_id)
-        self.persisted_output_directory = self.service._store.get_resolved_output_directory(
-            plan.job_id
+    def generate(plan: GenerationPlan, destination: BinaryIO) -> object:
+        service = adapter.service
+        assert service is not None
+        adapter.persisted_job = service.get_job(plan.job_id)
+        adapter.persisted_output_directory = (
+            service._store.get_resolved_output_directory(plan.job_id)
         )
-        self.persisted_request = self.service.get_request(self.persisted_job.request_id)
-        self.persisted_attempt = self.service.get_provenance(plan.job_id)["attempt"]
+        adapter.persisted_request = service.get_request(adapter.persisted_job.request_id)
+        adapter.persisted_attempt = service.get_provenance(plan.job_id)["attempt"]
         destination.write(b"partial image that must not become an artifact")
         raise RuntimeError("controlled adapter failure")
 
+    adapter.generate = generate
+    return adapter
 
-class _TrackingCpuAdapter(DeterministicCpuAdapter):
-    """Count adapter calls while retaining deterministic CPU behavior."""
+
+class _FalseyTrackingCpuAdapter(DeterministicCpuAdapter):
+    """Expose false truthiness while retaining valid CPU adapter behavior."""
+
+    adapter_id = "falsey-tracking-cpu-v1"
 
     def __init__(self) -> None:
+        super().__init__()
         self.calls = 0
+        self.configuration = {"configuration_version": 1, "profile": "falsey-tracking"}
 
     def generate(self, plan: GenerationPlan, destination: BinaryIO) -> object:
         self.calls += 1
         return super().generate(plan, destination)
 
-
-class _FalseyTrackingCpuAdapter(_TrackingCpuAdapter):
-    """Expose false truthiness while retaining valid CPU adapter behavior."""
-
-    adapter_id = "falsey-tracking-cpu-v1"
-
-    @property
-    def configuration(self) -> dict[str, object]:
-        """Return configuration that distinguishes this adapter from the default."""
-        return {"configuration_version": 1, "profile": "falsey-tracking"}
-
     def __bool__(self) -> bool:
         return False
+
+
+def test_cpu_subclass_without_super_init_keeps_default_configuration() -> None:
+    """A subclass that skips super().__init__ still resolves default settings."""
+
+    class NoSuperAdapter(DeterministicCpuAdapter):
+        def __init__(self) -> None:
+            self.adapter_id = "no-super-cpu-v1"
+
+    adapter = NoSuperAdapter()
+
+    assert adapter.configuration == {
+        "configuration_version": 1,
+        "image_format": "PNG",
+        "pattern_version": 1,
+    }
+    assert DeterministicCpuAdapter().configuration == adapter.configuration
 
 
 def test_falsey_adapter_is_selected_and_used(tmp_path: Path) -> None:
@@ -998,7 +989,7 @@ def test_adapter_failure_leaves_inspectable_attempt_and_no_artifact(
     tmp_path: Path,
 ) -> None:
     """Resolved execution state is durable before invocation and failure is visible."""
-    adapter = _FailAfterWritingAdapter()
+    adapter = _fail_after_writing_adapter()
     service = GenerationService(
         database_path=tmp_path / "studio.sqlite3",
         output_directory=tmp_path / "artifacts",
@@ -1088,7 +1079,15 @@ def test_corrupt_reference_is_rejected_before_adapter_execution(
     else:
         reference_path.write_bytes(b"different bytes than the saved SHA-256")
 
-    adapter = _TrackingCpuAdapter()
+    calls = 0
+    adapter = cpu_adapter()
+
+    def tracked_generate(plan: GenerationPlan, destination: BinaryIO) -> object:
+        nonlocal calls
+        calls += 1
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = tracked_generate
     consumer_service = GenerationService(
         database,
         tmp_path / "consumer-artifacts",
@@ -1110,7 +1109,7 @@ def test_corrupt_reference_is_rejected_before_adapter_execution(
 
     job = consumer_service.get_job(failure.value.job_id)
     provenance = consumer_service.get_provenance(job.job_id)
-    assert adapter.calls == 0
+    assert calls == 0
     assert job.status == "failed"
     assert provenance["attempt"]["status"] == "failed"
     assert provenance["artifact"] is None

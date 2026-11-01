@@ -25,6 +25,7 @@ from media_generation.admission import (
     parse_admission_policy,
     parse_workload_demand,
 )
+from test_cpu_adapter_support import cpu_adapter
 from test_resource_admission import GIB, inventory_report, workload_demand
 
 
@@ -292,12 +293,7 @@ def test_changed_resolved_work_conflicts_even_after_restart(tmp_path: Path, chan
     )
     adapter = DeterministicCpuAdapter()
     if change == "configuration":
-        class ChangedAdapter(DeterministicCpuAdapter):
-            @property
-            def configuration(self):
-                return {**super().configuration, "revision": 99}
-
-        adapter = ChangedAdapter()
+        adapter.configuration = {**adapter.configuration, "revision": 99}
 
     output = tmp_path / ("elsewhere" if change == "destination" else "images")
     service = GenerationService(
@@ -350,18 +346,21 @@ def test_queued_cancellation_is_idempotent_and_creates_no_attempt(tmp_path: Path
 def test_active_cancellation_fences_publication_until_adapter_stops(tmp_path: Path) -> None:
     entered, resume = threading.Event(), threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    def paused_adapter():
+        adapter = cpu_adapter()
 
-        def generate(self, plan, stream):
+        def generate(plan, stream):
             entered.set()
             assert resume.wait(10)
-            return super().generate(plan, stream)
+            return DeterministicCpuAdapter.generate(adapter, plan, stream)
+
+        adapter.generate = generate
+        return adapter
 
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     service = service_at(
-        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+        tmp_path, adapter=paused_adapter(), admission_profile=admission_profile
     )
     queued = service.enqueue(
         "paused", request(), max_attempts=2, workload_demand=demand
@@ -372,7 +371,7 @@ def test_active_cancellation_fences_publication_until_adapter_stops(tmp_path: Pa
             assert entered.wait(5)
             other = service_at(
                 tmp_path,
-                adapter=PausedAdapter(),
+                adapter=paused_adapter(),
                 admission_profile=admission_profile,
             )
             assert other.cancel(queued.job_id)["outcome"] == "accepted"
@@ -394,18 +393,21 @@ def test_active_cancellation_fences_publication_until_adapter_stops(tmp_path: Pa
 def test_synchronous_contention_is_explicit_and_reuses_admitted_job(tmp_path: Path) -> None:
     entered, resume = threading.Event(), threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    def paused_adapter():
+        adapter = cpu_adapter()
 
-        def generate(self, plan, stream):
+        def generate(plan, stream):
             entered.set()
             assert resume.wait(10)
-            return super().generate(plan, stream)
+            return DeterministicCpuAdapter.generate(adapter, plan, stream)
+
+        adapter.generate = generate
+        return adapter
 
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     worker = service_at(
-        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+        tmp_path, adapter=paused_adapter(), admission_profile=admission_profile
     )
     worker.enqueue("occupy", request(), workload_demand=demand)
     with ThreadPoolExecutor() as pool:
@@ -470,23 +472,23 @@ def test_independent_cli_processes_enqueue_execute_and_inspect(tmp_path: Path) -
 def test_retry_cli_requeues_same_job_then_worker_creates_next_attempt(tmp_path: Path) -> None:
     """The public retry operation is idempotent while a bounded retry is queued."""
 
-    class RetryOnceAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
+    calls = 0
 
-        def __init__(self) -> None:
-            self.calls = 0
+    def generate(plan, stream):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableGenerationError("known transient adapter failure")
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
 
-        def generate(self, plan, stream):
-            self.calls += 1
-            if self.calls == 1:
-                raise RetryableGenerationError("known transient adapter failure")
-            return super().generate(plan, stream)
+    adapter.generate = generate
 
     output = tmp_path / "images"
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         output,
-        adapter=RetryOnceAdapter(),
+        adapter=adapter,
         admission_profile=_heavyweight_profile(),
     )
     queued = service.enqueue(
@@ -651,18 +653,15 @@ def test_stale_epoch_cannot_finalize_or_reconcile(tmp_path: Path, checkpoint: st
 
 
 def test_worker_only_claims_matching_adapter_and_destination(tmp_path: Path) -> None:
-    class ChangedAdapter(DeterministicCpuAdapter):
-        @property
-        def configuration(self):
-            return {**super().configuration, "worker_variant": 2}
-
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     default = service_at(tmp_path, admission_profile=admission_profile)
     job = default.enqueue("matching-context", request(), workload_demand=demand)
+    changed = cpu_adapter(containment_contract=None)
+    changed.configuration = {**changed.configuration, "worker_variant": 2}
     assert service_at(
         tmp_path,
-        adapter=ChangedAdapter(),
+        adapter=changed,
         admission_profile=admission_profile,
     ).work()["status"] == "idle"
     other_root = tmp_path / "other-images"
@@ -719,25 +718,26 @@ def test_process_containment_and_attempt_authority_are_persisted_before_dispatch
 ) -> None:
     observed = []
 
-    class ObservingAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
 
-        def generate(self, plan, stream):
-            with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
-                connection.row_factory = sqlite3.Row
-                observed.append(
-                    dict(
-                        connection.execute(
-                            "SELECT * FROM execution_attempts WHERE attempt_id = ?",
-                            (plan.attempt_id,),
-                        ).fetchone()
-                    )
+    def generate(plan, stream):
+        with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+            connection.row_factory = sqlite3.Row
+            observed.append(
+                dict(
+                    connection.execute(
+                        "SELECT * FROM execution_attempts WHERE attempt_id = ?",
+                        (plan.attempt_id,),
+                    ).fetchone()
                 )
-            return super().generate(plan, stream)
+            )
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
+
+    adapter.generate = generate
 
     result = service_at(
         tmp_path,
-        adapter=ObservingAdapter(),
+        adapter=adapter,
         admission_profile=_heavyweight_profile(),
     ).submit("contained", request(), workload_demand=_heavyweight_demand())
     assert result.status == "succeeded"
@@ -940,20 +940,20 @@ def test_succeeded_reuse_ignores_incoming_budget_without_rewriting_policy(tmp_pa
 
 def test_worker_report_preserves_each_claim_outcome_after_retry_success(tmp_path: Path) -> None:
     """Loop completion cannot erase a failed attempt when its retry succeeds."""
-    class RetryOnce(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
+    calls = 0
 
-        def __init__(self):
-            self.calls = 0
+    def generate(plan, stream):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableGenerationError("retry once")
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
 
-        def generate(self, plan, stream):
-            self.calls += 1
-            if self.calls == 1:
-                raise RetryableGenerationError("retry once")
-            return super().generate(plan, stream)
+    adapter.generate = generate
 
     service = service_at(
-        tmp_path, adapter=RetryOnce(), admission_profile=_heavyweight_profile()
+        tmp_path, adapter=adapter, admission_profile=_heavyweight_profile()
     )
     job = service.enqueue(
         "outcome-retry",
@@ -977,20 +977,22 @@ def test_worker_cli_exit_reflects_claim_outcome(
     """A completed worker loop reports failed generation with a nonzero exit."""
     from media_generation.cli import main
 
-    class Adapter(DeterministicCpuAdapter):
-        containment_contract = None if mode == "external" else PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter(
+        containment_contract=None if mode == "external" else PROCESS_CONTAINED_CONTRACT
+    )
 
-        def generate(self, plan, stream):
-            if mode == "failed":
-                raise RuntimeError("terminal generation failure")
-            if mode == "retry":
-                raise RetryableGenerationError("retry queued")
-            if mode == "canceled":
-                service.cancel(plan.job_id)
-            return super().generate(plan, stream)
+    def generate(plan, stream):
+        if mode == "failed":
+            raise RuntimeError("terminal generation failure")
+        if mode == "retry":
+            raise RetryableGenerationError("retry queued")
+        if mode == "canceled":
+            service.cancel(plan.job_id)
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
 
+    adapter.generate = generate
     service = service_at(
-        tmp_path, adapter=Adapter(), admission_profile=_heavyweight_profile()
+        tmp_path, adapter=adapter, admission_profile=_heavyweight_profile()
     )
     job = service.enqueue(
         "outcome-cli",

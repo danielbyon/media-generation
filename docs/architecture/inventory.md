@@ -325,9 +325,11 @@ read, not a device query.
 
 The report keeps these values distinct. PCI class `0x0300` identifies a display
 device; it does not prove that a memory pool is dedicated or shared.
-Dedicated VRAM is marked only when a device query reports it explicitly, such
-as `nvidia-smi`. A card without reliable memory-kind evidence remains `unknown`:
-its pools are reported but are not allocatable and are not added to a total.
+Dedicated VRAM is marked when a device query reports it explicitly, such as
+`nvidia-smi`. An amdgpu APU carveout is marked as `shared_carveout` only when
+the UMA evidence described below passes every consistency check. A card without
+reliable memory-kind evidence remains `unknown`: its pools are reported but are
+not allocatable and are not added to a total.
 
 - `host.memory.system.total_bytes` is system RAM.
 - Each accelerator's `pools` contains the reported GPU pools, including
@@ -351,6 +353,42 @@ the sharing relationship cannot be established, the topology remains `unknown`
 or `ambiguous`; no total is invented. Unified memory is never counted by adding
 system RAM and a shared GPU aperture. A GTT aperture on a device with
 dedicated VRAM does not by itself make the topology ambiguous.
+
+### UMA carveout evidence
+
+The collector reads `device/uma/carveout` and `device/uma/carveout_options`
+when an amdgpu device exposes the UMA group. Kernel 7.0.0-38 creates that group
+only for AMD APUs that support UMA allocation size selection and provide the
+VBIOS carveout table. Its absence leaves the carveout evidence unknown; the
+collector does not infer one from the PCI class or vendor.
+
+`carveout` is an unsigned index into `carveout_options`, not a byte count. The
+option table comes from firmware and uses lines such as `0: Minimum (512 MB)`
+or `1: (1 GB)`. Labels are descriptive; the size in parentheses is authoritative
+for this check. The kernel formats MB and GB as binary units, so the parser
+converts them to 1024**2 and 1024**3 bytes. A firmware entry that names zero GB
+is reported as 512 MB, and every other entry is a whole number of GB, so 512 MB
+is the smallest size the table can contain. The selected index and option size
+describe the boot-time firmware allocation, not live GPU memory use.
+
+The collector marks the sysfs `vram` pool as `shared_carveout` only when all of
+these facts agree:
+
+- the accelerator driver is `amdgpu`;
+- both UMA files were read through the trusted sysfs reader;
+- `carveout` is an unsigned index present in the parsed option table;
+- the selected option has a positive size;
+- `mem_info_vram_total` is positive and equals that size;
+- `mem_info_vis_vram_total` is absent or equals the VRAM total;
+- system RAM is known and the VRAM total does not exceed it.
+
+If any check fails, or a UMA file is missing, malformed, unreadable, or changed
+through a symlink, the pool stays `unknown_vram`. Such a pool is reported for
+inspection but is not allocatable, so a partial probe cannot widen admission.
+When the checks pass, the accelerator record carries a small `uma_carveout`
+object with the index, resolved size in bytes, and option-table source. GTT and
+visible-VRAM remain sharing evidence only; neither is promoted to an
+allocatable pool.
 
 ## 9. Model component inspection
 

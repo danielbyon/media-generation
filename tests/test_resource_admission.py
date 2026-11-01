@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from media_generation.inventory.fingerprint import build_environment_fingerprint
+from test_cpu_adapter_support import cpu_adapter
 
 
 GIB = 1024**3
@@ -632,6 +633,85 @@ def test_unified_carveout_evidence_is_valid_and_not_additive() -> None:
     assert decision.required_bytes == {"system_ram": 56 * GIB}
 
 
+def test_resolved_uma_carveout_flows_through_admission_without_a_gtt_pool() -> None:
+    """A resolved APU carveout charges accelerator demand to system RAM once."""
+    from media_generation.admission import (
+        build_admission_profile,
+        evaluate_admission,
+        parse_admission_policy,
+        parse_workload_demand,
+    )
+    from media_generation.inventory.host import resolve_memory_topology
+
+    topology, findings = resolve_memory_topology(
+        system_total_bytes=64 * GIB,
+        accelerators=[
+            {
+                "id": "drm:card1",
+                "source": "sysfs",
+                "pools": [
+                    {
+                        "name": "vram",
+                        "kind": "shared_carveout",
+                        "total_bytes": 512 * 1024**2,
+                        "free_bytes": None,
+                        "additive": False,
+                        "source": "/sys/class/drm/card1/device/mem_info_vram_total",
+                    },
+                    {
+                        "name": "vis_vram",
+                        "kind": "visible_vram_alias",
+                        "total_bytes": 512 * 1024**2,
+                        "free_bytes": None,
+                        "additive": False,
+                        "source": "/sys/class/drm/card1/device/mem_info_vis_vram_total",
+                    },
+                    {
+                        "name": "gtt",
+                        "kind": "shared_gtt",
+                        "total_bytes": 32 * GIB,
+                        "free_bytes": None,
+                        "additive": False,
+                        "source": "/sys/class/drm/card1/device/mem_info_gtt_total",
+                    },
+                ],
+            }
+        ],
+    )
+    assert findings == []
+    assert topology["class"] == "unified_shared"
+    assert [pool["id"] for pool in topology["allocatable_pools"]] == ["system_ram"]
+
+    profile = build_admission_profile(
+        inventory_report(
+            allocatable_pools=topology["allocatable_pools"],
+            sharing_relationships=topology["sharing_relationships"],
+        ),
+        parse_admission_policy(
+            {
+                "schema": "media-generation.admission-policy",
+                "schema_version": 1,
+                "pool_headroom_bytes": {"system_ram": 8 * GIB},
+            }
+        ),
+    )
+    decision = evaluate_admission(
+        profile,
+        parse_workload_demand(
+            workload_demand(system_ram_bytes=20 * GIB, accelerator_memory_bytes=36 * GIB)
+        ),
+    )
+
+    assert profile.status == "ready"
+    assert profile.shared_pool_ids == (
+        "drm:card1:gtt",
+        "drm:card1:vis_vram",
+        "drm:card1:vram",
+    )
+    assert decision.status == "queued"
+    assert decision.required_bytes == {"system_ram": 56 * GIB}
+
+
 def test_discrete_topology_rejects_unified_carveout_evidence() -> None:
     """A system-RAM carveout contradicts a discrete topology classification."""
     from media_generation.admission import (
@@ -1045,13 +1125,14 @@ def test_reserved_demand_is_visible_on_the_singleton_resource(tmp_path) -> None:
     entered = threading.Event()
     resume = threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
 
-        def generate(self, plan, destination):
-            entered.set()
-            assert resume.wait(5)
-            return super().generate(plan, destination)
+    def pause(plan, destination):
+        entered.set()
+        assert resume.wait(5)
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = pause
 
     profile = build_admission_profile(
         inventory_report(),
@@ -1069,7 +1150,7 @@ def test_reserved_demand_is_visible_on_the_singleton_resource(tmp_path) -> None:
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=PausedAdapter(),
+        adapter=adapter,
         admission_profile=profile,
     )
     first = service.enqueue("first-admitted", request(), workload_demand=demand)
@@ -1824,17 +1905,17 @@ def test_retryable_failure_requeues_admission_then_success_releases_it(tmp_path)
     from media_generation.service import GenerationService
     from test_durable_execution import request
 
-    class RetryOnce(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
+    calls = 0
 
-        def __init__(self) -> None:
-            self.calls = 0
+    def retry_once(plan, stream):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableGenerationError("transient")
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
 
-        def generate(self, plan, stream):
-            self.calls += 1
-            if self.calls == 1:
-                raise RetryableGenerationError("transient")
-            return super().generate(plan, stream)
+    adapter.generate = retry_once
 
     profile = build_admission_profile(
         inventory_report(),
@@ -1849,7 +1930,7 @@ def test_retryable_failure_requeues_admission_then_success_releases_it(tmp_path)
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=RetryOnce(),
+        adapter=adapter,
         admission_profile=profile,
     )
     job = service.enqueue(
@@ -1894,17 +1975,17 @@ def test_submit_reports_safe_retry_without_claiming_publication_incomplete(
     from media_generation.service import GenerationService
     from test_durable_execution import request
 
-    class RetryOnce(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
+    calls = 0
 
-        def __init__(self) -> None:
-            self.calls = 0
+    def retry_once(plan, stream):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableGenerationError("transient submit failure")
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
 
-        def generate(self, plan, stream):
-            self.calls += 1
-            if self.calls == 1:
-                raise RetryableGenerationError("transient submit failure")
-            return super().generate(plan, stream)
+    adapter.generate = retry_once
 
     profile = build_admission_profile(
         inventory_report(),
@@ -1919,7 +2000,7 @@ def test_submit_reports_safe_retry_without_claiming_publication_incomplete(
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=RetryOnce(),
+        adapter=adapter,
         admission_profile=profile,
     )
     demand = parse_workload_demand(workload_demand())
@@ -1958,11 +2039,10 @@ def test_uncertain_external_failure_quarantines_admission(tmp_path) -> None:
     from media_generation.service import GenerationService
     from test_durable_execution import request
 
-    class ExternalFailure(DeterministicCpuAdapter):
-        containment_contract = None
+    def external_failure(plan, stream):
+        raise RuntimeError("external response lost")
 
-        def generate(self, plan, stream):
-            raise RuntimeError("external response lost")
+    adapter = cpu_adapter(containment_contract=None, generate=external_failure)
 
     profile = build_admission_profile(
         inventory_report(),
@@ -1977,7 +2057,7 @@ def test_uncertain_external_failure_quarantines_admission(tmp_path) -> None:
     service = GenerationService(
         tmp_path / "studio.sqlite3",
         tmp_path / "images",
-        adapter=ExternalFailure(),
+        adapter=adapter,
         admission_profile=profile,
     )
     job = service.enqueue(
@@ -2014,13 +2094,14 @@ def test_running_cancel_expired_lease_and_stale_owner_keep_reserved_admission(
     entered = threading.Event()
     resume = threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = cpu_adapter()
 
-        def generate(self, plan, destination):
-            entered.set()
-            assert resume.wait(5)
-            return super().generate(plan, destination)
+    def pause(plan, destination):
+        entered.set()
+        assert resume.wait(5)
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = pause
 
     profile = build_admission_profile(
         inventory_report(),
@@ -2036,7 +2117,7 @@ def test_running_cancel_expired_lease_and_stale_owner_keep_reserved_admission(
     service = GenerationService(
         database,
         tmp_path / "images",
-        adapter=PausedAdapter(),
+        adapter=adapter,
         admission_profile=profile,
     )
     job = service.enqueue(

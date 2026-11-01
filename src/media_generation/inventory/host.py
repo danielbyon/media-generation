@@ -4,7 +4,9 @@ Passive probes use standard-library platform facts, ``/etc/os-release``,
 ``/proc``, and Linux DRM sysfs.  External device commands (``lspci``,
 ``nvidia-smi``, ``rocm-smi``, ``hipconfig``) run only when a manifest enables
 ``probe_policy.device_queries``; every invocation is fixed in code, bounded, and
-recorded in the probe ledger.  No probe loads a model or changes device state.
+recorded in the probe ledger.  When an amdgpu device exposes the UMA sysfs
+group, passive reads also capture its firmware carveout index and option sizes.
+No probe loads a model or changes device state.
 """
 
 from __future__ import annotations
@@ -26,6 +28,11 @@ DRM_ROOT = Path("/sys/class/drm")
 SYS_DEVICES_ROOT = Path("/sys/devices")
 SYS_MODULE_ROOT = Path("/sys/module")
 _DRIVER_NAME = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_CARVEOUT_OPTION = re.compile(
+    r"\A(?P<index>[0-9]+):\s*(?P<label>.*?)\s*"
+    r"\((?P<size>[0-9]+)\s+(?P<unit>MB|GB)\)\s*\Z"
+)
+_UNSIGNED_INDEX = re.compile(r"\A[0-9]+\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +104,47 @@ def parse_uevent(text: str) -> dict[str, str]:
     return values
 
 
+def parse_carveout_options(text: str) -> dict[int, int] | None:
+    """Parse amdgpu ``uma/carveout_options`` firmware labels and sizes.
+
+    The kernel prints one option per line, such as ``0: Minimum (512 MB)`` or
+    ``1: (1 GB)``. The integer after the label is a size, not an index; the
+    index is the leading number. Sizes use the kernel's binary units: 1 MB is
+    1024**2 bytes and 1 GB is 1024**3 bytes.
+
+    Returns ``None`` when the text is empty, has a malformed line, repeats an
+    index, or contains a non-positive size. Callers must treat that result as
+    missing evidence rather than as a fallback allocation.
+    """
+    options: dict[int, int] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = _CARVEOUT_OPTION.fullmatch(line)
+        if match is None:
+            return None
+        index = int(match.group("index"))
+        size = int(match.group("size"))
+        if size <= 0 or index in options:
+            return None
+        multiplier = 1024**3 if match.group("unit") == "GB" else 1024**2
+        options[index] = size * multiplier
+    return options or None
+
+
+def parse_carveout_index(text: str) -> int | None:
+    """Parse the current amdgpu carveout index as an unsigned decimal value.
+
+    The value names one entry in ``carveout_options``. It is a boot-time
+    firmware selection, not a byte count or a live memory-use measurement.
+    """
+    value = text.strip()
+    if not _UNSIGNED_INDEX.fullmatch(value):
+        return None
+    return int(value)
+
+
 def _int_text(value: str) -> int | None:
     """Parse a sysfs integer, returning ``None`` when absent or malformed."""
     stripped = value.strip()
@@ -152,6 +200,36 @@ def _read_text(
     return observation.text
 
 
+def _read_uma_carveout(
+    ledger: ProbeLedger,
+    *,
+    card: str,
+    device_base: Path,
+    device_root: Path,
+) -> tuple[int | None, dict[int, int] | None]:
+    """Read the trusted UMA carveout index and its firmware option table.
+
+    Both reads stay beneath the already validated sysfs device root and use
+    non-following final-component opens. Any unreadable or malformed file
+    yields missing evidence; it never produces a synthesized index or size.
+    """
+    carveout_text = _read_text(
+        ledger,
+        probe_id=f"gpu:{card}:uma-carveout",
+        path=device_base / "uma" / "carveout",
+        root=device_root,
+    )
+    options_text = _read_text(
+        ledger,
+        probe_id=f"gpu:{card}:uma-carveout-options",
+        path=device_base / "uma" / "carveout_options",
+        root=device_root,
+    )
+    if carveout_text is None or options_text is None:
+        return None, None
+    return parse_carveout_index(carveout_text), parse_carveout_options(options_text)
+
+
 def _platform_os(system: str, *, mac_version: str, release: str) -> dict[str, object]:
     """Return an honest platform fallback when os-release is unavailable."""
     if system == "Darwin":
@@ -177,6 +255,44 @@ def _classify_vram(accelerator: dict[str, object]) -> str:
     if source == "nvidia-smi":
         return "dedicated_vram"
     return "unknown_vram"
+
+
+def _classify_sysfs_vram(
+    accelerator: dict[str, object],
+    *,
+    vram: int | None,
+    visible_vram: int | None,
+    system_total_bytes: int | None,
+    carveout_index: int | None,
+    carveout_options: dict[int, int] | None,
+) -> str:
+    """Return ``shared_carveout`` only for complete, consistent UMA evidence.
+
+    An amdgpu APU carveout is selected by an index into the firmware option
+    table. The selected option size and the reported VRAM total must agree;
+    visible VRAM, when present, is an alias and must agree as well. The
+    carveout must also fit inside known system RAM.
+
+    Missing, malformed, unreadable, or contradictory evidence returns
+    ``unknown_vram``. That keeps the pool out of every allocatable total rather
+    than widening admission on partial evidence.
+    """
+    if _classify_vram(accelerator) == "dedicated_vram":
+        return "dedicated_vram"
+    if accelerator.get("driver") != "amdgpu":
+        return "unknown_vram"
+    if carveout_index is None or carveout_options is None:
+        return "unknown_vram"
+    carveout_size = carveout_options.get(carveout_index)
+    if carveout_size is None or carveout_size <= 0:
+        return "unknown_vram"
+    if vram is None or vram <= 0 or vram != carveout_size:
+        return "unknown_vram"
+    if visible_vram is not None and visible_vram != vram:
+        return "unknown_vram"
+    if system_total_bytes is None or system_total_bytes < vram:
+        return "unknown_vram"
+    return "shared_carveout"
 
 
 def _pool_additive(kind: str) -> bool:
@@ -408,6 +524,7 @@ def _collect_accelerators(
     ledger: ProbeLedger,
     *,
     system: str,
+    system_total_bytes: int | None = None,
 ) -> tuple[list[dict[str, object]], list[Finding], bool, dict[str, object]]:
     """Enumerate Linux DRM cards through sysfs without external tooling."""
     findings: list[Finding] = []
@@ -607,6 +724,7 @@ def _collect_accelerators(
             else:
                 driver = None
         uevent = parse_uevent(uevent_text or "")
+        effective_driver = driver or uevent.get("DRIVER")
         pci_class = (class_text or uevent.get("PCI_CLASS") or "").strip().lower()
         if pci_class and not pci_class.startswith("0x"):
             pci_class = "0x" + pci_class
@@ -630,18 +748,34 @@ def _collect_accelerators(
             path=device_base / "mem_info_gtt_total",
             root=device_root,
         )
+        carveout_index: int | None = None
+        carveout_options: dict[int, int] | None = None
+        if effective_driver == "amdgpu":
+            carveout_index, carveout_options = _read_uma_carveout(
+                ledger,
+                card=card,
+                device_base=device_base,
+                device_root=device_root,
+            )
         accelerator: dict[str, object] = {
             "id": f"drm:{card}",
             "vendor_id": (vendor_text or "").strip().lower() or None,
             "device_id": (device_text or "").strip().lower() or None,
             "pci_class": pci_class or None,
             "pci_address": uevent.get("PCI_SLOT_NAME"),
-            "driver": driver or uevent.get("DRIVER"),
+            "driver": effective_driver,
             "driver_version": None,
             "source": "sysfs",
             "pools": [],
         }
-        vram_kind = _classify_vram(accelerator)
+        vram_kind = _classify_sysfs_vram(
+            accelerator,
+            vram=vram,
+            visible_vram=vis_vram,
+            system_total_bytes=system_total_bytes,
+            carveout_index=carveout_index,
+            carveout_options=carveout_options,
+        )
         pools: list[dict[str, object]] = []
         if vram is not None:
             pools.append(
@@ -671,6 +805,16 @@ def _collect_accelerators(
                 )
             )
         accelerator["pools"] = pools
+        if (
+            vram_kind == "shared_carveout"
+            and carveout_index is not None
+            and carveout_options is not None
+        ):
+            accelerator["uma_carveout"] = {
+                "index": carveout_index,
+                "size_bytes": carveout_options[carveout_index],
+                "source": f"/sys/class/drm/{card}/device/uma/carveout_options",
+            }
         if driver and _DRIVER_NAME.match(driver):
             driver_version = _read_text(
                 ledger,
@@ -1054,7 +1198,11 @@ def collect_host(ledger: ProbeLedger, policy: ProbePolicy) -> HostFacts:
         accelerator_findings,
         accelerator_degraded,
         accelerator_enumeration,
-    ) = _collect_accelerators(ledger, system=system)
+    ) = _collect_accelerators(
+        ledger,
+        system=system,
+        system_total_bytes=memory_total,
+    )
     findings.extend(accelerator_findings)
     degraded = degraded or accelerator_degraded
     toolchain = _collect_device_queries(ledger, policy, accelerators)
