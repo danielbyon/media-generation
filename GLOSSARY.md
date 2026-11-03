@@ -24,6 +24,10 @@ _Avoid_: prompt override as a synonym.
 The complete structured intent resolved from inherited defaults and explicit child overrides for a particular generation. Its recorded snapshot preserves the values and contributing revision identities used by that generation.
 _Avoid_: current parent values as a substitute for a historical effective scene.
 
+**ModelVariant**:
+An explicitly selected identity for an exact model/component bundle and its provenance, distinct from its model family or stock release. Different weight hashes can be valid variants of the same family; a variant's own approved pins determine its integrity.
+_Avoid_: stock model, model family, publisher release hash as substitutes for selected variant identity.
+
 **Benchmark profile**:
 Explicit, versioned test conditions used to collect comparable execution and quality evidence. A benchmark profile is not an owner-approved product target.
 _Avoid_: accepted preset, product SLO as synonyms.

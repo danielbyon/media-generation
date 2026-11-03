@@ -190,6 +190,14 @@ JSON is written to standard error.
 
 ## Consequences
 
+**Selected model variants:** ADR 0004 clarifies that a candidate may deliberately
+pin an unlocked/uncensored Hugging Face variant with bytes different from a
+stock release. An official publisher's digest is not a mandatory allowlist.
+The independently approved **selected candidate pin** remains authoritative;
+an unexpected mismatch to that pin still fails closed, and missing independent
+evidence remains unverified. Intentional variant switches must be explicitly
+redeclared and independently reviewed, never silently substituted.
+
 Downstream execution can consume a manifest only when its status is `ready`.
 The manifest identifies the exact inputs and records the evidence limitations.
 It does not prove that the engine loads the bundle, that the APEX host has enough
