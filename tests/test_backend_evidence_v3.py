@@ -327,6 +327,8 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
     execution = service.get_execution(job_id)
     resource = service._store.resource_snapshot()
     listener_marker = bundle.files / "listener-bound.json"
+    listener_bind_error = bundle.files / "listener-bind-error.json"
+    observed = execution["observed"]
     assert provenance["status"] == "succeeded", {
         "failure_message": provenance["execution"]["failure_message"],
         "listener_bound": (
@@ -334,6 +336,13 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
             if listener_marker.exists()
             else None
         ),
+        "listener_bind_error": (
+            listener_bind_error.read_text(encoding="utf-8")
+            if listener_bind_error.exists()
+            else None
+        ),
+        "child_exit_code": observed.get("exit_code") if observed else None,
+        "child_stderr_bytes": observed.get("stderr_bytes") if observed else None,
     }
     assert listener_marker.is_file()
     assert provenance["attempt"]["termination_proven"] is False

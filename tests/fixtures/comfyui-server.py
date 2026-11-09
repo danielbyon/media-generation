@@ -360,7 +360,19 @@ def main() -> int:
 
     try:
         server = ThreadingHTTPServer((options.listen, options.port), Handler)
-    except OSError:
+    except OSError as error:
+        (cwd / "listener-bind-error.json").write_text(
+            json.dumps(
+                {
+                    "error": str(error),
+                    "errno": error.errno,
+                    "host": options.listen,
+                    "port": options.port,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
         return 7
     server.daemon_threads = True
     (cwd / "listener-bound.json").write_text(
