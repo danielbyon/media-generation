@@ -1,0 +1,19 @@
+tests/test_backend_evidence_v3.py
+  s_ce5a4681e7ca91::t_711e3eed81eba6 344-345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "558e91e256f38769d857876b389d889090b0d7cd",
+  "prompts": {},
+  "sessions": {
+    "s_ce5a4681e7ca91": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1bbae-2a41-7881-897c-4327bd62231b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
