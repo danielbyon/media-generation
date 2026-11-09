@@ -551,7 +551,9 @@ def test_http_retry_exhaustion_reaps_every_response_without_publication(
     )
 
     certificate, context = tls_material
-    processes = _install_worker(tmp_path, monkeypatch, _trust_certificate(certificate))
+    processes = _install_worker(
+        tmp_path, monkeypatch, _trust_certificate(certificate), preload=1
+    )
     declaration = _fixture(tmp_path)
     artifact = tmp_path / "files" / "diffusion.safetensors"
     body_size = artifact.stat().st_size
