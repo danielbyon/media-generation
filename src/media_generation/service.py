@@ -1001,14 +1001,22 @@ class GenerationService:
             if snapshot["artifact"] is not None and snapshot["status"] == "succeeded":
                 return None
             if snapshot["status"] == "canceled":
+                prelaunch_refusal = (
+                    not adapter_dispatched
+                    and not executed
+                    and (
+                        not execute_entered
+                        or (
+                            supervisor is not None
+                            and not supervisor.process_started
+                        )
+                    )
+                )
                 canceled_termination = (
                     self._store.attempt_termination_proven(
                         claim.job_id, claim.attempt_id
                     )
-                    or (
-                        supervisor is not None
-                        and not supervisor.process_started
-                    )
+                    or prelaunch_refusal
                 )
                 finalized = self._store.fail_execution(
                     claim.job_id,
@@ -1019,6 +1027,7 @@ class GenerationService:
                     claim_epoch=claim.claim_epoch,
                     failure_class="canceled",
                     termination_proven=canceled_termination,
+                    prelaunch_refusal=prelaunch_refusal,
                 )
                 if not finalized:
                     return PublicationIncompleteError(

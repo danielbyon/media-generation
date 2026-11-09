@@ -590,6 +590,82 @@ def test_qwen_profile_v2_operations_complete_through_generation_service(
     )
 
 
+def test_cancellation_before_execution_dispatch_releases_unlaunched_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = build_comfyui_bundle(tmp_path)
+    service = _service(tmp_path, bundle)
+    job_id = service.enqueue(
+        "cancel-before-dispatch", _request(),
+        workload_demand=heavy_workload_demand(),
+    ).job_id
+    adapter = service.adapter
+    original_resolve = adapter.resolve_execution
+    execute_calls = 0
+
+    def cancel_after_resolution(plan):
+        original_resolve(plan)
+        assert service.cancel(job_id)["outcome"] == "accepted"
+        raise BackendPreparationError(
+            "test_pre_dispatch_cancel", "cancel before execution dispatch"
+        )
+
+    def unexpected_execute(plan, destination, *, supervisor):
+        nonlocal execute_calls
+        execute_calls += 1
+        raise AssertionError("canceled work reached adapter execution")
+
+    monkeypatch.setattr(adapter, "resolve_execution", cancel_after_resolution)
+    monkeypatch.setattr(adapter, "execute", unexpected_execute)
+    service.work()
+
+    snapshot = service.get_provenance(job_id)
+    assert execute_calls == 0
+    assert snapshot["status"] == "canceled"
+    assert snapshot["attempt"]["status"] == "canceled"
+    assert snapshot["execution"]["resource_state"] == "available"
+    assert service._store.resource_snapshot()["state"] == "available"
+
+
+def test_cancellation_before_managed_popen_releases_unlaunched_resource(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = build_comfyui_bundle(tmp_path)
+    service = _service(tmp_path, bundle)
+    job_id = service.enqueue(
+        "cancel-before-popen", _request(),
+        workload_demand=heavy_workload_demand(),
+    ).job_id
+    original_verify_current = service_module._StoreExecutionAuthority.verify_current
+    spawn_calls = 0
+
+    def cancel_before_popen(authority):
+        assert service.cancel(job_id)["outcome"] == "accepted"
+        return original_verify_current(authority)
+
+    def unexpected_spawn(*args, **kwargs):
+        nonlocal spawn_calls
+        spawn_calls += 1
+        raise AssertionError("canceled work reached managed process spawn")
+
+    monkeypatch.setattr(
+        service_module._StoreExecutionAuthority,
+        "verify_current",
+        cancel_before_popen,
+    )
+    monkeypatch.setattr(
+        service_module.ProcessSupervisor, "_spawn_and_record_launch", unexpected_spawn
+    )
+    service.work()
+
+    snapshot = service.get_provenance(job_id)
+    assert spawn_calls == 0
+    assert snapshot["status"] == "canceled"
+    assert snapshot["attempt"]["status"] == "canceled"
+    assert snapshot["execution"]["resource_state"] == "available"
+    assert service._store.resource_snapshot()["state"] == "available"
+
+
 @pytest.mark.parametrize(
     ("operation", "references"),
     [
