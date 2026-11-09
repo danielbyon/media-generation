@@ -1,0 +1,20 @@
+tests/test_candidate_transport.py
+  s_ce5a4681e7ca91::t_ae847e74b3b573 780-782,793-800
+  s_ce5a4681e7ca91::t_1fc495b0f66ca0 970-972
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "1e548cfd9a674d4fcb33d60e1708a01e880493c9",
+  "prompts": {},
+  "sessions": {
+    "s_ce5a4681e7ca91": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1bbae-2a41-7881-897c-4327bd62231b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
