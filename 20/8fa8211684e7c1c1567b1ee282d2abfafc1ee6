@@ -1,0 +1,23 @@
+tests/test_comfyui_fixture.py
+  s_ce5a4681e7ca91::t_776278391b0353 3,10-11,16-37,39-70
+  s_ce5a4681e7ca91::t_f67b8e2b2236e5 38
+  s_ce5a4681e7ca91::t_75bf65305a3b26 71-72
+tests/fixtures/comfyui-server.py
+  s_ce5a4681e7ca91::t_f67b8e2b2236e5 24,100-108,383
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "208fa8211684e7c1c1567b1ee282d2abfafc1ee6",
+  "prompts": {},
+  "sessions": {
+    "s_ce5a4681e7ca91": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1bbae-2a41-7881-897c-4327bd62231b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
