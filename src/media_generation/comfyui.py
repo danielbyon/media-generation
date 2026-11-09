@@ -2773,6 +2773,7 @@ class ComfyUIAdapter:
         connection: http.client.HTTPConnection,
         deadline: float | None,
     ) -> float | None:
+        """Cap connection and socket timeouts at the remaining request budget."""
         remaining = self._remaining_deadline(deadline)
         if remaining is None:
             return None
@@ -2894,13 +2895,14 @@ class ComfyUIAdapter:
             remaining = self._remaining_deadline(deadline)
             assert remaining is not None
             effective_timeout = min(effective_timeout, remaining)
-        connection = self._connection(
-            control,
-            resolved,
-            effective_timeout,
-            deadline=deadline,
-        )
+        connection: http.client.HTTPConnection | None = None
         try:
+            connection = self._connection(
+                control,
+                resolved,
+                effective_timeout,
+                deadline=deadline,
+            )
             response = self._request_owned(
                 control,
                 resolved,
@@ -2950,7 +2952,8 @@ class ComfyUIAdapter:
                 ) from error
             raise BackendEvidenceError("ComfyUI HTTP response was unavailable or malformed") from error
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
 
     def _verify_node_replacements(
         self, control: ManagedProcessControl, resolved: ResolvedComfyUIExecution

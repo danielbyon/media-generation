@@ -1243,6 +1243,47 @@ def test_partial_json_response_uses_updated_remaining_deadline(
     assert read_timeouts == pytest.approx([1.25, 1.0])
 
 
+def test_connection_timeout_after_prompt_acceptance_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    resolved = SimpleNamespace(
+        side_effect_state=SimpleNamespace(may_have_been_accepted=True)
+    )
+
+    def timeout_connect(*_args, **_kwargs):
+        raise TimeoutError("connection timed out")
+
+    monkeypatch.setattr(adapter, "_connection", timeout_connect)
+
+    with pytest.raises(
+        AmbiguousBackendOutcome, match="response was unavailable or malformed"
+    ) as raised:
+        adapter._get_json(object(), resolved, "/history/prompt-id", timeout=1.0)
+
+    assert isinstance(raised.value.__cause__, TimeoutError)
+
+
+def test_completion_connection_authority_failure_is_ambiguous(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    monkeypatch.setattr(adapter, "_require_request_authority", lambda *_args: None)
+
+    def fail_connection(*_args, **_kwargs):
+        raise BackendEvidenceError("listener owner could not be confirmed")
+
+    monkeypatch.setattr(adapter, "_connection", fail_connection)
+    resolved = SimpleNamespace(
+        side_effect_state=SimpleNamespace(may_have_been_accepted=True)
+    )
+
+    with pytest.raises(AmbiguousBackendOutcome, match="history response") as raised:
+        adapter._wait_for_completion(object(), resolved, "prompt-id")
+
+    assert isinstance(raised.value.__cause__, BackendEvidenceError)
+
+
 def test_json_probe_does_not_connect_after_listener_check_expires_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
