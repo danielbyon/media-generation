@@ -1,13 +1,73 @@
 import errno
 import json
+import runpy
 import shutil
 import socket
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 FIXTURE_SOURCE = Path(__file__).parent / "fixtures" / "comfyui-server.py"
+
+
+def test_comfyui_fixture_does_not_reverse_resolve_loopback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "comfyui-source"
+    source_root.mkdir()
+    server = source_root / "comfyui-server.py"
+    shutil.copyfile(FIXTURE_SOURCE, server)
+    directories = {
+        name: tmp_path / name
+        for name in ("base", "frontend", "output", "temp", "input")
+    }
+    for directory in directories.values():
+        directory.mkdir()
+
+    fixture = runpy.run_path(str(server), run_name="comfyui_fixture")
+    resolved_hosts: list[str] = []
+    monkeypatch.setattr(
+        socket,
+        "getfqdn",
+        lambda host: resolved_hosts.append(host) or host,
+    )
+    monkeypatch.setattr(
+        fixture["LoopbackThreadingHTTPServer"],
+        "serve_forever",
+        lambda _server, poll_interval: None,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(server),
+            "--listen",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--disable-all-custom-nodes",
+            "--disable-auto-launch",
+            "--offline",
+            "--feature-flag",
+            "enable_telemetry=false",
+            "--base-directory",
+            str(directories["base"]),
+            "--front-end-root",
+            str(directories["frontend"]),
+            "--output-directory",
+            str(directories["output"]),
+            "--temp-directory",
+            str(directories["temp"]),
+            "--input-directory",
+            str(directories["input"]),
+        ],
+    )
+
+    assert fixture["main"]() == 0
+    assert resolved_hosts == []
 
 
 def test_comfyui_fixture_records_listener_bind_failure(tmp_path: Path) -> None:

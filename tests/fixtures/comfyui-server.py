@@ -21,6 +21,7 @@ import zlib
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from socketserver import TCPServer
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -94,6 +95,15 @@ def load_mode(cwd: Path) -> dict[str, object]:
         return {"mode": "success"}
     value = json.loads(path.read_text(encoding="utf-8"))
     return value if isinstance(value, dict) else {"mode": "success"}
+
+
+class LoopbackThreadingHTTPServer(ThreadingHTTPServer):
+    """Serve the loopback fixture without reverse DNS lookups."""
+
+    def server_bind(self) -> None:
+        TCPServer.server_bind(self)
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
 
 
 def main() -> int:
@@ -370,7 +380,7 @@ def main() -> int:
         encoding="utf-8",
     )
     try:
-        server = ThreadingHTTPServer((options.listen, options.port), Handler)
+        server = LoopbackThreadingHTTPServer((options.listen, options.port), Handler)
     except OSError as error:
         (cwd / "listener-bind-error.json").write_text(
             json.dumps(
