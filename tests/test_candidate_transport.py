@@ -423,13 +423,13 @@ def test_preparation_timeout_cleans_staging_and_releases_journal_lock(
     preload = 0 if phase == "startup" else 2 if phase in {"redirect", "retry"} else 1
     processes = _install_worker(tmp_path, monkeypatch, prefix, preload=preload)
     expirations: list[float] = []
-    deadlines: list[float] = []
+    deadlines: list[Any] = []
     real_start = acquisition._TransferDeadline.start
     real_open = acquisition._open_remote
 
     def start(cls: Any, timeout_seconds: float) -> Any:
         deadline = real_start(timeout_seconds)
-        deadlines.append(deadline.expires_at)
+        deadlines.append(deadline)
         return deadline
 
     def open_remote(*args: Any, **kwargs: Any) -> Any:
@@ -506,10 +506,11 @@ def test_preparation_timeout_cleans_staging_and_releases_journal_lock(
             )
         finished = time.monotonic()
         assert len(deadlines) == 1
-        elapsed = finished - (deadlines[0] - 0.25)
+        expires_at = deadlines[0].expires_at
+        elapsed = finished - (expires_at - 0.25)
         record_property("deadline_elapsed_seconds", elapsed)
         assert elapsed < 0.43
-        assert expirations and set(expirations) == set(deadlines)
+        assert expirations and set(expirations) == {expires_at}
         _assert_reaped(processes)
         if phase in {"startup", "dns", "dns_budget", "connect", "tls", "send"}:
             assert marker.read_text() == "entered"

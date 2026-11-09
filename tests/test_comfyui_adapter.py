@@ -1889,8 +1889,8 @@ def test_listener_proof_does_not_use_a_path_shadow(
 @pytest.mark.parametrize(
     ("nested_group", "observation_mode"),
     [
-        ("jobs", {}),
-        ("queue", {"jobs_unknown": True}),
+        ("jobs", {"queue_unknown": True, "history_unknown": True}),
+        ("queue", {"jobs_unknown": True, "history_unknown": True}),
         ("history", {"jobs_unknown": True, "queue_unknown": True}),
     ],
 )

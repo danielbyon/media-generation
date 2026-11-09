@@ -222,12 +222,20 @@ class _JournalLock:
 class _TransferDeadline:
     """One monotonic deadline shared by every phase of an acquisition attempt."""
 
-    expires_at: float
+    timeout_seconds: float
+    _expires_at: float | None = None
 
     @classmethod
     def start(cls, timeout_seconds: float) -> _TransferDeadline:
-        """Start the deadline immediately before the first network operation."""
-        return cls(time.monotonic() + timeout_seconds)
+        """Create the deadline; its clock starts at the first network check."""
+        return cls(timeout_seconds)
+
+    @property
+    def expires_at(self) -> float:
+        """Return the fixed expiry, starting the clock on first access."""
+        if self._expires_at is None:
+            self._expires_at = time.monotonic() + self.timeout_seconds
+        return self._expires_at
 
     def remaining(self) -> float:
         """Return time left for the next operation, or raise on expiry."""
