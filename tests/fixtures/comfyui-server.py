@@ -363,6 +363,16 @@ def main() -> int:
     except OSError:
         return 7
     server.daemon_threads = True
+    (cwd / "listener-bound.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "host": server.server_address[0],
+                "port": server.server_address[1],
+            }
+        ),
+        encoding="utf-8",
+    )
 
     def stop(_signum: int, _frame: object) -> None:
         threading.Thread(target=server.shutdown, daemon=True).start()

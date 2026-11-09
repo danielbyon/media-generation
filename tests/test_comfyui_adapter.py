@@ -2049,6 +2049,39 @@ def test_listener_owner_reports_ambiguous_pid_count(monkeypatch):
         comfyui._listener_owner_pid("127.0.0.1", 51423)
 
 
+def test_listener_owner_reports_endpoint_and_bounded_stderr(monkeypatch):
+    import subprocess
+
+    import pytest
+
+    from media_generation import comfyui
+    from media_generation.errors import BackendEvidenceError
+
+    monkeypatch.setattr(
+        comfyui.shutil,
+        "which",
+        lambda _name, **_kwargs: "/usr/sbin/lsof",
+    )
+    monkeypatch.setattr(
+        comfyui.subprocess,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args,
+            1,
+            stdout="",
+            stderr=f"permission denied {'x' * 500}",
+        ),
+    )
+
+    with pytest.raises(BackendEvidenceError) as caught:
+        comfyui._listener_owner_pid("127.0.0.1", 51423)
+
+    message = str(caught.value)
+    assert "lsof returncode=1, pid_count=0, host=127.0.0.1, port=51423" in message
+    assert "permission denied" in message
+    assert len(message) < 350
+
+
 def test_readiness_timeout_preserves_last_probe_error(monkeypatch):
     from types import SimpleNamespace
 

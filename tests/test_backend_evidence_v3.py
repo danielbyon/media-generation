@@ -326,7 +326,16 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
     provenance = service.get_provenance(job_id)
     execution = service.get_execution(job_id)
     resource = service._store.resource_snapshot()
-    assert provenance["status"] == "succeeded", provenance
+    listener_marker = bundle.files / "listener-bound.json"
+    assert provenance["status"] == "succeeded", {
+        "failure_message": provenance["failure_message"],
+        "listener_bound": (
+            listener_marker.read_text(encoding="utf-8")
+            if listener_marker.exists()
+            else None
+        ),
+    }
+    assert listener_marker.is_file()
     assert provenance["attempt"]["termination_proven"] is False
     assert execution["observed"]["direct_child_reaped"] is True
     assert execution["observed"]["process_tree_containment"] is False
