@@ -2882,13 +2882,15 @@ class ComfyUIAdapter:
 
     def _wait_ready(self, control: ManagedProcessControl, resolved: ResolvedComfyUIExecution) -> None:
         deadline = time.monotonic() + self._candidate.recipe.api.readiness_timeout_seconds
+        last_error: BackendEvidenceError | None = None
         while time.monotonic() < deadline:
             control.require_current()
             if not control.is_running():
                 raise BackendEvidenceError("ComfyUI exited before readiness")
             try:
                 status, payload = self._get_json(control, resolved, self._candidate.recipe.server.readiness_path)
-            except BackendEvidenceError:
+            except BackendEvidenceError as error:
+                last_error = error
                 time.sleep(0.05)
                 continue
             if status == 200:
@@ -2906,7 +2908,13 @@ class ComfyUIAdapter:
                         )
                 return
             time.sleep(0.05)
-        raise BackendEvidenceError("ComfyUI readiness timed out")
+        message = "ComfyUI readiness timed out"
+        if last_error is not None:
+            detail = f"{type(last_error).__name__}: {last_error}"
+            if len(detail) > 300:
+                detail = f"{detail[:297]}..."
+            message = f"{message}; last probe failure: {detail}"
+        raise BackendEvidenceError(message) from last_error
 
     def _upload_reference(
         self,

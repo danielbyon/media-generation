@@ -2021,6 +2021,48 @@ def test_port_taken_after_reservation_never_receives_http_from_adapter(
         foreign_listener.close()
 
 
+def test_readiness_timeout_preserves_last_probe_error(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    from media_generation import comfyui
+    from media_generation.errors import BackendEvidenceError
+
+    adapter = object.__new__(comfyui.ComfyUIAdapter)
+    adapter._candidate = SimpleNamespace(
+        recipe=SimpleNamespace(
+            api=SimpleNamespace(readiness_timeout_seconds=0.2),
+            server=SimpleNamespace(readiness_path="/health"),
+        )
+    )
+
+    def fail_connection(*_args):
+        raise BackendEvidenceError("listener ownership probe timed out")
+
+    adapter._get_json = fail_connection
+    control = SimpleNamespace(
+        is_running=lambda: True,
+        require_current=lambda: None,
+    )
+    resolved = SimpleNamespace()
+    now = 0.0
+
+    def monotonic():
+        nonlocal now
+        now += 0.1
+        return now
+
+    monkeypatch.setattr(comfyui.time, "monotonic", monotonic)
+    monkeypatch.setattr(comfyui.time, "sleep", lambda _duration: None)
+
+    with pytest.raises(
+        BackendEvidenceError,
+        match="listener ownership probe timed out",
+    ):
+        adapter._wait_ready(control, resolved)
+
+
 @pytest.mark.parametrize(
     ("mode", "key"),
     [
