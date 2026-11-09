@@ -329,23 +329,23 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
     listener_marker = bundle.files / "listener-bound.json"
     listener_bind_error = bundle.files / "listener-bind-error.json"
     observed = execution["observed"]
-    assert provenance["status"] == "succeeded", {
-        "failure_message": provenance["execution"]["failure_message"],
-        "listener_bound": (
-            listener_marker.read_text(encoding="utf-8")
-            if listener_marker.exists()
-            else None
-        ),
-        "listener_bind_error": (
-            listener_bind_error.read_text(encoding="utf-8")
-            if listener_bind_error.exists()
-            else None
-        ),
-        "execution_state": execution["state"],
-        "launch_recorded": execution["launch"] is not None,
-        "child_exit_code": observed.get("exit_code") if observed else None,
-        "child_stderr_bytes": observed.get("stderr_bytes") if observed else None,
-    }
+    listener_bound = (
+        listener_marker.read_text(encoding="utf-8") if listener_marker.exists() else None
+    )
+    bind_error = (
+        listener_bind_error.read_text(encoding="utf-8")
+        if listener_bind_error.exists()
+        else None
+    )
+    child_exit_code = observed.get("exit_code") if observed else None
+    child_stderr_bytes = observed.get("stderr_bytes") if observed else None
+    diagnostics = (
+        f"failure={provenance['execution']['failure_message']}; "
+        f"state={execution['state']}; launch_recorded={execution['launch'] is not None}; "
+        f"exit_code={child_exit_code}; stderr_bytes={child_stderr_bytes}; "
+        f"listener_bound={listener_bound}; listener_bind_error={bind_error}"
+    )
+    assert provenance["status"] == "succeeded", diagnostics
     assert listener_marker.is_file()
     assert provenance["attempt"]["termination_proven"] is False
     assert execution["observed"]["direct_child_reaped"] is True
