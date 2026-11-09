@@ -15,6 +15,7 @@ import sys
 import zlib
 import select
 import socket
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
@@ -1066,6 +1067,314 @@ def test_unknown_post_acceptance_is_not_resubmitted_and_quarantines(
     assert observed["direct_child_reaped"] is True
     assert observed["process_tree_containment"] is False
     assert service._store.resource_snapshot()["state"] == "quarantined"
+
+
+def _adapter_for_deadline_probe() -> ComfyUIAdapter:
+    adapter = ComfyUIAdapter.__new__(ComfyUIAdapter)
+    adapter._candidate = SimpleNamespace(
+        recipe=SimpleNamespace(
+            api=SimpleNamespace(
+                request_timeout_seconds=60.0,
+                readiness_timeout_seconds=2.0,
+                poll_timeout_seconds=2.0,
+                history_path="/history/{prompt_id}",
+            ),
+            server=SimpleNamespace(readiness_path="/system_stats"),
+        )
+    )
+    return adapter
+
+
+def _install_deadline_clock(
+    monkeypatch: pytest.MonkeyPatch,
+    method,
+    *,
+    start: float,
+    probe_time: float,
+    after_sleep: float,
+) -> dict[str, float]:
+    clock = {"now": start}
+    readings = iter((start, probe_time))
+
+    def monotonic() -> float:
+        clock["now"] = next(readings, clock["now"])
+        return clock["now"]
+
+    def sleep(_seconds: float) -> None:
+        clock["now"] = after_sleep
+
+    monkeypatch.setitem(
+        method.__globals__,
+        "time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
+    )
+    return clock
+
+
+def _install_timeout_recording_transport(
+    adapter: ComfyUIAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: int,
+    payload: bytes,
+    chunks: tuple[bytes, ...] | None = None,
+    clock: dict[str, float] | None = None,
+    after_first_read: float | None = None,
+) -> list[float]:
+    read_timeouts: list[float] = []
+    sock = SimpleNamespace(timeout=None)
+    sock.settimeout = lambda timeout: setattr(sock, "timeout", timeout)
+    connection = SimpleNamespace(timeout=None, sock=sock, close=lambda: None)
+
+    class _Response:
+        def __init__(self) -> None:
+            self.status = status
+            self._remaining_chunks = list(chunks if chunks is not None else (payload,))
+            self._closed = False
+
+        def read(self, _limit: int) -> bytes:
+            read_timeouts.append(sock.timeout)
+            if not self._remaining_chunks:
+                self._closed = True
+                return b""
+            chunk = self._remaining_chunks.pop(0)
+            if len(self._remaining_chunks) == 0:
+                self._closed = True
+            if clock is not None and len(read_timeouts) == 1 and after_first_read is not None:
+                clock["now"] = after_first_read
+            return chunk
+
+        def read1(self, limit: int) -> bytes:
+            return self.read(limit)
+
+        def isclosed(self) -> bool:
+            return self._closed
+
+    response = _Response()
+
+    def create_connection(
+        _control,
+        _resolved,
+        timeout: float,
+        *,
+        deadline: float | None = None,
+    ):
+        connection.timeout = timeout
+        return connection
+
+    monkeypatch.setattr(adapter, "_connection", create_connection)
+
+    def request_owned(*_args, **_kwargs):
+        connection._comfyui_response_socket = sock
+        connection.sock = None
+        return response
+
+    monkeypatch.setattr(adapter, "_request_owned", request_owned)
+    monkeypatch.setattr(adapter, "_require_request_authority", lambda *_args, **_kwargs: None)
+    return read_timeouts
+
+
+def test_deadline_json_probe_reads_connection_close_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ResponseHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            payload = b'{"ready":true}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _ResponseHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    adapter = _adapter_for_deadline_probe()
+    adapter._candidate.recipe.server.host = "127.0.0.1"
+    monkeypatch.setattr(adapter, "_require_owned_listener", lambda *_args: None)
+    monkeypatch.setattr(adapter, "_require_request_authority", lambda *_args: None)
+    resolved = SimpleNamespace(
+        argv=("--port", str(server.server_port)),
+        side_effect_state=SimpleNamespace(may_have_been_accepted=False),
+    )
+
+    try:
+        status, payload = adapter._get_json(
+            object(), resolved, "/system_stats", timeout=1.0
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+
+    assert status == 200
+    assert payload == {"ready": True}
+
+
+def test_partial_json_response_uses_updated_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    clock = {"now": 30.75}
+    monkeypatch.setitem(
+        ComfyUIAdapter._get_json.__globals__,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    read_timeouts = _install_timeout_recording_transport(
+        adapter,
+        monkeypatch,
+        status=200,
+        payload=b'{"ready":true}',
+        chunks=(b'{"ready":', b"true}"),
+        clock=clock,
+        after_first_read=31.0,
+    )
+
+    status, payload = adapter._get_json(
+        object(), object(), "/system_stats", timeout=2.0, deadline=32.0
+    )
+
+    assert status == 200
+    assert payload == {"ready": True}
+    assert read_timeouts == pytest.approx([1.25, 1.0])
+
+
+def test_json_probe_does_not_connect_after_listener_check_expires_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    adapter._candidate.recipe.server.host = "127.0.0.1"
+    clock = {"now": 10.0}
+    monkeypatch.setitem(
+        ComfyUIAdapter._get_json.__globals__,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    connections = []
+
+    class _Connection:
+        def __init__(self, _host, _port, *, timeout: float) -> None:
+            self.timeout = timeout
+            self.sock = SimpleNamespace(settimeout=lambda _timeout: None)
+            self.connected = False
+            connections.append(self)
+
+        def connect(self) -> None:
+            self.connected = True
+
+        def close(self) -> None:
+            return None
+
+    http_client = ComfyUIAdapter._connection.__globals__["http"].client
+    monkeypatch.setattr(http_client, "HTTPConnection", _Connection)
+
+    def expire_listener_check(*_args, **_kwargs) -> None:
+        clock["now"] = 12.0
+
+    monkeypatch.setattr(adapter, "_require_owned_listener", expire_listener_check)
+    monkeypatch.setattr(
+        adapter,
+        "_request_owned",
+        lambda *_args, **_kwargs: SimpleNamespace(status=200, read=lambda _limit: b"{}"),
+    )
+    monkeypatch.setattr(adapter, "_require_request_authority", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(BackendEvidenceError):
+        adapter._get_json(
+            object(),
+            SimpleNamespace(argv=("--port", "8188")),
+            "/system_stats",
+            timeout=1.0,
+        )
+
+    assert connections == []
+
+
+def test_json_probe_rechecks_deadline_after_response_authority_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    clock = {"now": 10.0}
+    monkeypatch.setitem(
+        ComfyUIAdapter._get_json.__globals__,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["now"]),
+    )
+    sock = SimpleNamespace(timeout=None)
+    sock.settimeout = lambda timeout: setattr(sock, "timeout", timeout)
+    connection = SimpleNamespace(timeout=None, sock=sock, close=lambda: None)
+    response = SimpleNamespace(status=200, read=lambda _limit: b"{}")
+    monkeypatch.setattr(adapter, "_connection", lambda *_args, **_kwargs: connection)
+    monkeypatch.setattr(adapter, "_request_owned", lambda *_args, **_kwargs: response)
+
+    def expire_authority_check(*_args, **_kwargs) -> None:
+        clock["now"] = 12.0
+
+    monkeypatch.setattr(adapter, "_require_request_authority", expire_authority_check)
+
+    with pytest.raises(BackendEvidenceError):
+        adapter._get_json(object(), object(), "/system_stats", timeout=1.0)
+
+
+def test_readiness_response_read_uses_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    _install_deadline_clock(
+        monkeypatch,
+        ComfyUIAdapter._wait_ready,
+        start=10.0,
+        probe_time=10.75,
+        after_sleep=13.0,
+    )
+    read_timeouts = _install_timeout_recording_transport(
+        adapter, monkeypatch, status=503, payload=b"{}"
+    )
+
+    with pytest.raises(BackendEvidenceError):
+        adapter._wait_ready(
+            SimpleNamespace(
+                is_running=lambda: True,
+                require_current=lambda *_args, **_kwargs: None,
+            ),
+            object(),
+        )
+
+    assert read_timeouts
+    assert all(timeout == pytest.approx(1.25) for timeout in read_timeouts)
+
+
+def test_completion_response_read_uses_remaining_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _adapter_for_deadline_probe()
+    _install_deadline_clock(
+        monkeypatch,
+        ComfyUIAdapter._wait_for_completion,
+        start=20.0,
+        probe_time=20.75,
+        after_sleep=23.0,
+    )
+    read_timeouts = _install_timeout_recording_transport(
+        adapter, monkeypatch, status=200, payload=b"{}"
+    )
+
+    with pytest.raises(AmbiguousBackendOutcome):
+        adapter._wait_for_completion(
+            SimpleNamespace(
+                is_running=lambda: True,
+                require_current=lambda *_args, **_kwargs: None,
+            ),
+            object(),
+            "prompt-id",
+        )
+
+    assert read_timeouts
+    assert all(timeout == pytest.approx(1.25) for timeout in read_timeouts)
 
 
 @pytest.mark.parametrize("failure_stage", ["after-send", "after-acceptance"])
@@ -2174,7 +2483,7 @@ def test_readiness_timeout_preserves_last_probe_error(monkeypatch):
         )
     )
 
-    def fail_connection(*_args):
+    def fail_connection(*_args, **_kwargs):
         raise BackendEvidenceError("listener ownership probe timed out")
 
     adapter._get_json = fail_connection

@@ -2758,21 +2758,60 @@ class ComfyUIAdapter:
                 "ComfyUI frontend bytes changed after admission"
             )
 
+    @staticmethod
+    def _remaining_deadline(deadline: float | None) -> float | None:
+        """Return the time left for an operation, or raise after its deadline."""
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BackendEvidenceError("ComfyUI API request exceeded its deadline")
+        return remaining
+
+    def _apply_deadline_timeout(
+        self,
+        connection: http.client.HTTPConnection,
+        deadline: float | None,
+    ) -> float | None:
+        remaining = self._remaining_deadline(deadline)
+        if remaining is None:
+            return None
+        configured_timeout = connection.timeout
+        timeout = remaining if configured_timeout is None else min(configured_timeout, remaining)
+        connection.timeout = timeout
+        sock = connection.sock
+        if sock is None:
+            sock = getattr(connection, "_comfyui_response_socket", None)
+        if sock is not None:
+            sock.settimeout(timeout)
+        return timeout
+
     def _connection(
         self,
         control: ManagedProcessControl,
         resolved: ResolvedComfyUIExecution,
         timeout: float,
+        *,
+        deadline: float | None = None,
     ) -> http.client.HTTPConnection:
         self._require_owned_listener(control, resolved)
+        if deadline is not None:
+            remaining = self._remaining_deadline(deadline)
+            assert remaining is not None
+            timeout = min(timeout, remaining)
         server = self._candidate.recipe.server
         connection = http.client.HTTPConnection(
             server.host,
             int(resolved.argv[resolved.argv.index("--port") + 1]),
             timeout=timeout,
         )
-        connection.connect()
-        self._require_owned_listener(control, resolved)
+        try:
+            connection.connect()
+            self._require_owned_listener(control, resolved)
+            self._apply_deadline_timeout(connection, deadline)
+        except BaseException:
+            connection.close()
+            raise
         return connection
 
     def _require_owned_listener(
@@ -2808,15 +2847,24 @@ class ComfyUIAdapter:
         *,
         body: bytes | None = None,
         headers: Mapping[str, str] | None = None,
+        deadline: float | None = None,
     ) -> http.client.HTTPResponse:
         self._require_request_authority(control, resolved)
+        self._apply_deadline_timeout(connection, deadline)
         if method == "POST":
             resolved.side_effect_state.may_have_been_accepted = True
         try:
             connection.request(method, path, body=body, headers=dict(headers or {}))
+            self._apply_deadline_timeout(connection, deadline)
             self._require_request_authority(control, resolved)
+            self._apply_deadline_timeout(connection, deadline)
+            response_socket = getattr(connection, "sock", None)
             response = connection.getresponse()
+            if response_socket is not None:
+                setattr(connection, "_comfyui_response_socket", response_socket)
+            self._apply_deadline_timeout(connection, deadline)
             self._require_request_authority(control, resolved)
+            self._apply_deadline_timeout(connection, deadline)
             return response
         except AmbiguousBackendOutcome:
             raise
@@ -2834,14 +2882,23 @@ class ComfyUIAdapter:
         path: str,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> tuple[int, object]:
+        effective_timeout = min(
+            self._candidate.recipe.api.request_timeout_seconds,
+            timeout if timeout is not None else float("inf"),
+        )
+        if deadline is None and timeout is not None:
+            deadline = time.monotonic() + effective_timeout
+        if deadline is not None:
+            remaining = self._remaining_deadline(deadline)
+            assert remaining is not None
+            effective_timeout = min(effective_timeout, remaining)
         connection = self._connection(
             control,
             resolved,
-            min(
-                self._candidate.recipe.api.request_timeout_seconds,
-                timeout if timeout is not None else float("inf"),
-            ),
+            effective_timeout,
+            deadline=deadline,
         )
         try:
             response = self._request_owned(
@@ -2851,9 +2908,27 @@ class ComfyUIAdapter:
                 "GET",
                 path,
                 headers={"Accept": "application/json", "Connection": "close"},
+                deadline=deadline,
             )
-            payload = response.read(COMFYUI_MAX_RECIPE_BYTES + 1)
+            if deadline is None:
+                payload = response.read(COMFYUI_MAX_RECIPE_BYTES + 1)
+            else:
+                payload = bytearray()
+                read_response = getattr(response, "read1", response.read)
+                while len(payload) <= COMFYUI_MAX_RECIPE_BYTES:
+                    self._apply_deadline_timeout(connection, deadline)
+                    remaining_bytes = COMFYUI_MAX_RECIPE_BYTES + 1 - len(payload)
+                    chunk = read_response(min(64 * 1024, remaining_bytes))
+                    if not chunk:
+                        break
+                    payload.extend(chunk)
+                    is_closed = getattr(response, "isclosed", None)
+                    if callable(is_closed) and is_closed():
+                        break
+                payload = bytes(payload)
+            self._remaining_deadline(deadline)
             self._require_request_authority(control, resolved)
+            self._remaining_deadline(deadline)
             if len(payload) > COMFYUI_MAX_RECIPE_BYTES:
                 raise BackendEvidenceError("ComfyUI JSON response is oversized")
             if not payload:
@@ -2893,12 +2968,21 @@ class ComfyUIAdapter:
     def _wait_ready(self, control: ManagedProcessControl, resolved: ResolvedComfyUIExecution) -> None:
         deadline = time.monotonic() + self._candidate.recipe.api.readiness_timeout_seconds
         last_error: BackendEvidenceError | None = None
-        while time.monotonic() < deadline:
+        while True:
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                break
             control.require_current()
             if not control.is_running():
                 raise BackendEvidenceError("ComfyUI exited before readiness")
             try:
-                status, payload = self._get_json(control, resolved, self._candidate.recipe.server.readiness_path)
+                status, payload = self._get_json(
+                    control,
+                    resolved,
+                    self._candidate.recipe.server.readiness_path,
+                    timeout=remaining_timeout,
+                    deadline=deadline,
+                )
             except BackendEvidenceError as error:
                 last_error = error
                 time.sleep(0.05)
@@ -3110,9 +3194,16 @@ class ComfyUIAdapter:
         prompt_id: str,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> Mapping[str, object] | None:
         path = self._candidate.recipe.api.history_path.format(prompt_id=prompt_id)
-        status, payload = self._get_json(control, resolved, path, timeout=timeout)
+        status, payload = self._get_json(
+            control,
+            resolved,
+            path,
+            timeout=timeout,
+            deadline=deadline,
+        )
         if status != 200 or not isinstance(payload, Mapping):
             return None
         entry = payload.get(prompt_id)
@@ -3212,10 +3303,19 @@ class ComfyUIAdapter:
         prompt_id: str,
     ) -> Mapping[str, object]:
         deadline = time.monotonic() + self._candidate.recipe.api.poll_timeout_seconds
-        while time.monotonic() < deadline:
+        while True:
+            remaining_timeout = deadline - time.monotonic()
+            if remaining_timeout <= 0:
+                break
             self._require_request_authority(control, resolved)
             try:
-                entry = self._known_history_entry(control, resolved, prompt_id)
+                entry = self._known_history_entry(
+                    control,
+                    resolved,
+                    prompt_id,
+                    timeout=remaining_timeout,
+                    deadline=deadline,
+                )
             except BackendEvidenceError as error:
                 raise AmbiguousBackendOutcome(
                     "ComfyUI history response is unavailable or malformed"
