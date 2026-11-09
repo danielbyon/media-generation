@@ -328,7 +328,7 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
     resource = service._store.resource_snapshot()
     listener_marker = bundle.files / "listener-bound.json"
     assert provenance["status"] == "succeeded", {
-        "failure_message": provenance["failure_message"],
+        "failure_message": provenance["execution"]["failure_message"],
         "listener_bound": (
             listener_marker.read_text(encoding="utf-8")
             if listener_marker.exists()
