@@ -777,7 +777,9 @@ def test_timeout_terminates_tls_socket_as_observed_by_peer(
     tls_material: tuple[Path, ssl.SSLContext],
 ) -> None:
     certificate, context = tls_material
-    processes = _install_worker(tmp_path, monkeypatch, _trust_certificate(certificate))
+    processes = _install_worker(
+        tmp_path, monkeypatch, _trust_certificate(certificate), preload=1
+    )
     peer_closed = threading.Event()
 
     def respond(connection: Any, request: Any, stop: Any, observations: Any) -> None:
@@ -788,11 +790,14 @@ def test_timeout_terminates_tls_socket_as_observed_by_peer(
         except (ConnectionResetError, ssl.SSLEOFError):
             peer_closed.set()
 
-    with _server(context, respond) as (url, _):
-        response = candidate._acquisition._open_remote(url, headers={}, timeout_seconds=0.15)
-        with pytest.raises(TimeoutError):
-            response.read(1)
-        assert peer_closed.wait(timeout=0.2)
+    with _cleanup_test_workers(processes):
+        with _server(context, respond) as (url, _):
+            response = candidate._acquisition._open_remote(
+                url, headers={}, timeout_seconds=0.15
+            )
+            with pytest.raises(TimeoutError):
+                response.read(1)
+            assert peer_closed.wait(timeout=0.2)
         _assert_reaped(processes)
 
 
@@ -962,7 +967,9 @@ def test_malformed_https_framing_never_publishes_or_retains_resources(
 
     acquisition = candidate._acquisition
     certificate, context = tls_material
-    processes = _install_worker(tmp_path, monkeypatch, _trust_certificate(certificate))
+    processes = _install_worker(
+        tmp_path, monkeypatch, _trust_certificate(certificate), preload=1
+    )
     declaration = _fixture(tmp_path)
     artifact = tmp_path / "files" / "diffusion.safetensors"
     body = artifact.read_bytes()
