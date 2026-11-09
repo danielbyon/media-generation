@@ -1880,7 +1880,10 @@ def _listener_owner_pid(host: str, port: int) -> int:
         except ValueError as error:
             raise BackendEvidenceError("listener ownership output is malformed") from error
     if result.returncode not in (0, 1) or len(pids) != 1:
-        raise BackendEvidenceError("loopback listener identity is absent or ambiguous")
+        raise BackendEvidenceError(
+            "loopback listener identity is absent or ambiguous "
+            f"(lsof returncode={result.returncode}, pid_count={len(pids)})"
+        )
     return next(iter(pids))
 
 

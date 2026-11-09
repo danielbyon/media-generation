@@ -2021,6 +2021,34 @@ def test_port_taken_after_reservation_never_receives_http_from_adapter(
         foreign_listener.close()
 
 
+def test_listener_owner_reports_ambiguous_pid_count(monkeypatch):
+    import subprocess
+
+    import pytest
+
+    from media_generation import comfyui
+    from media_generation.errors import BackendEvidenceError
+
+    monkeypatch.setattr(
+        comfyui.shutil,
+        "which",
+        lambda _name, **_kwargs: "/usr/sbin/lsof",
+    )
+    monkeypatch.setattr(
+        comfyui.subprocess,
+        "run",
+        lambda *args, **_kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="321\n654\n", stderr=""
+        ),
+    )
+
+    with pytest.raises(
+        BackendEvidenceError,
+        match=r"lsof returncode=0, pid_count=2",
+    ):
+        comfyui._listener_owner_pid("127.0.0.1", 51423)
+
+
 def test_readiness_timeout_preserves_last_probe_error(monkeypatch):
     from types import SimpleNamespace
 

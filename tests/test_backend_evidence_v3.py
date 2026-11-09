@@ -326,7 +326,7 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
     provenance = service.get_provenance(job_id)
     execution = service.get_execution(job_id)
     resource = service._store.resource_snapshot()
-    assert provenance["status"] == "succeeded"
+    assert provenance["status"] == "succeeded", provenance
     assert provenance["attempt"]["termination_proven"] is False
     assert execution["observed"]["direct_child_reaped"] is True
     assert execution["observed"]["process_tree_containment"] is False
