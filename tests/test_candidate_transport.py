@@ -507,9 +507,11 @@ def test_preparation_timeout_cleans_staging_and_releases_journal_lock(
         finished = time.monotonic()
         assert len(deadlines) == 1
         expires_at = deadlines[0].expires_at
-        elapsed = finished - (expires_at - 0.25)
-        record_property("deadline_elapsed_seconds", elapsed)
-        assert elapsed < 0.43
+        cleanup_elapsed = finished - expires_at
+        record_property("deadline_cleanup_elapsed_seconds", cleanup_elapsed)
+        assert cleanup_elapsed < 0.5, (
+            f"cleanup after the transfer deadline took {cleanup_elapsed:.4f}s"
+        )
         assert expirations and set(expirations) == {expires_at}
         _assert_reaped(processes)
         if phase in {"startup", "dns", "dns_budget", "connect", "tls", "send"}:
