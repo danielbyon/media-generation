@@ -10,7 +10,7 @@ or network isolation.
 The execution service constructs the supervisor and binds it to one claimed
 attempt, the exact argument vector and child environment produced by pre-dispatch
 resolution, and an application-owned evidence authority. Adapter code receives
-the bound supervisor and calls :meth:`ProcessSupervisor.run` once. The
+the bound supervisor and calls one of its process execution methods. The
 supervisor itself spawns the process and writes launch and observation evidence;
 an adapter cannot supply those facts or substitute a different invocation.
 """
@@ -27,7 +27,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from .backend_provenance import (
     LAUNCH_SCHEMA,
@@ -151,6 +151,94 @@ class ExecutionEvidenceAuthority(ABC):
         """Persist one validated reaped-child fact for the bound attempt."""
 
 
+class ManagedProcessControl:
+    """Control one live direct child owned by a managed supervisor call.
+
+    The control exposes only liveness, authority verification, and direct-child
+    termination. It never reports process-tree containment or persists facts.
+    """
+
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        authority: ExecutionEvidenceAuthority,
+        listener_owner_pid: Callable[[str, int], int] | None = None,
+    ) -> None:
+        self._process = process
+        self._authority = authority
+        self._listener_owner_pid = listener_owner_pid
+        self._lock = threading.Lock()
+        self._termination_requested = False
+
+    @property
+    def pid(self) -> int:
+        """Return the operating-system identifier of the direct child."""
+        return self._process.pid
+
+    def is_running(self) -> bool:
+        """Return whether the direct child has not yet exited."""
+        return self._process.poll() is None
+
+    def require_listener_owner(self, host: str, port: int) -> None:
+        """Require that the direct child uniquely owns one requested listener."""
+        self.require_current()
+        if not self.is_running():
+            raise BackendEvidenceError("managed child exited before listener identity check")
+        if self._listener_owner_pid is None:
+            raise BackendEvidenceError("listener ownership proof is unavailable")
+        try:
+            owner_pid = self._listener_owner_pid(host, port)
+        except BackendEvidenceError:
+            raise
+        except Exception as error:
+            raise BackendEvidenceError("listener ownership proof failed") from error
+        if (
+            isinstance(owner_pid, bool)
+            or not isinstance(owner_pid, int)
+            or owner_pid != self._process.pid
+        ):
+            raise BackendEvidenceError(
+                "loopback listener is not owned by the managed direct child"
+            )
+        self.require_current()
+        if not self.is_running():
+            raise BackendEvidenceError("managed child exited during listener identity check")
+
+    def require_current(self) -> None:
+        """Refuse a later protocol step after attempt authority is revoked."""
+        if not self._authority.verify_current():
+            raise BackendEvidenceError(
+                "attempt authority was revoked while the managed child was live"
+            )
+
+    def terminate(self, *, timeout_seconds: float = 5.0) -> None:
+        """Terminate and reap the direct child, escalating after one timeout."""
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0.0 <= float(timeout_seconds) <= 60.0
+        ):
+            raise ValueError("timeout_seconds must be between 0 and 60")
+        with self._lock:
+            if self._termination_requested:
+                return
+            self._termination_requested = True
+        if self._process.poll() is not None:
+            return
+        try:
+            self._process.terminate()
+        except OSError:
+            pass
+        deadline = time.monotonic() + float(timeout_seconds)
+        while self._process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if self._process.poll() is None:
+            try:
+                self._process.kill()
+            except OSError:
+                pass
+
+
 class _PipeCapture:
     """Drain one pipe while retaining a bounded prefix and a full digest."""
 
@@ -199,7 +287,7 @@ class _PipeCapture:
 class ProcessSupervisor:
     """Run one direct child and report post-reap evidence about it.
 
-    Pipes are drained by non-blocking reads in the supervising thread. After
+    Pipes are drained by non-blocking reads in a dedicated drain thread. After
     the direct child is reaped, the supervisor keeps reading for at most
     ``drain_timeout_seconds``. A descendant that inherited a pipe can keep it
     open indefinitely; the supervisor stops observing and closes its own ends
@@ -267,6 +355,67 @@ class ProcessSupervisor:
         reaped before the original error is re-raised. The observation recorder
         runs only after the direct child is reaped. A second call is refused.
         """
+        actual_argv, actual_environment, started = self._begin_invocation(
+            argv, env, already_used_message="supervisor run may be called only once"
+        )
+        process = self._spawn_and_record_launch(actual_argv, actual_environment, cwd)
+        _, observation = self._finish_child(
+            process,
+            actual_argv,
+            started,
+        )
+        return observation
+
+    def run_managed(
+        self,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        cwd: Path,
+        session: Callable[[ManagedProcessControl], object],
+        shutdown_timeout_seconds: float = 5.0,
+        listener_owner_pid: Callable[[str, int], int] | None = None,
+    ) -> tuple[object, ProcessObservation]:
+        """Run one live direct child while an application callback owns IPC.
+
+        Existing callers retain the finite ``run`` behavior. This additive path
+        drains both streams concurrently, gives the callback only liveness and
+        direct-child termination control, then reaps the exact child and writes
+        the same launch and observation records. A failure after spawn still
+        attempts bounded termination and records observation when reaping is
+        proven. Descendant containment is never claimed.
+        """
+        if not callable(session):
+            raise TypeError("session must be callable")
+        if (
+            isinstance(shutdown_timeout_seconds, bool)
+            or not isinstance(shutdown_timeout_seconds, (int, float))
+            or not 0.0 <= float(shutdown_timeout_seconds) <= 60.0
+        ):
+            raise ValueError("shutdown_timeout_seconds must be between 0 and 60")
+        actual_argv, actual_environment, started = self._begin_invocation(
+            argv,
+            env,
+            already_used_message="supervisor execution may be called only once",
+        )
+        process = self._spawn_and_record_launch(actual_argv, actual_environment, cwd)
+        return self._finish_child(
+            process,
+            actual_argv,
+            started,
+            session=session,
+            listener_owner_pid=listener_owner_pid,
+            shutdown_timeout_seconds=float(shutdown_timeout_seconds),
+        )
+
+    def _begin_invocation(
+        self,
+        argv: Sequence[str],
+        env: Mapping[str, str],
+        *,
+        already_used_message: str,
+    ) -> tuple[tuple[str, ...], dict[str, str], float]:
+        """Validate and claim the one exact invocation owned by this supervisor."""
         actual_argv = tuple(argv)
         if not actual_argv or any(
             not isinstance(item, str) or not item for item in actual_argv
@@ -288,22 +437,30 @@ class ProcessSupervisor:
             )
         with self._lock:
             if self._used:
-                raise RuntimeError("supervisor run may be called only once")
+                raise RuntimeError(already_used_message)
             self._used = True
         if not self._authority.verify_current():
             raise BackendEvidenceError(
                 "attempt ownership, epoch, or current-job authority is stale; "
                 "no process was started"
             )
-        started = time.monotonic()
+        return actual_argv, actual_environment, time.monotonic()
+
+    def _spawn_and_record_launch(
+        self,
+        argv: tuple[str, ...],
+        environment: Mapping[str, str],
+        cwd: Path,
+    ) -> subprocess.Popen[bytes]:
+        """Start the direct child and persist its exact launch facts once."""
         try:
             process = subprocess.Popen(
-                list(actual_argv),
+                list(argv),
                 shell=False,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                env=actual_environment,
+                env=dict(environment),
                 cwd=str(cwd),
                 start_new_session=True,
                 close_fds=True,
@@ -321,46 +478,110 @@ class ProcessSupervisor:
                     attempt_id=self._authority.attempt_id,
                     pid=os.getpid(),
                     monotonic_start_ns=time.monotonic_ns(),
-                    argv=actual_argv,
-                    environment=tuple(sorted(actual_environment.items())),
+                    argv=argv,
+                    environment=tuple(sorted(environment.items())),
                 )
             )
-        except BaseException:
-            try:
-                process.kill()
-            except OSError:
-                # The child may have exited before the evidence write. Reaping,
-                # signalling, and closing the pipes still prove it is no longer
-                # running under this supervisor.
-                pass
-            process.wait()
-            for stream in (process.stdout, process.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass
+        except BaseException as error:
+            if not self._terminate_after_drain_failure(process):
+                raise BackendEvidenceError(
+                    "direct child termination could not be proven after launch recording failed"
+                ) from error
             raise
+        return process
 
+    def _finish_child(
+        self,
+        process: subprocess.Popen[bytes],
+        argv: tuple[str, ...],
+        started: float,
+        *,
+        session: Callable[[ManagedProcessControl], object] | None = None,
+        listener_owner_pid: Callable[[str, int], int] | None = None,
+        shutdown_timeout_seconds: float = 5.0,
+    ) -> tuple[object, ProcessObservation]:
+        """Drain, reap, and persist common direct-child completion evidence.
+
+        ``run`` leaves a finite process to exit on its own. ``run_managed``
+        executes its protocol callback while this same drain and evidence path
+        runs, then terminates the direct child within the supplied bound.
+        """
         stdout_capture = _PipeCapture()
         stderr_capture = _PipeCapture()
+        drain_result: list[tuple[int, bool, bool]] = []
+        drain_error: list[BaseException] = []
+
+        def drain() -> None:
+            try:
+                drain_result.append(
+                    self._drain_until_reaped(
+                        process,
+                        stdout_capture=stdout_capture,
+                        stderr_capture=stderr_capture,
+                    )
+                )
+            except BaseException as error:
+                drain_error.append(error)
+
+        drain_thread = threading.Thread(
+            target=drain,
+            name=f"managed-process-drain-{self._authority.attempt_id}",
+            daemon=True,
+        )
         try:
-            (
-                returncode,
-                inherited_streams_retained,
-                stream_state_unknown,
-            ) = self._drain_until_reaped(
-                process,
-                stdout_capture=stdout_capture,
-                stderr_capture=stderr_capture,
-            )
-        except BaseException:
-            self._terminate_after_drain_failure(process)
+            drain_thread.start()
+        except BaseException as error:
+            if not self._terminate_after_drain_failure(process):
+                raise BackendEvidenceError(
+                    "direct child termination could not be proven after drain startup failed"
+                ) from error
             raise
+        callback_result: object = None
+        callback_error: BaseException | None = None
+        termination_error: BaseException | None = None
+        if session is None:
+            try:
+                drain_thread.join()
+            except BaseException:
+                self._terminate_after_drain_failure(process)
+                raise
+        else:
+            control = ManagedProcessControl(
+                process, self._authority, listener_owner_pid
+            )
+            try:
+                callback_result = session(control)
+            except BaseException as error:
+                callback_error = error
+            finally:
+                try:
+                    control.terminate(timeout_seconds=shutdown_timeout_seconds)
+                except BaseException as error:
+                    termination_error = error
+                drain_thread.join(
+                    timeout=shutdown_timeout_seconds + self._drain_timeout_seconds + 5.0
+                )
+                if drain_thread.is_alive():
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    drain_thread.join(timeout=2.0)
+
+        if drain_error:
+            self._terminate_after_drain_failure(process)
+            raise drain_error[0]
+        if not drain_result:
+            raise BackendEvidenceError(
+                "direct-child stream draining did not reach a reaped result"
+            )
+        if termination_error is not None and callback_error is None:
+            raise termination_error
+        returncode, inherited_streams_retained, stream_state_unknown = drain_result[0]
         duration = max(0.0, time.monotonic() - started)
         exit_code = returncode if returncode >= 0 else None
         signal_number = -returncode if returncode < 0 else None
-        prompt_markers = _prompt_markers(actual_argv)
+        prompt_markers = _prompt_markers(argv)
         stdout_classification = stdout_capture.classification(
             prompt_markers=prompt_markers
         )
@@ -384,7 +605,9 @@ class ProcessSupervisor:
             stream_state_unknown=stream_state_unknown,
         )
         self._authority.record_observation(observation)
-        return observation
+        if callback_error is not None:
+            raise callback_error
+        return callback_result, observation
 
     def _drain_until_reaped(
         self,
@@ -467,7 +690,6 @@ class ProcessSupervisor:
                     pass
 
     @staticmethod
-    @staticmethod
     def _streams_still_open(
         streams: Sequence[tuple[BinaryIO, _PipeCapture]],
     ) -> tuple[bool, bool]:
@@ -505,22 +727,28 @@ class ProcessSupervisor:
         return False, stream_state_unknown
 
     @staticmethod
-    def _terminate_after_drain_failure(process: subprocess.Popen[bytes]) -> None:
-        """Kill, reap, and close the direct child after a drain-phase failure."""
+    def _terminate_after_drain_failure(process: subprocess.Popen[bytes]) -> bool:
+        """Kill and reap the direct child, returning whether reaping was proven."""
         try:
             process.kill()
         except OSError:
             pass
         try:
-            process.wait()
-        except OSError:
-            pass
+            process.wait(timeout=5.0)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                reaped = process.poll() is not None
+            except OSError:
+                reaped = False
+        else:
+            reaped = process.returncode is not None
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 try:
                     stream.close()
                 except OSError:
                     pass
+        return reaped
 
 
 def _prompt_markers(argv: Sequence[str]) -> tuple[str, ...]:

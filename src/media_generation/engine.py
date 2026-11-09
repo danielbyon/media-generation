@@ -585,6 +585,11 @@ def _declared_candidate(
             "bundle_incompatible",
             f"engine id must be {SUPPORTED_ENGINE_ID!r}",
         )
+    if declaration.engine.launch is not None:
+        raise BackendPreparationError(
+            "bundle_incompatible",
+            "stable-diffusion.cpp requires a native executable entrypoint",
+        )
     if declaration.recipe.engine_id != declaration.engine.id:
         raise BackendPreparationError(
             "bundle_incompatible",

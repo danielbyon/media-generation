@@ -175,7 +175,10 @@ def test_crashed_external_execution_remains_quarantined_after_lock_release(
     assert admission.decision == "quarantined"
     assert admission.reserved_bytes == {"system_ram": 48 * GIB}
     service_at(tmp_path).enqueue("other", request())
-    assert service_at(tmp_path).work()["status"] == "resource_busy"
+    restarted = service_at(tmp_path).work()
+    assert restarted["status"] == "attention_required"
+    assert restarted["resource_state"] == "quarantined"
+    assert restarted["resource_reason"]
     with pytest.raises(GenerationError):
         service_at(tmp_path).retry(queued.job_id)
 
@@ -524,7 +527,10 @@ def test_canceled_external_publication_without_termination_proof_quarantines_res
     assert snapshot["status"] == "canceled"
     assert snapshot["attempts"][0]["termination_proven"] is False
     assert snapshot["execution"]["resource_state"] == "quarantined"
-    assert service_at(tmp_path).recover() == {"status": "attention_required"}
+    recovered = service_at(tmp_path).recover()
+    assert recovered["status"] == "attention_required"
+    assert recovered["resource_state"] == "quarantined"
+    assert recovered["resource_reason"]
     assert service_at(tmp_path).get_job(queued.job_id).artifact_id is None
 
 
@@ -539,7 +545,7 @@ def test_undeclared_containment_does_not_authorize_retry_after_dispatch(
 
     service = _admitted_service_at(tmp_path, adapter=UndeclaredRetryableAdapter())
     queued = _admit(service, "undeclared-containment", request(), max_attempts=2)
-    assert service.work()["status"] == "complete"
+    assert service.work()["status"] == "attention_required"
 
     snapshot = service.get_provenance(queued.job_id)
     assert snapshot["status"] == "ambiguous"
@@ -547,7 +553,7 @@ def test_undeclared_containment_does_not_authorize_retry_after_dispatch(
     assert snapshot["attempts"][0]["failure_class"] == "retryable"
     assert snapshot["attempts"][0]["termination_proven"] is False
     assert snapshot["execution"]["resource_state"] == "quarantined"
-    assert service.work()["status"] == "resource_busy"
+    assert service.work()["status"] == "attention_required"
     assert len(service.get_provenance(queued.job_id)["attempts"]) == 1
 
 
@@ -608,7 +614,10 @@ def test_unqualified_success_preserves_artifact_but_quarantines_resource(
     assert Path(parent_artifact.path).read_bytes() == parent_bytes
     lineage = child_service.get_lineage(child_artifact.artifact_id)
     assert lineage["parents"][0]["source_id"] == parent_artifact.artifact_id
-    assert service_at(tmp_path).recover() == {"status": "attention_required"}
+    recovered = service_at(tmp_path).recover()
+    assert recovered["status"] == "attention_required"
+    assert recovered["resource_state"] == "quarantined"
+    assert recovered["resource_reason"]
 
 
 def test_unproven_retryable_failure_is_quarantined_without_replay_authority(
@@ -731,7 +740,11 @@ def test_canceled_allocated_attempt_reconciliation_finalizes_attempt_and_resourc
 
     report = service_at(tmp_path).reconcile()
 
-    assert report["status"] == "complete"
+    assert report["status"] == (
+        "attention_required" if external else "complete"
+    )
+    assert report["resource_state"] == expected_resource_state
+    assert (report["resource_reason"] is not None) is external
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
     assert snapshot["status"] == "canceled"
     assert snapshot["attempts"][0]["status"] == "canceled"
@@ -779,7 +792,11 @@ def test_contained_recovery_reports_attention_when_finalization_fails(
     monkeypatch.setattr(service._store, "fail_execution", lambda *args, **kwargs: False)
     report = service.recover()
 
-    assert report == {"status": "attention_required"}
+    assert report == {
+        "status": "attention_required",
+        "resource_state": "claimed",
+        "resource_reason": None,
+    }
     snapshot = service.get_provenance(queued.job_id)
     assert snapshot["attempts"][0]["status"] == "running"
     assert snapshot["execution"]["resource_state"] == "claimed"
@@ -851,6 +868,10 @@ def test_recovered_external_artifact_reports_quarantine_immediately(tmp_path: Pa
     assert snapshot["attempt"]["termination_proven"] is False
     assert snapshot["execution"]["resource_state"] == "quarantined"
     assert service.recover()["status"] == "attention_required"
+    reconcile = service.reconcile()
+    assert reconcile["status"] == "attention_required"
+    assert reconcile["resource_state"] == "quarantined"
+    assert reconcile["resource_reason"]
 
 
 def test_cancellation_does_not_authorize_a_different_attempt_owner(tmp_path: Path) -> None:
@@ -941,7 +962,9 @@ def test_cancel_after_reconciliation_snapshot_cannot_restore_retry(
     )
     service.recover()
     assert service.get_provenance(queued.job_id) == finalized
-    assert service.work()["status"] == ("resource_busy" if external else "idle")
+    assert service.work()["status"] == (
+        "attention_required" if external else "idle"
+    )
     assert len(service.get_provenance(queued.job_id)["attempts"]) == 1
 
 

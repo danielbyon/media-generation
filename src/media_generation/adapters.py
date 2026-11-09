@@ -6,6 +6,7 @@ import hashlib
 import json
 import struct
 import zlib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, BinaryIO, Protocol
 
@@ -21,7 +22,12 @@ BACKEND_EXECUTION_CONTRACT_VERSION = "backend-execution/v1"
 
 @dataclass(frozen=True, slots=True)
 class AdapterCapabilities:
-    """Limits the service checks before creating a job for an adapter."""
+    """Limits checked before creating a job or calling the adapter.
+
+    ``operation_reference_roles`` is optional. Adapters that need a different
+    reference topology for each operation provide the exact role sequence here;
+    leaving it unset preserves the adapter's existing generic admission rules.
+    """
 
     max_width: int
     max_height: int
@@ -31,6 +37,7 @@ class AdapterCapabilities:
     max_source_images: int = 0
     dimension_multiple: int = 1
     supported_operations: frozenset[str] = frozenset({"generate"})
+    operation_reference_roles: Mapping[str, tuple[str, ...]] | None = None
     min_width: int = 1
     min_height: int = 1
 

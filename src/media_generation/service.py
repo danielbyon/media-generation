@@ -38,6 +38,7 @@ from .domain import (
     ResolvedReference,
 )
 from .errors import (
+    AmbiguousBackendOutcome,
     BackendEvidenceError,
     BackendPreparationError,
     GenerationExecutionError,
@@ -60,9 +61,19 @@ from .privacy import (
     application_privacy_profile,
     application_privacy_policy,
     application_privacy_registration,
+    comfyui_invocation_privacy_settings,
+    comfyui_resolved_privacy_evidence,
     invocation_privacy_settings,
 )
-from .backend_provenance import environment_record
+from .backend_provenance import (
+    COMFYUI_RESOLVED_BACKEND_KIND,
+    COMFYUI_RESOLVED_CLI_CONTRACT,
+    COMFYUI_RESOLVED_INVOCATION_CONTRACT,
+    COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS,
+    RECORD_SCHEMA_VERSION,
+    RESOLVED_RECORD_SCHEMA_VERSION,
+    environment_record,
+)
 from .store import ExecutionClaim, QueuedExecution, SQLiteStore
 from .supervisor import (
     ExecutionEvidenceAuthority,
@@ -83,6 +94,13 @@ class SubmissionResult:
     status: str
     output_slot_id: str
     artifact_id: str | None
+    resource_state: str = "available"
+    resource_reason: str | None = None
+
+    @property
+    def attention_required(self) -> bool:
+        """Whether successful publication left heavyweight capacity quarantined."""
+        return self.resource_state == "quarantined"
 
     def to_dict(self) -> dict[str, object]:
         """Return a CLI-ready result without exposing storage implementation details."""
@@ -92,6 +110,8 @@ class SubmissionResult:
             "status": self.status,
             "output_slot_id": self.output_slot_id,
             "artifact_id": self.artifact_id,
+            "resource_state": self.resource_state,
+            "resource_reason": self.resource_reason,
         }
 
 
@@ -486,10 +506,11 @@ class GenerationService:
         """Admit work, then synchronously execute one matching local attempt.
 
         Existing successful jobs remain directly inspectable and reusable. An
-        occupied heavyweight resource returns a specific error while leaving
-        the newly admitted job queued for a later worker or submit call. A
-        blocked or denied capacity decision returns the queued submission
-        without creating an attempt; inspect it with ``inspect_admission``.
+        occupied or quarantined heavyweight resource returns a specific error
+        while leaving the newly admitted job queued for a later worker or
+        submit call. A blocked or denied capacity decision returns the queued
+        submission without creating an attempt; inspect it with
+        ``inspect_admission``.
         A process-contained retryable failure remains durably queued for its
         next bounded attempt and raises ``GenerationExecutionError`` with the
         ``execution_retryable`` safe message.
@@ -515,7 +536,10 @@ class GenerationService:
         report = self._run_jobs(
             limit=1, job_id=admitted.job_id, _failures=failures
         )
-        if report["status"] == "resource_busy":
+        if report["status"] == "resource_busy" or (
+            report["status"] == "attention_required"
+            and report.get("processed") == 0
+        ):
             if not self._observe_same_job_resource(admitted.job_id):
                 raise ResourceBusyError(admitted.job_id)
             return self._submission_for_job(admitted.job_id)
@@ -612,23 +636,37 @@ class GenerationService:
             resource = self._store.resource_snapshot()
             state = str(resource["state"])
             if state == "quarantined":
-                return {"status": "attention_required"}
+                return self._resource_result("attention_required")
             if state == "available":
                 report = self._publication.reconcile()
-                return {
-                    "status": "attention_required" if report.get("status") == "attention_required" else "complete",
-                    "publications": report,
-                }
+                result = self._resource_result(
+                    "attention_required"
+                    if report.get("status") == "attention_required"
+                    else "complete"
+                )
+                result["publications"] = report
+                return result
             job_id = resource.get("job_id")
             attempt_id = resource.get("attempt_id")
             if not isinstance(job_id, str) or not isinstance(attempt_id, str):
-                return {"status": "attention_required"}
+                return self._resource_result("attention_required")
             return self._recover_attempt(job_id, attempt_id)
+
+    def _resource_result(self, outcome: str) -> dict[str, object]:
+        """Return a recovery outcome whose clean status requires released capacity."""
+        resource = self._store.resource_snapshot()
+        state = str(resource["state"])
+        reason = resource.get("reason")
+        return {
+            "status": "attention_required" if state != "available" else outcome,
+            "resource_state": state,
+            "resource_reason": None if reason is None else str(reason),
+        }
 
     def _recover_attempt(self, job_id: str, attempt_id: str) -> dict[str, object]:
         attempt = self._store.current_attempt(job_id)
         if attempt is None or attempt["attempt_id"] != attempt_id:
-            return {"status": "complete"}
+            return self._resource_result("complete")
         publication = next(
             (
                 record
@@ -645,12 +683,8 @@ class GenerationService:
                 self._publication.reconcile()
                 snapshot = self._store.get_provenance(job_id)
                 if snapshot["status"] == "succeeded":
-                    resource = self._store.resource_snapshot()
-                    return {
-                        "status": "attention_required"
-                        if resource["state"] == "quarantined" else "recovered"
-                    }
-                return {"status": "attention_required"}
+                    return self._resource_result("recovered")
+                return self._resource_result("attention_required")
             self._store.revoke_ready_publication(
                 publication_id,
                 "attempt ownership or cancellation fenced ready publication",
@@ -664,16 +698,10 @@ class GenerationService:
 
         attempt = self._store.current_attempt(job_id)
         if attempt is None or attempt["attempt_id"] != attempt_id:
-            return {"status": "complete"}
+            return self._resource_result("complete")
         owner_id = None if attempt["owner_id"] is None else str(attempt["owner_id"])
         epoch = int(attempt["claim_epoch"])
-        contained = (
-            (
-                attempt["containment_contract"] is not None
-                and bool(attempt["process_contained"])
-            )
-            or self._store.termination_evidence_proven(job_id, attempt_id)
-        )
+        contained = self._store.attempt_termination_proven(job_id, attempt_id)
         timestamp = _now()
         if attempt["job_status"] == "canceled":
             finalized = self._store.fail_execution(
@@ -688,8 +716,8 @@ class GenerationService:
                 _revoked_publication_id=str(publication["publication_id"]) if publication_was_fenced else None,
             )
             if not finalized:
-                return {"status": "attention_required"}
-            return {"status": "canceled"}
+                return self._resource_result("attention_required")
+            return self._resource_result("canceled")
         if publication_was_fenced:
             finalized = self._store.fail_execution(
                 job_id,
@@ -707,13 +735,13 @@ class GenerationService:
                 _revoked_publication_id=str(publication["publication_id"]),
             )
             if not finalized:
-                return {"status": "attention_required"}
-            return {"status": "attention_required"}
+                return self._resource_result("attention_required")
+            return self._resource_result("attention_required")
         if contained:
             finalized = self._store.fail_execution(
                 job_id,
                 attempt_id,
-                "worker process ended; process-contained adapter invocation terminated",
+                "worker process ended after adapter termination evidence was validated",
                 timestamp,
                 attempt_owner_id=owner_id,
                 claim_epoch=epoch,
@@ -721,8 +749,8 @@ class GenerationService:
                 termination_proven=True,
             )
             if not finalized:
-                return {"status": "attention_required"}
-            return {"status": "complete"}
+                return self._resource_result("attention_required")
+            return self._resource_result("complete")
         self._store.fail_execution(
             job_id,
             attempt_id,
@@ -733,7 +761,8 @@ class GenerationService:
             failure_class="ambiguous",
             termination_proven=False,
         )
-        return {"status": "attention_required"}
+        return self._resource_result("attention_required")
+
     def _run_jobs(
         self,
         *,
@@ -746,13 +775,21 @@ class GenerationService:
                 return {"status": "resource_busy", "processed": 0}
             processed = 0
             outcomes: list[dict[str, object]] = []
+            processed_claims: set[tuple[str, str, str]] = set()
             for _ in range(limit):
                 resource = self._store.resource_snapshot()
                 if resource["state"] != "available":
+                    state = str(resource["state"])
                     return {
-                        "status": "resource_busy",
+                        "status": (
+                            "attention_required"
+                            if state == "quarantined"
+                            else "resource_busy"
+                        ),
                         "processed": processed,
                         "outcomes": outcomes,
+                        "resource_state": state,
+                        "resource_reason": resource.get("reason"),
                     }
                 (
                     _,
@@ -778,6 +815,9 @@ class GenerationService:
                 if claim is None:
                     break
                 processed += 1
+                processed_claims.add(
+                    (claim.job_id, claim.attempt_id, claim.owner_id)
+                )
                 failure = self._execute_claim(claim)
                 if failure is not None and _failures is not None:
                     _failures.append(failure)
@@ -789,17 +829,57 @@ class GenerationService:
                     item for item in snapshot["attempts"]
                     if item["attempt_id"] == claim.attempt_id
                 )
-                outcomes.append({
+                resource = self._store.resource_snapshot()
+                outcome = {
                     "job_id": claim.job_id,
                     "attempt_id": claim.attempt_id,
                     "status": attempt["status"],
                     "execution_status": snapshot["status"],
                     "failure_class": attempt["failure_class"],
                     "termination_proven": attempt["termination_proven"],
-                })
+                }
+                if (
+                    resource.get("job_id") == claim.job_id
+                    and resource.get("attempt_id") == claim.attempt_id
+                    and resource.get("owner_id") == claim.owner_id
+                ):
+                    outcome["resource_state"] = resource["state"]
+                    outcome["resource_reason"] = resource["reason"]
+                outcomes.append(outcome)
             if processed == 0:
                 return {"status": "idle", "processed": 0}
-            return {"status": "complete", "processed": processed, "outcomes": outcomes}
+            resource = self._store.resource_snapshot()
+            state = str(resource["state"])
+            reason = resource.get("reason")
+            if state == "available":
+                return {
+                    "status": "complete",
+                    "processed": processed,
+                    "outcomes": outcomes,
+                }
+            if state == "quarantined" or (
+                resource.get("job_id"),
+                resource.get("attempt_id"),
+                resource.get("owner_id"),
+            ) in processed_claims:
+                return {
+                    "status": "attention_required",
+                    "processed": processed,
+                    "outcomes": outcomes,
+                    "resource_state": state,
+                    "resource_reason": (
+                        reason
+                        if reason is not None
+                        else "processed execution claim remains unreleased"
+                    ),
+                }
+            return {
+                "status": "resource_busy",
+                "processed": processed,
+                "outcomes": outcomes,
+                "resource_state": state,
+                "resource_reason": reason,
+            }
 
     def _execute_claim(self, claim: ExecutionClaim) -> Exception | None:
         stop_heartbeat = threading.Event()
@@ -826,6 +906,7 @@ class GenerationService:
         metadata = None
         adapter_dispatched = False
         execute_entered = False
+        executed = False
         prepared_execution = None
         supervisor: ProcessSupervisor | None = None
         try:
@@ -855,7 +936,7 @@ class GenerationService:
             generated_artifact_id = _new_id("art")
 
             def write_image(destination: Path, staged: BinaryIO) -> None:
-                nonlocal metadata, adapter_dispatched, execute_entered, supervisor
+                nonlocal metadata, adapter_dispatched, execute_entered, executed, supervisor
                 if prepared_execution is not None:
                     supervisor = ProcessSupervisor(
                         _StoreExecutionAuthority(self._store, claim),
@@ -868,6 +949,7 @@ class GenerationService:
                         staged,
                         supervisor=supervisor,
                     )
+                    executed = True
                     self._verify_execution_evidence(claim, prepared_execution)
                 else:
                     adapter_dispatched = True
@@ -920,13 +1002,12 @@ class GenerationService:
                 return None
             if snapshot["status"] == "canceled":
                 canceled_termination = (
-                    claim.containment_contract is not None
+                    self._store.attempt_termination_proven(
+                        claim.job_id, claim.attempt_id
+                    )
                     or (
                         supervisor is not None
                         and not supervisor.process_started
-                    )
-                    or self._store.termination_evidence_proven(
-                        claim.job_id, claim.attempt_id
                     )
                 )
                 finalized = self._store.fail_execution(
@@ -956,7 +1037,10 @@ class GenerationService:
                 not execute_entered
                 or (
                     not process_started
-                    and preparation_error is not None
+                    and supervisor is not None
+                    and not executed
+                    and isinstance(error, GenerationError)
+                    and not isinstance(error, AmbiguousBackendOutcome)
                 )
             ):
                 preparation_message = "execution_preparation_failed"
@@ -973,6 +1057,7 @@ class GenerationService:
                     claim_epoch=claim.claim_epoch,
                     failure_class="terminal",
                     termination_proven=True,
+                    prelaunch_refusal=True,
                 )
                 return error
             retryable_failure = False
@@ -982,22 +1067,30 @@ class GenerationService:
                     retryable_failure = True
                     break
                 cursor = cursor.__cause__
-            termination_proven = (
-                claim.containment_contract is not None
-                or self._store.termination_evidence_proven(
-                    claim.job_id, claim.attempt_id
-                )
+            termination_proven = self._store.attempt_termination_proven(
+                claim.job_id, claim.attempt_id
             )
-            if not termination_proven:
+            ambiguous_acceptance = False
+            cursor = error
+            while cursor is not None:
+                if isinstance(cursor, AmbiguousBackendOutcome):
+                    ambiguous_acceptance = True
+                    break
+                cursor = cursor.__cause__
+            if not termination_proven or ambiguous_acceptance:
                 self._store.fail_execution(
                     claim.job_id,
                     claim.attempt_id,
-                    "execution_retryable" if retryable_failure else "execution_ambiguous",
+                    "execution_retryable"
+                    if retryable_failure and not ambiguous_acceptance
+                    else "execution_ambiguous",
                     _now(),
                     attempt_owner_id=claim.owner_id,
                     claim_epoch=claim.claim_epoch,
-                    failure_class="retryable" if retryable_failure else "ambiguous",
-                    termination_proven=False,
+                    failure_class="retryable"
+                    if retryable_failure and not ambiguous_acceptance
+                    else "ambiguous",
+                    termination_proven=termination_proven,
                 )
                 return error
             failure_class = "retryable" if retryable_failure else "terminal"
@@ -1030,9 +1123,9 @@ class GenerationService:
         Resolution performs the T07 evaluation and builds the resolved record.
         The record cannot be its own authority: every field that selects a
         candidate, engine, recipe, or component must match the restart-stable
-        configuration selected for the attempt. The program named by argv[0]
-        must also be the selected executable pin, so an adapter cannot obtain a
-        privacy pass for a different program.
+        configuration selected for the attempt. The pinned backend executable
+        must also appear at its contract-defined argv position, so an adapter
+        cannot obtain a privacy pass for a different program.
         """
         record = getattr(prepared, "resolved_record", None)
         if not isinstance(record, dict):
@@ -1080,7 +1173,10 @@ class GenerationService:
             label="adapters",
         )
         self._require_selected_executable(
-            record_engine, selected_engine, prepared
+            record_engine,
+            selected_engine,
+            prepared,
+            backend_kind=record.get("backend_kind"),
         )
 
     def _require_selected_executable(
@@ -1088,8 +1184,10 @@ class GenerationService:
         record_engine: Mapping[str, object],
         selected_engine: Mapping[str, object],
         prepared: object,
+        *,
+        backend_kind: object,
     ) -> None:
-        """Require argv[0] to identify and contain the selected executable."""
+        """Require the backend executable pin at its contract-defined argv index."""
         pin = selected_engine.get("executable")
         if not isinstance(pin, Mapping):
             raise _resolved_execution_mismatch(
@@ -1111,24 +1209,38 @@ class GenerationService:
             label="engine.executable_sha256",
         )
         argv = tuple(getattr(prepared, "argv", ()))
-        if not argv or not isinstance(argv[0], str) or not os.path.isabs(argv[0]):
+        if backend_kind == COMFYUI_RESOLVED_BACKEND_KIND:
+            try:
+                executable_index = argv.index("--") + 1
+            except ValueError as error:
+                raise _resolved_execution_mismatch(
+                    "resolved ComfyUI argv is missing its bootstrap delimiter"
+                ) from error
+        else:
+            executable_index = 0
+        if (
+            len(argv) <= executable_index
+            or not isinstance(argv[executable_index], str)
+            or not os.path.isabs(argv[executable_index])
+        ):
             raise _resolved_execution_mismatch(
-                "resolved argv[0] is not an absolute executable path"
+                f"resolved argv[{executable_index}] is not an absolute executable path"
             )
+        executable_path = argv[executable_index]
         parts = Path(relative_path).parts
-        if not parts or tuple(Path(argv[0]).parts[-len(parts) :]) != parts:
+        if not parts or tuple(Path(executable_path).parts[-len(parts) :]) != parts:
             raise _resolved_execution_mismatch(
-                "resolved argv[0] does not match the selected executable path"
+                f"resolved argv[{executable_index}] does not match the selected executable path"
             )
         try:
-            observed_digest = _sha256_regular_file(argv[0])
+            observed_digest = _sha256_regular_file(executable_path)
         except OSError as error:
             raise _resolved_execution_mismatch(
-                "resolved argv[0] cannot be read for executable verification"
+                f"resolved argv[{executable_index}] cannot be read for executable verification"
             ) from error
         if observed_digest != selected_digest:
             raise _resolved_execution_mismatch(
-                "resolved argv[0] bytes do not match the selected executable"
+                f"resolved argv[{executable_index}] bytes do not match the selected executable"
             )
 
     def _require_execution_privacy(
@@ -1153,6 +1265,11 @@ class GenerationService:
         record = getattr(prepared, "resolved_record", None)
         if not isinstance(record, dict):
             raise BackendEvidenceError("resolved execution record is missing")
+        schema_version = record.get("schema_version")
+        if type(schema_version) is not int:
+            raise BackendEvidenceError(
+                "resolved execution record has an unsupported schema"
+            )
         if claim is None:
             configuration = self.adapter.configuration
             reference_roles = _record_reference_roles(record)
@@ -1176,7 +1293,14 @@ class GenerationService:
             raise BackendEvidenceError(
                 "resolved argv record does not match the prepared invocation"
             )
-        if record.get("environment") != environment_record(environment):
+        if schema_version in COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS:
+            expected_environment_record: Mapping[str, object] = {
+                "names": sorted(environment),
+                "values": environment,
+            }
+        else:
+            expected_environment_record = environment_record(environment)
+        if record.get("environment") != expected_environment_record:
             raise BackendEvidenceError(
                 "resolved environment record does not match the prepared invocation"
             )
@@ -1186,12 +1310,63 @@ class GenerationService:
             raise BackendEvidenceError(
                 "resolved execution engine identity missing"
             )
-        privacy = invocation_privacy_settings(argv, environment)
+        is_comfyui_record = (
+            schema_version in COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS
+            and record.get("backend_kind") == COMFYUI_RESOLVED_BACKEND_KIND
+            and record.get("invocation_contract")
+            == COMFYUI_RESOLVED_INVOCATION_CONTRACT
+            and record.get("cli_contract") == COMFYUI_RESOLVED_CLI_CONTRACT
+        )
+        if schema_version == RECORD_SCHEMA_VERSION:
+            if "effective_execution" in record:
+                raise BackendEvidenceError(
+                    "resolved v2 execution record unexpectedly contains effective ComfyUI evidence"
+                )
+            privacy = invocation_privacy_settings(argv, environment)
+        elif is_comfyui_record:
+            effective_execution = record.get("effective_execution")
+            if not isinstance(effective_execution, Mapping):
+                raise BackendEvidenceError(
+                    "resolved effective execution evidence is not an object"
+                )
+            privacy = comfyui_invocation_privacy_settings(
+                argv, environment, effective_execution
+            )
+        else:
+            raise BackendEvidenceError(
+                "resolved record does not identify a supported privacy backend contract"
+            )
         configuration_version = configuration.get("configuration_version")
         result = self._privacy_policy.evaluate(
             self.adapter.adapter_id,
             {"configuration_version": configuration_version, "privacy": privacy},
         )
+        if schema_version == RESOLVED_RECORD_SCHEMA_VERSION:
+            try:
+                expected_privacy_evidence = comfyui_resolved_privacy_evidence(
+                result,
+                effective_execution,
+                configuration_version=configuration_version,
+                ).to_dict()
+            except ValueError:
+                expected_privacy_evidence = None
+            if record.get("privacy_evidence") != expected_privacy_evidence:
+                raise PrivacyComplianceError(
+                    replace(
+                        result,
+                        status=PrivacyComplianceStatus.FAIL,
+                        reasons=(
+                            *result.reasons,
+                            {
+                                "code": "resolved_privacy_mismatch",
+                                "detail": (
+                                    "Resolved privacy evidence does not match "
+                                    "recomputed invocation."
+                                ),
+                            },
+                        ),
+                    )
+                )
         if (
             engine.get("id") != registration.tool_id
             or engine.get("version") != registration.tool_version
@@ -1255,13 +1430,25 @@ class GenerationService:
         resolved = record.get("resolved")
         if not isinstance(resolved, dict):
             raise BackendEvidenceError("backend execution resolved evidence is missing")
+        resolved_schema_version = resolved.get("schema_version")
+        if type(resolved_schema_version) is not int:
+            raise BackendEvidenceError(
+                "persisted resolved record has an unsupported schema"
+            )
         expected_argv = list(getattr(prepared, "argv"))
         if resolved.get("argv") != expected_argv:
             raise BackendEvidenceError(
                 "persisted resolved argv does not match the resolved invocation"
             )
         expected_environment = dict(getattr(prepared, "environment"))
-        if resolved.get("environment") != environment_record(expected_environment):
+        if resolved_schema_version in COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS:
+            expected_environment_record: Mapping[str, object] = {
+                "names": sorted(expected_environment),
+                "values": expected_environment,
+            }
+        else:
+            expected_environment_record = environment_record(expected_environment)
+        if resolved.get("environment") != expected_environment_record:
             raise BackendEvidenceError(
                 "persisted resolved environment does not match the resolved invocation"
             )
@@ -1456,6 +1643,13 @@ class GenerationService:
                 f"adapter {self.adapter.adapter_id!r} does not support "
                 f"{operation} requests"
             )
+        if capabilities.operation_reference_roles is not None:
+            expected_roles = capabilities.operation_reference_roles.get(operation)
+            if expected_roles is not None and roles != expected_roles:
+                raise UnsupportedCapabilityError(
+                    f"adapter {self.adapter.adapter_id!r} requires reference "
+                    f"roles {expected_roles!r} for {operation} requests"
+                )
         if source_count and not capabilities.supports_editing:
             raise UnsupportedCapabilityError(
                 f"adapter {self.adapter.adapter_id!r} does not support editing "
@@ -1469,12 +1663,20 @@ class GenerationService:
 
     def _submission_for_job(self, job_id: str) -> SubmissionResult:
         job = self._store.get_job(job_id)
+        resource = self._store.resource_snapshot()
+        owned = resource.get("job_id") == job_id
         return SubmissionResult(
             request_id=job.request_id,
             job_id=job.job_id,
             status=job.execution_status or job.status,
             output_slot_id=job.output_slot_id,
             artifact_id=job.artifact_id,
+            resource_state=str(resource["state"]) if owned else "available",
+            resource_reason=(
+                None
+                if not owned or resource.get("reason") is None
+                else str(resource["reason"])
+            ),
         )
 
 

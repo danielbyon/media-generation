@@ -122,16 +122,37 @@ persisted attempt budget remains. The default budget is one total attempt. A
 worker restart does not reset it. Unknown outcomes are quarantined and never
 replayed automatically; retry keeps the request, job, output slot, and budget.
 
-Termination proof is accepted from one of two authorities: a containment
-contract declared directly by the adapter, or validated observation produced by
-the application-owned process supervisor showing that the direct child was
-reaped and its exit status was recorded. An adapter identity, inherited class
-behavior, successful return, elapsed time, or a descendant process exiting does
-not establish that the backend process stopped. A valid artifact produced
-without trusted proof remains committed and inspectable, but its attempt
-records `termination_proven=false` and the resource stays quarantined. A
-noncanceled failure without proof reports the durable job as `ambiguous`,
-retains its underlying failure classification, and cannot authorize replay.
+`execution_attempts.termination_proven` records whether trusted evidence
+satisfies the adapter's resource-release policy. The application-owned
+supervisor records its direct-child observation separately in
+`backend_executions.observed`: `direct_child_reaped` reports whether the direct
+child exited and was reaped, while `process_tree_containment` reports whether
+containment of descendants was proven. The effective launch record retains the
+launch. A containment contract declared by the adapter or a validated
+direct-child observation may satisfy a policy that only requires direct-child
+termination. An adapter identity, inherited class behavior, successful return,
+elapsed time, process-group signalling, an empty process snapshot, or a
+descendant process exiting does not establish that the backend process tree
+stopped.
+
+ComfyUI requires process-tree termination evidence before its heavyweight
+resource can leave quarantine. The current supervisor proves only that the
+direct child exited and was reaped, so a launched ComfyUI attempt records
+`termination_proven=false` and `process_tree_containment=false`. A valid
+artifact may remain committed and its job may report `succeeded` while the
+separate resource state remains `quarantined`.
+
+Execution ambiguity has at least two independent causes: an unreconciled or
+otherwise ambiguous backend acceptance or outcome, which remains ambiguous even
+when `direct_child_reaped=true`; and, for a noncanceled failure, the absence of
+trusted evidence that the direct child terminated and was reaped. Lack of ComfyUI
+process-tree release proof is a separate resource-release condition: it
+quarantines capacity while preserving a known `failed` outcome. A noncanceled
+failure without trusted direct-child termination proof reports the durable job
+as `ambiguous`, retains its underlying failure classification, and cannot
+authorize replay. A successful artifact and job may retain `succeeded` status
+while the resource state remains `quarantined`. A refusal proven to have occurred
+before launch does not create the same quarantine requirement.
 
 The public retry operation may acknowledge an eligible bounded retry while it is already queued. Repeated requests are idempotent and preserve the job, request, output slot, attempt history, and budget while the job remains queued, within budget, and the resource is available. A later worker claim, recovery failure, or another job's resource claim can invalidate a subsequent retry acknowledgement; only a worker claim starts the next attempt. The singleton resource state appears in provenance's execution context with owner IDs where applicable. Individual job snapshots do not imply resource ownership.
 

@@ -18,8 +18,15 @@ from urllib.request import ProxyHandler, build_opener
 import pytest
 
 from media_generation import candidate, cli
+from media_generation._candidate_contract import (
+    CandidateDeclaration,
+    ComponentDeclaration,
+    _parse_component,
+    parse_candidate,
+)
 from media_generation._candidate_evaluation import _Evaluator, evaluate_candidate
 from media_generation.inventory.fingerprint import build_environment_fingerprint
+from test_t09_support import build_comfyui_bundle
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = ROOT / "src"
@@ -164,6 +171,14 @@ PROVENANCE_SCHEMA = "media-generation.candidate-provenance-evidence"
 LICENSE_SCHEMA = "media-generation.candidate-license-evidence"
 CONVERSION_SCHEMA = "media-generation.candidate-conversion-evidence"
 COMPATIBILITY_SCHEMA = "media-generation.candidate-compatibility-evidence"
+COMFYUI_QWEN_POLICY_CLAIM = (
+    "backend-policy:comfyui/"
+    "qwen-image-edit-2511-reference-latent-timestep-zero/v1"
+)
+COMFYUI_QWEN_POLICY_ARTIFACT = (
+    "recipe.compatibility.policy:"
+    "comfyui-qwen-image-edit-2511-reference-latent-timestep-zero"
+)
 
 SYNTHETIC_CONTENTS = {
     "engine.bin": b"synthetic-engine-build",
@@ -999,6 +1014,64 @@ def _trust_compatibility_for_fixture(
     return tuple(selected_records)
 
 
+def _comfyui_qwen_declaration_without_zero_conditioning(
+    tmp_path: Path,
+) -> tuple[Path, tuple[candidate.TrustedEvidence, ...]]:
+    """Build a valid ComfyUI candidate whose identity names Qwen 2511."""
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    flag = "qwen_image_zero_cond_t"
+
+    payload["engine"]["id"] = "comfyui"
+    payload["engine"]["version"] = "synthetic-unqualified-comfyui/v1"
+    payload["engine"]["build"] = "qwen-image-edit-2511"
+    payload["engine"]["architecture_flags"].pop(flag)
+    payload["recipe"]["engine_id"] = "comfyui"
+    payload["recipe"]["engine_version"] = "synthetic-unqualified-comfyui/v1"
+    payload["recipe"]["architecture_flags"].pop(flag)
+    claims = payload["recipe"]["compatibility_evidence"][0]["claims"]
+    claims.remove(f"flag:{flag}")
+    claims.append(COMFYUI_QWEN_POLICY_CLAIM)
+
+    trusted_records = list(_trusted_evidence())
+    for evidence_owner in (payload["engine"]["provenance"], payload["engine"]["license"]):
+        evidence_path = tmp_path / "files" / evidence_owner["evidence"]["path"]
+        document = _payload(evidence_path)
+        document["subject"]["id"] = "comfyui"
+        pin = _write_json(
+            evidence_path.parent,
+            evidence_path.name,
+            document,
+        )
+        evidence_owner["evidence"] = pin
+        for index, record in enumerate(trusted_records):
+            subject = record.expected.get("subject")
+            if (
+                record.expected.get("schema") != document["schema"]
+                or not isinstance(subject, dict)
+                or subject.get("id") != "synthetic-engine"
+            ):
+                continue
+            expected = dict(record.expected)
+            updated_subject = dict(subject)
+            updated_subject["id"] = "comfyui"
+            expected["subject"] = updated_subject
+            trusted_records[index] = replace(
+                record,
+                document_size_bytes=pin["size_bytes"],
+                document_sha256=pin["sha256"],
+                expected=expected,
+            )
+
+    trusted_evidence = _trust_compatibility_for_fixture(
+        tmp_path,
+        payload,
+        records=tuple(trusted_records),
+    )
+    _rewrite(declaration, payload)
+    return declaration, trusted_evidence
+
+
 def _mixed_adapter_lora_fixture(
     tmp_path: Path,
 ) -> tuple[Path, tuple[candidate.TrustedEvidence, ...]]:
@@ -1451,6 +1524,390 @@ def test_qwen_2511_policy_requires_exact_pinned_compatibility(tmp_path: Path) ->
     ] == "qwen_2511_zero_conditioning_enabled"
     assert items["recipe.compatibility.evidence[0]"]["code"] == (
         "evidence_contract_mismatch"
+    )
+
+
+def test_sd_cpp_qwen_policy_cannot_be_bypassed_by_comfyui_self_declaration(
+    tmp_path: Path,
+) -> None:
+    from media_generation._candidate_evaluation import (
+        _requires_sd_cpp_qwen_zero_conditioning,
+    )
+
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    payload["engine"]["build"] = "qwen-image-edit-2511"
+    payload["engine"]["architecture_flags"]["comfyui_api_contract"] = "v1"
+    payload["recipe"]["pipeline_version"] = "qwen-image-edit-2511@1.0"
+    payload["recipe"]["architecture_flags"]["comfyui_api_contract"] = "v1"
+    _rewrite(declaration, payload)
+
+    parsed = candidate.parse_candidate(declaration)
+
+    assert _requires_sd_cpp_qwen_zero_conditioning(parsed) is True
+    assert (
+        _requires_sd_cpp_qwen_zero_conditioning(
+            parsed,
+            selected_backend_kind="comfyui-local-http",
+        )
+        is True
+    )
+
+
+def test_inspect_candidate_scopes_zero_conditioning_to_sd_cpp(
+    tmp_path: Path,
+) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+    policy_artifact = (
+        "recipe.compatibility.policy:qwen-image-edit-2511-zero-conditioning"
+    )
+
+    report = candidate.inspect_candidate(
+        declaration,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind="comfyui-local-http",
+    )
+
+    assert report["status"] == "ready"
+    assert policy_artifact not in _items(report)
+
+
+def test_comfyui_qwen_policy_claim_is_required(tmp_path: Path) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+    payload = _payload(declaration)
+    payload["recipe"]["compatibility_evidence"][0]["claims"].remove(
+        COMFYUI_QWEN_POLICY_CLAIM
+    )
+    trusted_evidence = _trust_compatibility_for_fixture(
+        tmp_path,
+        payload,
+        records=trusted_evidence,
+    )
+    _rewrite(declaration, payload)
+
+    report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind="comfyui-local-http",
+    )
+
+    assert report["status"] == "unverified"
+    assert _items(report)["recipe.compatibility.evidence"]["code"] == (
+        "compatibility_evidence_incomplete"
+    )
+    assert _items(report)[COMFYUI_QWEN_POLICY_ARTIFACT]["code"] == (
+        "comfyui_conditioning_policy_claim_missing"
+    )
+
+
+def test_comfyui_qwen_policy_claim_must_match_trusted_evidence(
+    tmp_path: Path,
+) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+    mismatched = list(trusted_evidence)
+    for index, record in enumerate(mismatched):
+        if record.expected.get("schema") != COMPATIBILITY_SCHEMA:
+            continue
+        expected = dict(record.expected)
+        claims = list(expected["claims"])  # type: ignore[arg-type]
+        claims[claims.index(COMFYUI_QWEN_POLICY_CLAIM)] = (
+            "backend-policy:comfyui/"
+            "qwen-image-edit-2511-reference-latent-timestep-zero/v2"
+        )
+        expected["claims"] = claims
+        mismatched[index] = replace(record, expected=expected)
+        break
+    else:
+        raise AssertionError("fixture omitted trusted compatibility evidence")
+
+    report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=tuple(mismatched),
+        selected_backend_kind="comfyui-local-http",
+    )
+
+    assert report["status"] == "unverified"
+    assert _items(report)["recipe.compatibility.evidence[0]"]["code"] == (
+        "evidence_authority_mismatch"
+    )
+    assert _items(report)[COMFYUI_QWEN_POLICY_ARTIFACT]["code"] == (
+        "comfyui_conditioning_policy_evidence_untrusted"
+    )
+
+
+def test_comfyui_qwen_policy_claim_requires_independent_authority(
+    tmp_path: Path,
+) -> None:
+    declaration, _ = _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+
+    report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=(),
+        selected_backend_kind="comfyui-local-http",
+    )
+
+    assert report["status"] == "unverified"
+    assert _items(report)["recipe.compatibility.evidence[0]"]["code"] == (
+        "evidence_authority_unavailable"
+    )
+    assert _items(report)[COMFYUI_QWEN_POLICY_ARTIFACT]["code"] == (
+        "comfyui_conditioning_policy_evidence_untrusted"
+    )
+
+
+def test_comfyui_qwen_policy_trust_binds_exact_recipe_digest(
+    tmp_path: Path,
+) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+    payload = _payload(declaration)
+    recipe_pin = _write_json(
+        tmp_path / "files",
+        "recipe.json",
+        {"steps": 2, "sampler": "changed"},
+    )
+    payload["recipe"]["document"] = recipe_pin
+    compatibility = payload["recipe"]["compatibility_evidence"][0]
+    refreshed_document = _compatibility_document(
+        payload["engine"],
+        payload["recipe"],
+        payload["components"],
+        payload["adapters"],
+        compatibility["claims"],
+    )
+    compatibility_path = (
+        tmp_path / "files" / compatibility["document"]["path"]
+    )
+    compatibility["document"] = _write_json(
+        compatibility_path.parent,
+        compatibility_path.name,
+        refreshed_document,
+    )
+    _rewrite(declaration, payload)
+
+    report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind="comfyui-local-http",
+    )
+
+    assert report["status"] == "unverified"
+    assert _items(report)["recipe.compatibility.evidence[0]"]["code"] == (
+        "evidence_authority_unavailable"
+    )
+    assert _items(report)[COMFYUI_QWEN_POLICY_ARTIFACT]["code"] == (
+        "comfyui_conditioning_policy_evidence_untrusted"
+    )
+
+
+def test_unknown_selected_backend_fails_closed(tmp_path: Path) -> None:
+    declaration = _fixture(tmp_path)
+
+    with pytest.raises(
+        candidate.CandidateValidationError,
+        match="selected backend kind",
+    ):
+        candidate.verify_candidate(
+            declaration,
+            trusted_evidence=_trusted_evidence(),
+            selected_backend_kind="unknown-backend",
+        )
+
+
+def test_verify_candidate_keeps_zero_conditioning_for_sd_cpp(
+    tmp_path: Path,
+) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+
+    report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=trusted_evidence,
+    )
+
+    item = _items(report)[
+        "recipe.compatibility.policy:qwen-image-edit-2511-zero-conditioning"
+    ]
+    assert report["status"] == "incompatible"
+    assert item["status"] == "incompatible"
+    assert item["code"] == "qwen_2511_zero_conditioning_required"
+
+
+def test_prepare_candidate_selects_trusted_comfyui_recipe_v2_policy(
+    tmp_path: Path,
+) -> None:
+    bundle = build_comfyui_bundle(tmp_path, profile_version=2)
+    trusted_evidence = candidate.parse_trusted_evidence(bundle.trusted_evidence_path)
+
+    report = candidate.prepare_candidate(
+        bundle.declaration_path,
+        manifest_output=tmp_path / "prepared.json",
+        journal_output=tmp_path / "journal.json",
+        trusted_evidence_path=bundle.trusted_evidence_path,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind="comfyui-local-http",
+    )
+
+    assert report["status"] == "ready"
+    assert _items(report)[COMFYUI_QWEN_POLICY_ARTIFACT]["code"] == (
+        "comfyui_conditioning_policy_trusted"
+    )
+
+
+@pytest.mark.parametrize("flag_state", ("missing", "false"))
+def test_prepare_candidate_keeps_sd_cpp_qwen_flag_requirement(
+    tmp_path: Path,
+    flag_state: str,
+) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+    if flag_state == "false":
+        payload = _payload(declaration)
+        flag = "qwen_image_zero_cond_t"
+        payload["engine"]["architecture_flags"][flag] = False
+        payload["recipe"]["architecture_flags"][flag] = False
+        payload["recipe"]["compatibility_evidence"][0]["claims"].append(
+            f"flag:{flag}"
+        )
+        trusted_evidence = _trust_compatibility_for_fixture(
+            tmp_path,
+            payload,
+            records=trusted_evidence,
+        )
+        _rewrite(declaration, payload)
+
+    report = candidate.prepare_candidate(
+        declaration,
+        manifest_output=tmp_path / f"{flag_state}-prepared.json",
+        journal_output=tmp_path / f"{flag_state}-journal.json",
+        trusted_evidence=trusted_evidence,
+    )
+
+    item = _items(report)[
+        "recipe.compatibility.policy:qwen-image-edit-2511-zero-conditioning"
+    ]
+    assert report["status"] == "incompatible"
+    assert item["code"] == "qwen_2511_zero_conditioning_required"
+
+
+def test_prepare_candidate_rejects_unknown_selected_backend(
+    tmp_path: Path,
+) -> None:
+    declaration = _fixture(tmp_path)
+
+    with pytest.raises(
+        candidate.CandidateValidationError,
+        match="selected backend kind",
+    ):
+        candidate.prepare_candidate(
+            declaration,
+            manifest_output=tmp_path / "prepared.json",
+            journal_output=tmp_path / "journal.json",
+            trusted_evidence=_trusted_evidence(),
+            selected_backend_kind="unknown-backend",
+        )
+
+
+def test_candidate_cli_reports_engine_specific_zero_conditioning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    declaration, trusted_evidence = (
+        _comfyui_qwen_declaration_without_zero_conditioning(tmp_path)
+    )
+    trusted_evidence_path = _write_trusted_evidence(tmp_path, trusted_evidence)
+    policy_artifact = (
+        "recipe.compatibility.policy:qwen-image-edit-2511-zero-conditioning"
+    )
+
+    comfyui_exit = cli.main(
+        [
+            "candidate",
+            "inspect",
+            "--declaration",
+            str(declaration),
+            "--trusted-evidence",
+            str(trusted_evidence_path),
+            "--engine-backend",
+            "comfyui",
+        ]
+    )
+    comfyui_capture = capsys.readouterr()
+    comfyui_report = json.loads(comfyui_capture.out)
+
+    assert comfyui_exit == 0
+    assert comfyui_capture.err == ""
+    assert comfyui_report["status"] == "ready"
+    assert policy_artifact not in _items(comfyui_report)
+
+    verify_exit = cli.main(
+        [
+            "candidate",
+            "verify",
+            "--declaration",
+            str(declaration),
+            "--trusted-evidence",
+            str(trusted_evidence_path),
+            "--engine-backend",
+            "comfyui",
+        ]
+    )
+    verify_capture = capsys.readouterr()
+    verify_report = json.loads(verify_capture.out)
+
+    assert verify_exit == 0
+    assert verify_capture.err == ""
+    assert verify_report["status"] == "ready"
+
+    stable_exit = cli.main(
+        [
+            "candidate",
+            "verify",
+            "--declaration",
+            str(declaration),
+            "--trusted-evidence",
+            str(trusted_evidence_path),
+            "--engine-backend",
+            "stable-diffusion-cpp",
+        ]
+    )
+    stable_capture = capsys.readouterr()
+    stable_report = json.loads(stable_capture.out)
+
+    assert stable_exit == 3
+    assert stable_capture.err == ""
+    assert stable_report["status"] == "incompatible"
+    assert _items(stable_report)[policy_artifact]["code"] == (
+        "qwen_2511_zero_conditioning_required"
+    )
+
+    legacy_exit = cli.main(
+        [
+            "candidate",
+            "verify",
+            "--declaration",
+            str(declaration),
+            "--trusted-evidence",
+            str(trusted_evidence_path),
+        ]
+    )
+    legacy_capture = capsys.readouterr()
+    legacy_report = json.loads(legacy_capture.out)
+
+    assert legacy_exit == 3
+    assert legacy_capture.err == ""
+    assert legacy_report["status"] == "incompatible"
+    assert _items(legacy_report)[policy_artifact]["code"] == (
+        "qwen_2511_zero_conditioning_required"
     )
 
 
@@ -5540,6 +5997,162 @@ def test_unknown_component_format_is_rejected_before_readiness(
         candidate.verify_candidate(declaration)
 
 
+def _other_role_fixture(
+    tmp_path: Path,
+    *,
+    precision: str,
+    quantization: str,
+) -> tuple[Path, tuple[candidate.TrustedEvidence, ...]]:
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    files = tmp_path / "files"
+    archive = b"synthetic source archive"
+    (files / "node-implementations.zip").write_bytes(archive)
+
+    component = next(
+        item for item in payload["components"] if item["role"] == "tokenizer"
+    )
+    component["id"] = "node_implementations"
+    component["role"] = "other"
+    component["artifact"] = {
+        "root": "files",
+        "path": "node-implementations.zip",
+        "size_bytes": len(archive),
+        "sha256": _sha256(archive),
+    }
+    component["precision"] = precision
+    component["quantization"] = quantization
+
+    recipe = payload["recipe"]
+    required_roles = recipe["required_component_roles"]
+    required_roles[required_roles.index("tokenizer")] = "other"
+    claims = recipe["compatibility_evidence"][0]["claims"]
+    claims[claims.index("role:tokenizer")] = "role:other"
+    trusted_evidence = _trust_compatibility_for_fixture(tmp_path, payload)
+    _rewrite(declaration, payload)
+    return declaration, trusted_evidence
+
+
+@pytest.mark.parametrize(
+    ("precision", "field", "changed_value"),
+    (
+        ("not-applicable", "precision", "fp16"),
+        ("fp16", "quantization", "int8"),
+    ),
+)
+def test_other_component_metrics_remain_bound_to_identity_and_compatibility(
+    tmp_path: Path,
+    precision: str,
+    field: str,
+    changed_value: str,
+) -> None:
+    declaration, trusted_evidence = _other_role_fixture(
+        tmp_path,
+        precision=precision,
+        quantization="none",
+    )
+    original = candidate.parse_candidate(declaration)
+    component = original.component_index["node_implementations"]
+    assert component.identity()["precision"] == precision
+    assert component.identity()["quantization"] == "none"
+
+    compatibility = _payload(tmp_path / "files" / "compatibility.json")
+    compatible_component = next(
+        item
+        for item in compatibility["components"]
+        if item["id"] == "node_implementations"
+    )
+    assert compatible_component["precision"] == precision
+    assert compatible_component["quantization"] == "none"
+    required_role = next(
+        item for item in compatibility["required_roles"] if item["role"] == "other"
+    )
+    assert required_role["components"][0]["precision"] == precision
+    assert required_role["components"][0]["quantization"] == "none"
+
+    original_report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=trusted_evidence,
+    )
+    assert _items(original_report)["recipe.compatibility.evidence[0]"]["status"] == (
+        "ready"
+    )
+
+    payload = _payload(declaration)
+    payload["components"][-1][field] = changed_value
+    _rewrite(declaration, payload)
+    changed = candidate.parse_candidate(declaration)
+    assert changed.stable_candidate_id() != original.stable_candidate_id()
+
+    changed_report = candidate.verify_candidate(
+        declaration,
+        trusted_evidence=trusted_evidence,
+    )
+    assert _items(changed_report)["recipe.compatibility.evidence[0]"]["code"] == (
+        "evidence_contract_mismatch"
+    )
+
+
+@pytest.mark.parametrize(
+    "role",
+    (
+        "checkpoint",
+        "diffusion_model",
+        "text_encoder",
+        "vision_encoder",
+        "tokenizer",
+        "processor",
+        "vae",
+        "lora",
+        "adapter",
+        "controlnet",
+        "projector",
+    ),
+)
+def test_not_applicable_precision_is_rejected_for_non_other_roles(
+    tmp_path: Path,
+    role: str,
+) -> None:
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    payload["components"][0]["role"] = role
+    payload["components"][0]["precision"] = "not-applicable"
+    payload["components"][0]["quantization"] = "none"
+    _rewrite(declaration, payload)
+
+    with pytest.raises(candidate.CandidateValidationError, match="precision"):
+        candidate.parse_candidate(declaration)
+
+
+@pytest.mark.parametrize(
+    "precision",
+    ("unknown", "", "default", "auto", "unverified", "n/a", "none"),
+)
+def test_other_role_still_rejects_unsupported_precision_values(
+    tmp_path: Path,
+    precision: str,
+) -> None:
+    declaration, _ = _other_role_fixture(
+        tmp_path,
+        precision=precision,
+        quantization="none",
+    )
+
+    with pytest.raises(candidate.CandidateValidationError, match="precision"):
+        candidate.parse_candidate(declaration)
+
+
+def test_not_applicable_precision_requires_no_quantization(tmp_path: Path) -> None:
+    declaration, _ = _other_role_fixture(
+        tmp_path,
+        precision="not-applicable",
+        quantization="int8",
+    )
+
+    with pytest.raises(candidate.CandidateValidationError, match="quantization"):
+        candidate.parse_candidate(declaration)
+
+
 @pytest.mark.parametrize("field", ("precision", "quantization"))
 def test_absent_component_format_is_rejected_before_readiness(
     tmp_path: Path,
@@ -7418,3 +8031,165 @@ def test_lora_configuration_is_bound_to_identity_manifest_and_trusted_evidence(
 
     assert reverified["status"] == "ready"
     assert reverified["candidate_id"] != stale["candidate_id"]
+
+
+def _parsed_test_component(
+    tmp_path: Path,
+    *,
+    role: str,
+    precision: str,
+    quantization: str,
+) -> tuple[Path, CandidateDeclaration, dict[str, object], ComponentDeclaration]:
+    """Parse role metrics using existing fixture files and evidence pins.
+
+    The ``other`` case uses the complete role-specific declaration fixture. The
+    numerical-role cases clone an existing component because this helper tests
+    only ``_parse_component`` and does not inspect the component's evidence
+    document contents.
+    """
+    if role == "other":
+        declaration, _ = _other_role_fixture(
+            tmp_path,
+            precision=precision,
+            quantization=quantization,
+        )
+        parsed_candidate = candidate.parse_candidate(declaration)
+        component_data = next(
+            item
+            for item in _payload(declaration)["components"]
+            if item["role"] == "other"
+        )
+        component = parsed_candidate.component_index["node_implementations"]
+        return declaration, parsed_candidate, component_data, component
+
+    declaration = _fixture(tmp_path)
+    parsed_candidate = parse_candidate(declaration)
+    component_data = dict(_payload(declaration)["components"][0])
+    component_data["role"] = role
+    component_data["precision"] = precision
+    component_data["quantization"] = quantization
+    component = _parse_component(
+        component_data,
+        index=0,
+        root_ids=frozenset(root.id for root in parsed_candidate.roots),
+    )
+    return declaration, parsed_candidate, component_data, component
+
+
+def test_other_component_accepts_not_applicable_precision_with_no_quantization(
+    tmp_path: Path,
+) -> None:
+    _, _, _, component = _parsed_test_component(
+        tmp_path,
+        role="other",
+        precision="not-applicable",
+        quantization="none",
+    )
+
+    assert component.precision == "not-applicable"
+    assert component.quantization == "none"
+
+
+@pytest.mark.parametrize(
+    "role",
+    ("diffusion_model", "text_encoder", "vae", "adapter", "lora"),
+)
+def test_model_roles_reject_not_applicable_precision(
+    tmp_path: Path,
+    role: str,
+) -> None:
+    with pytest.raises(candidate.CandidateValidationError, match="precision"):
+        _parsed_test_component(
+            tmp_path,
+            role=role,
+            precision="not-applicable",
+            quantization="none",
+        )
+
+
+def test_other_component_requires_no_quantization_for_not_applicable_precision(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(candidate.CandidateValidationError, match="precision"):
+        _parsed_test_component(
+            tmp_path,
+            role="other",
+            precision="not-applicable",
+            quantization="int8",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("precision", "unknown"),
+        ("precision", ""),
+        ("precision", "default"),
+        ("precision", "not available"),
+        ("quantization", "unknown"),
+        ("quantization", ""),
+        ("quantization", "default"),
+        ("quantization", "not available"),
+    ),
+)
+def test_other_component_still_rejects_placeholder_metrics(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    metrics = {"precision": "bf16", "quantization": "none"}
+    metrics[field] = value
+
+    with pytest.raises(candidate.CandidateValidationError, match=field):
+        _parsed_test_component(tmp_path, role="other", **metrics)
+
+
+def test_other_component_metrics_remain_in_identity_and_compatibility_evidence(
+    tmp_path: Path,
+) -> None:
+    _, base, _, component = _parsed_test_component(
+        tmp_path,
+        role="other",
+        precision="not-applicable",
+        quantization="none",
+    )
+    initial_id = base.stable_candidate_id()
+    identity_component = component.identity()
+    assert identity_component["precision"] == "not-applicable"
+    assert identity_component["quantization"] == "none"
+
+    precision_changed = replace(component, precision="bf16")
+    precision_changed_id = replace(
+        base,
+        components=tuple(
+            precision_changed if item.id == component.id else item
+            for item in base.components
+        ),
+    ).stable_candidate_id()
+    assert precision_changed_id != initial_id
+
+    quantization_changed = replace(precision_changed, quantization="int8")
+    quantization_changed_id = replace(
+        base,
+        components=tuple(
+            quantization_changed if item.id == component.id else item
+            for item in base.components
+        ),
+    ).stable_candidate_id()
+    assert quantization_changed_id != precision_changed_id
+
+    compatibility_pin = base.recipe.evidence[0].document
+    compatibility = json.loads(
+        compatibility_pin.resolved_path(base.root_index).read_bytes()
+    )
+    evidence_component = next(
+        item for item in compatibility["components"] if item["id"] == component.id
+    )
+    required_role = next(
+        item for item in compatibility["required_roles"] if item["role"] == "other"
+    )
+    required_component = required_role["components"][0]
+    assert evidence_component["precision"] == "not-applicable"
+    assert evidence_component["quantization"] == "none"
+    assert required_component["precision"] == "not-applicable"
+    assert required_component["quantization"] == "none"

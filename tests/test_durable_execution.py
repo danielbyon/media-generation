@@ -578,18 +578,19 @@ def test_cancel_after_publication_commit_is_too_late(tmp_path: Path, checkpoint:
 def test_expired_lease_does_not_reclaim_a_live_process(tmp_path: Path) -> None:
     entered, resume = threading.Event(), threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = DeterministicCpuAdapter()
 
-        def generate(self, plan, stream):
-            entered.set()
-            assert resume.wait(10)
-            return super().generate(plan, stream)
+    def generate(plan, stream):
+        entered.set()
+        assert resume.wait(10)
+        return DeterministicCpuAdapter.generate(adapter, plan, stream)
+
+    adapter.generate = generate
 
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     service = service_at(
-        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+        tmp_path, adapter=adapter, admission_profile=admission_profile
     )
     job = service.enqueue(
         "lease", request(), max_attempts=3, workload_demand=demand
@@ -836,19 +837,22 @@ def test_queued_job_does_not_report_another_jobs_resource_state(tmp_path: Path) 
     entered = threading.Event()
     release = threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        def generate(
-            self, plan: GenerationPlan, destination: BinaryIO
-        ) -> tuple[str, int, int]:
-            entered.set()
-            if not release.wait(timeout=10):
-                raise RuntimeError("paused adapter was not released")
-            return super().generate(plan, destination)
+    adapter = DeterministicCpuAdapter()
+
+    def generate(
+        plan: GenerationPlan, destination: BinaryIO
+    ) -> tuple[str, int, int]:
+        entered.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError("paused adapter was not released")
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = generate
 
     admission_profile = _heavyweight_profile()
     demand = _heavyweight_demand()
     service = service_at(
-        tmp_path, adapter=PausedAdapter(), admission_profile=admission_profile
+        tmp_path, adapter=adapter, admission_profile=admission_profile
     )
     owner = service.enqueue(
         "resource-owner", request("resource owner"), workload_demand=demand
@@ -966,8 +970,142 @@ def test_worker_report_preserves_each_claim_outcome_after_retry_success(tmp_path
     assert report["processed"] == 2
     assert [item["status"] for item in report["outcomes"]] == ["failed", "succeeded"]
     assert [item["execution_status"] for item in report["outcomes"]] == ["queued", "succeeded"]
+    attempts = service.get_provenance(job.job_id)["attempts"]
+    assert [item["termination_proven"] for item in attempts] == [True, True]
     assert all(item["job_id"] == job.job_id for item in report["outcomes"])
     assert len({item["attempt_id"] for item in report["outcomes"]}) == 2
+
+
+def test_submit_cli_accepts_same_job_running_with_claimed_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A reused active job is explicit progress, not a completed result."""
+    from media_generation import cli
+
+    entered = threading.Event()
+    release = threading.Event()
+    adapter = cpu_adapter()
+
+    def generate(plan: GenerationPlan, destination: BinaryIO):
+        entered.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError("paused adapter was not released")
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = generate
+    profile = _heavyweight_profile()
+    demand = _heavyweight_demand()
+    running_service = service_at(
+        tmp_path, adapter=adapter, admission_profile=profile
+    )
+    submit_service = service_at(
+        tmp_path, adapter=adapter, admission_profile=profile
+    )
+    monkeypatch.setattr(cli, "GenerationService", lambda *args, **kwargs: submit_service)
+    monkeypatch.setattr(cli, "_admission_inputs", lambda _options: (profile, demand))
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        running = executor.submit(
+            running_service.submit,
+            "cli-running-submit",
+            request(),
+            workload_demand=demand,
+        )
+        assert entered.wait(timeout=10)
+        try:
+            exit_code = cli.main(
+                [
+                    "submit",
+                    "--db",
+                    str(tmp_path / "studio.sqlite3"),
+                    "--output-dir",
+                    str(tmp_path / "images"),
+                    "--idempotency-key",
+                    "cli-running-submit",
+                    "--request-json",
+                    json.dumps(request().to_dict()),
+                ]
+            )
+            report = json.loads(capsys.readouterr().out)
+            assert exit_code == 0
+            assert report["status"] == "running"
+            assert report["artifact_id"] is None
+            assert report["resource_state"] == "claimed"
+        finally:
+            release.set()
+        assert running.result(timeout=10).status == "succeeded"
+
+
+def test_work_requires_processed_claim_release_for_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreleased claim owned by this invocation cannot report complete."""
+    service = service_at(tmp_path)
+    job = service.enqueue("unreleased-claim", request())
+    monkeypatch.setattr(service, "_execute_claim", lambda _claim: None)
+
+    report = service.work()
+
+    assert report["status"] == "attention_required"
+    assert report["processed"] == 1
+    assert report["resource_state"] == "claimed"
+    assert report["resource_reason"] == "processed execution claim remains unreleased"
+    assert report["outcomes"][0]["resource_state"] == "claimed"
+    assert service.get_provenance(job.job_id)["status"] == "running"
+
+
+def test_work_does_not_attribute_an_unrelated_claimed_resource(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another claim remains busy without contaminating processed outcomes."""
+    service = service_at(tmp_path)
+    job = service.enqueue("processed-before-contention", request())
+    other = service.enqueue("unrelated-contention", request("another job"))
+    execute = service._execute_claim
+
+    def execute_then_install_unrelated_claim(claim):
+        result = execute(claim)
+        with sqlite3.connect(tmp_path / "studio.sqlite3") as connection:
+            connection.execute(
+                """UPDATE execution_resource
+                   SET state = 'claimed', job_id = ?, attempt_id = ?,
+                       owner_id = ?, reason = 'unrelated invocation owns capacity'
+                   WHERE id = 1""",
+                (other.job_id, "att_unrelated", "worker_unrelated"),
+            )
+        return result
+
+    monkeypatch.setattr(service, "_execute_claim", execute_then_install_unrelated_claim)
+
+    report = service.work()
+
+    assert report["status"] == "resource_busy"
+    assert report["processed"] == 1
+    assert report["resource_state"] == "claimed"
+    assert report["resource_reason"] == "unrelated invocation owns capacity"
+    assert report["outcomes"][0]["job_id"] == job.job_id
+    assert "resource_state" not in report["outcomes"][0]
+    assert "resource_reason" not in report["outcomes"][0]
+
+
+def test_work_reports_complete_after_processed_claim_release(tmp_path: Path) -> None:
+    """Normal claim finalization releases capacity and completes the worker."""
+    service = service_at(tmp_path)
+    job = service.enqueue("released-claim", request())
+
+    report = service.work()
+
+    assert report["status"] == "complete"
+    assert report["processed"] == 1
+    assert report["outcomes"][0]["status"] == "succeeded"
+    assert "resource_state" not in report["outcomes"][0]
+    assert "resource_reason" not in report["outcomes"][0]
+    assert service._store.resource_snapshot()["state"] == "available"
+    assert service.get_provenance(job.job_id)["status"] == "succeeded"
 
 
 @pytest.mark.parametrize("mode", ("success", "failed", "retry", "external", "canceled"))
@@ -1033,7 +1171,10 @@ def test_worker_contention_preserves_already_processed_claim_outcomes(
     )
     monkeypatch.setattr("media_generation.cli.GenerationService", lambda *args, **kwargs: service)
     code = main(["worker", "--db", str(tmp_path / "studio.sqlite3"), "--output-dir", str(tmp_path / "images"), "--limit", "2"])
-    result = json.loads(capsys.readouterr().err)
+    result = json.loads(capsys.readouterr().out)
     assert code == 1
-    assert result["error"]["code"] == "resource_busy"
-    assert result["error"]["outcomes"][0]["job_id"] == job.job_id
+    assert result["status"] == "attention_required"
+    assert result["processed"] == 1
+    assert result["outcomes"][0]["job_id"] == job.job_id
+    assert result["outcomes"][0]["resource_state"] == "quarantined"
+    assert result["outcomes"][0]["resource_reason"]

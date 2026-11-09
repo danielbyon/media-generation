@@ -31,6 +31,7 @@ from .errors import (
     ResourceBusyError,
 )
 from .engine import StableDiffusionCppAdapter
+from .comfyui import COMFYUI_BACKEND_KIND, ComfyUIAdapter
 from .candidate import (
     CandidateAcquisitionError,
     CandidateOutputError,
@@ -115,18 +116,32 @@ def _add_engine_arguments(command: argparse.ArgumentParser) -> None:
         type=Path,
         help="host-owned evidence pins; requires --engine-candidate",
     )
+    command.add_argument(
+        "--engine-backend",
+        choices=("stable-diffusion-cpp", "comfyui"),
+        default="stable-diffusion-cpp",
+        help="explicit backend invoked by --engine-candidate",
+    )
 
 
 def _engine_adapter(
     options: argparse.Namespace, output_directory: Path
-) -> StableDiffusionCppAdapter | None:
+) -> StableDiffusionCppAdapter | ComfyUIAdapter | None:
     """Build the optional engine adapter without falling back on refusal."""
     if options.engine_trusted_evidence is not None and options.engine_candidate is None:
         raise InputValidationError(
             "--engine-trusted-evidence requires --engine-candidate"
         )
     if options.engine_candidate is None:
+        if options.engine_backend == "comfyui":
+            raise InputValidationError("--engine-backend comfyui requires --engine-candidate")
         return None
+    if options.engine_backend == "comfyui":
+        return ComfyUIAdapter(
+            candidate_path=options.engine_candidate,
+            output_directory=output_directory,
+            trusted_evidence_path=options.engine_trusted_evidence,
+        )
     return StableDiffusionCppAdapter(
         candidate_path=options.engine_candidate,
         output_directory=output_directory,
@@ -286,6 +301,12 @@ def build_parser() -> argparse.ArgumentParser:
             type=Path,
             help="separate host-owned pins for candidate evidence documents",
         )
+        command.add_argument(
+            "--engine-backend",
+            choices=("stable-diffusion-cpp", "comfyui"),
+            default="stable-diffusion-cpp",
+            help="engine-specific invocation contract for candidate evaluation",
+        )
         if name == "prepare":
             command.add_argument(
                 "--manifest-output",
@@ -339,7 +360,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 options.idempotency_key, request, workload_demand=demand
             )
             _write_json(result.to_dict(), sys.stdout)
-            return 0
+            return 1 if result.attention_required else 0
 
         if options.command == "enqueue":
             request = _parse_request(options.request_json)
@@ -386,10 +407,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 return _write_error(
                     "resource_busy", "local generation resource is busy", 1,
                     outcomes=report.get("outcomes", []),
+                    resource_state=report.get("resource_state"),
+                    resource_reason=report.get("resource_reason"),
                 )
             _write_json(report, sys.stdout)
-            return int(any(
-                item["status"] != "succeeded" or not item["termination_proven"]
+            return 1 if report["status"] == "attention_required" else int(any(
+                item["status"] != "succeeded"
+                or not item["termination_proven"]
+                or item.get("resource_state") == "quarantined"
                 for item in report.get("outcomes", [])
             ))
 
@@ -529,13 +554,22 @@ def _run_candidate(options: argparse.Namespace) -> int:
         if options.trusted_evidence is None
         else parse_trusted_evidence(options.trusted_evidence)
     )
+    selected_backend_kind = (
+        COMFYUI_BACKEND_KIND
+        if options.engine_backend == "comfyui"
+        else None
+    )
     if options.candidate_command == "inspect":
         report = inspect_candidate(
-            options.declaration, trusted_evidence=trusted_evidence
+            options.declaration,
+            trusted_evidence=trusted_evidence,
+            selected_backend_kind=selected_backend_kind,
         )
     elif options.candidate_command == "verify":
         report = verify_candidate(
-            options.declaration, trusted_evidence=trusted_evidence
+            options.declaration,
+            trusted_evidence=trusted_evidence,
+            selected_backend_kind=selected_backend_kind,
         )
     else:
         report = prepare_candidate(
@@ -546,6 +580,7 @@ def _run_candidate(options: argparse.Namespace) -> int:
             acquisition_config=options.acquisition_config,
             trusted_evidence_path=options.trusted_evidence,
             trusted_evidence=trusted_evidence,
+            selected_backend_kind=selected_backend_kind,
         )
     _write_json(report, sys.stdout)
     return candidate_exit_code(str(report["status"]))
@@ -565,6 +600,7 @@ def _parse_request(source: str) -> GenerationRequest:
         "reference_ids",
         "reference_roles",
         "output_slot",
+        "operation",
     }
     unknown_fields = sorted(set(payload) - allowed_fields)
     if unknown_fields:

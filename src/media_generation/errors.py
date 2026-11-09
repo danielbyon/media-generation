@@ -140,3 +140,7 @@ class BackendEvidenceError(GenerationError):
     process termination or evidence persistence cannot be proven must never
     release the singleton heavyweight resource.
     """
+
+
+class AmbiguousBackendOutcome(BackendEvidenceError):
+    """A backend accepted or may have accepted work whose outcome is unknown."""

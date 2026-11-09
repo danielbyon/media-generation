@@ -789,6 +789,31 @@ def test_unknown_invocation_setting_stays_unverified(tmp_path: Path) -> None:
     assert settings["telemetry"] is None
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("random", False),
+        ("0", False),
+        ("0001", False),
+        ("4294967295", False),
+        ("", None),
+        ("Random", None),
+        ("-1", None),
+        ("4294967296", None),
+        ("1.5", None),
+        ("١", None),
+    ],
+)
+def test_python_hash_seed_value_controls_privacy_confidence(
+    value: str, expected: bool | None
+) -> None:
+    settings = invocation_privacy_settings(
+        ["engine"], {"PYTHONHASHSEED": value}
+    )
+
+    assert set(settings.values()) == {expected}
+
+
 def test_unverified_invocation_control_blocks_before_spawn(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1124,8 +1149,20 @@ def test_reference_roles_reject_malformed_values() -> None:
             width=64,
             height=64,
             reference_ids=("art_reference",),
-            reference_roles=(1,),  # type: ignore[arg-type]
-        )
+        reference_roles=(1,),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize("operation", [["generate"], {"intent": "generate"}])
+def test_cli_non_string_operation_is_rejected_as_input_validation(
+    operation: object,
+) -> None:
+    request = json.dumps({"prompt": "a red cube", "operation": operation})
+
+    with pytest.raises(
+        InputValidationError, match="operation must be generate or edit"
+    ):
+        cli._parse_request(request)
 
 
 def test_request_digest_omits_all_reference_roles_and_binds_source() -> None:
@@ -1146,6 +1183,36 @@ def test_request_digest_omits_all_reference_roles_and_binds_source() -> None:
     assert source.digest() == GenerationRequest(
         "same prompt", reference_ids=(identifier,), reference_roles=("source",)
     ).digest()
+
+
+def test_explicit_edit_request_requires_exactly_one_source_image() -> None:
+    with pytest.raises(
+        InputValidationError, match="edit requests require exactly one source image"
+    ):
+        GenerationRequest("edit this image", operation="edit")
+
+
+def test_explicit_edit_intent_preserves_the_existing_source_request_digest() -> None:
+    identifier = "art_" + "1" * 32
+    implicit_edit = GenerationRequest(
+        "same prompt", reference_ids=(identifier,), reference_roles=("source",)
+    )
+    explicit_edit = GenerationRequest(
+        "same prompt",
+        reference_ids=(identifier,),
+        reference_roles=("source",),
+        operation="edit",
+    )
+
+    assert explicit_edit.digest() == implicit_edit.digest()
+    assert "operation" not in explicit_edit.to_dict()
+
+
+def test_cli_edit_intent_without_source_is_rejected_as_input_validation() -> None:
+    with pytest.raises(
+        InputValidationError, match="edit requests require exactly one source image"
+    ):
+        cli._parse_request('{"prompt":"edit this image","operation":"edit"}')
 
 
 def test_engine_cli_is_opt_in_and_execution_command_returns_records(

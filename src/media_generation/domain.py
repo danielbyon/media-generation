@@ -51,6 +51,7 @@ class GenerationRequest:
     reference_ids: tuple[str, ...] = ()
     reference_roles: tuple[str, ...] = ()
     output_slot: str = "primary"
+    operation: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.prompt, str):
@@ -107,6 +108,15 @@ class GenerationRequest:
             raise InputValidationError(
                 "output_slot must be 1-64 ASCII letters, numbers, dots, underscores, or hyphens"
             )
+
+        if self.operation is not None and not isinstance(self.operation, str):
+            raise InputValidationError("operation must be generate or edit")
+        if self.operation not in {None, "generate", "edit"}:
+            raise InputValidationError("operation must be generate or edit")
+        if self.operation == "edit" and roles != ("source",):
+            raise InputValidationError("edit requests require exactly one source image")
+        if self.operation == "generate" and "source" in roles:
+            raise InputValidationError("generate requests cannot include a source image")
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable, JSON-compatible representation used for hashing."""

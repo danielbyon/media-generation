@@ -265,6 +265,14 @@ def _all_declared_pins(declaration: CandidateDeclaration) -> tuple[ArtifactPin, 
         declaration.engine.license.evidence,
         declaration.recipe.document,
     ]
+    if declaration.engine.launch is not None:
+        pins.extend(
+            (
+                declaration.engine.launch.interpreter,
+                declaration.engine.launch.provenance.evidence,
+                declaration.engine.launch.license.evidence,
+            )
+        )
     for evidence in declaration.recipe.evidence:
         pins.append(evidence.document)
     for component in declaration.components:
@@ -2061,7 +2069,7 @@ def _acquire_source(
                 pin=pin,
                 root=declaration.root_index[pin.root],
                 config=config,
-                executable=source.artifact == "engine",
+                executable=declaration.requires_executable(source.artifact),
                 budget=budget,
             deadline=deadline,
             )
@@ -2145,6 +2153,7 @@ def prepare_candidate(
     acquisition_config: Path | None = None,
     trusted_evidence_path: Path | None = None,
     trusted_evidence: Iterable[TrustedEvidence] = (),
+    selected_backend_kind: str | None = None,
 ) -> dict[str, object]:
     """Prepare a manifest, preserving every supplied control file identity.
 
@@ -2282,7 +2291,9 @@ def prepare_candidate(
         journal_lock = _JournalLock.acquire(journal_target)
         _invalidate_manifest(manifest_target, declaration)
         evaluation = evaluate_candidate(
-        declaration, trusted_evidence=trusted_evidence_records
+            declaration,
+            trusted_evidence=trusted_evidence_records,
+            selected_backend_kind=selected_backend_kind,
         )
         targets = declaration.artifact_targets()
         if acquire:
@@ -2321,7 +2332,9 @@ def prepare_candidate(
                     budget=budget,
                 )
             evaluation = evaluate_candidate(
-        declaration, trusted_evidence=trusted_evidence_records
+                declaration,
+                trusted_evidence=trusted_evidence_records,
+                selected_backend_kind=selected_backend_kind,
             )
         else:
             for source in declaration.acquisition_sources:
@@ -2350,7 +2363,9 @@ def prepare_candidate(
         _write_journal(journal_target, journal)
         journal = _reload_owned_journal(journal_target, declaration=declaration)
         evaluation = evaluate_candidate(
-        declaration, trusted_evidence=trusted_evidence_records
+            declaration,
+            trusted_evidence=trusted_evidence_records,
+            selected_backend_kind=selected_backend_kind,
         )
         if (
             journal.get("candidate_id") != evaluation.candidate_id
