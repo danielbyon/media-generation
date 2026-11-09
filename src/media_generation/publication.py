@@ -299,13 +299,7 @@ class PublicationManager:
             return True
         owner_id = None if attempt['owner_id'] is None else str(attempt['owner_id'])
         epoch = int(attempt['claim_epoch'])
-        contained = (
-            (
-                attempt['containment_contract'] is not None
-                and bool(attempt['process_contained'])
-            )
-            or self.store.termination_evidence_proven(job_id, attempt_id)
-        )
+        contained = self.store.attempt_termination_proven(job_id, attempt_id)
         failure_class = (
             'canceled'
             if attempt['job_status'] == 'canceled'
@@ -722,10 +716,21 @@ class PublicationManager:
                 pass  # An unrecognized cleanup directory remains an orphan.
             orphans.extend(name for name in os.listdir(directory) if name not in known)
             orphans.sort()
-            incomplete = bool(orphans) or any(item['status'] != 'ok' for item in integrity) or any(
-                item['state'] not in {'committed', 'abandoned'} or 'error' in item
-                or item.get('cleanup') not in {'removed_owned_stage', 'absent'} for item in results
+            resource = self.store.resource_snapshot()
+            resource_state = str(resource['state'])
+            resource_reason = resource.get('reason')
+            incomplete = (
+                resource_state != 'available'
+                or bool(orphans)
+                or any(item['status'] != 'ok' for item in integrity)
+                or any(
+                    item['state'] not in {'committed', 'abandoned'} or 'error' in item
+                    or item.get('cleanup') not in {'removed_owned_stage', 'absent'}
+                    for item in results
+                )
             )
             return {'root': str(self.root), 'status': 'attention_required' if incomplete else 'complete',
                     'publications': results,
-                    'integrity': integrity, 'orphan_files': orphans}
+                    'integrity': integrity, 'orphan_files': orphans,
+                    'resource_state': resource_state,
+                    'resource_reason': None if resource_reason is None else str(resource_reason)}

@@ -53,6 +53,12 @@ PYTHONPATH=src python3.14 -m media_generation candidate prepare \
   --journal-output /path/outside-the-repository/acquisition-journal.json
 ```
 
+`candidate inspect`, `candidate verify`, and `candidate prepare` accept
+`--engine-backend stable-diffusion-cpp|comfyui`. The default is
+`stable-diffusion-cpp`. `candidate prepare` uses the selected backend for the
+service evaluation before acquisition and for both reconciliations after the
+journal update. The candidate declaration does not select this policy.
+
 The offline commands never contact a remote source, even when the declaration
 contains an acquisition source URL. `verify` hashes the declared files and does
 not alter them or create a journal.
@@ -343,17 +349,34 @@ directory descriptor with no-follow flags. A file reached through a symlink is
 `corrupt`; a host without descriptor-relative containment reports
 `unverified` rather than falling back to a less safe path check.
 
-The engine executable must also have at least one execute-permission bit. An
-acquired executable is staged with mode `0700`; no downloaded file is executed
-as part of preparation.
+An engine declaration without `engine.launch` uses the native-executable
+contract. Its entrypoint must be a regular file with matching size and SHA-256
+pins, and at least one execute-permission bit. Acquisition stages native
+executables with mode `0700`; preparation never executes downloaded files.
+
+`engine.launch` schema version 1 supports `kind: "python-script"`. In this
+contract, `engine.executable` is the script entrypoint. The evaluator checks its
+regular-file identity and full contents while requiring read access; the script
+does not need an execute bit. The launch object separately pins an executable
+interpreter by declared root, relative path, size, and SHA-256. Interpreter
+provenance and license evidence are checked against their own `TrustedEvidence`
+records. The launch contract, interpreter pin, and evidence declarations
+participate in candidate identity and the compatibility document.
+
+ComfyUI requires this explicit Python-script contract. Its signed runtime-pin
+schema-v5 approval must match both the declared interpreter and script
+entrypoint. The stable-diffusion.cpp adapter accepts native-executable
+declarations only. Acquisition applies execute permission to the native
+executable or declared interpreter as appropriate; it does not run either file.
 
 `precision` and `quantization` must be explicit known values. `unknown`,
 `auto`, `default`, and empty values are rejected. A conversion record names its
 lineage, optional conversion tool and version, and a pinned evidence document.
-The trusted compatibility contract binds both values for every component,
-including each entry under `required_roles`. Changing either value without a
-matching independently pinned compatibility document leaves the candidate
-`unverified`.
+`precision: "not-applicable"` is allowed only for a component with
+`role: "other"` and `quantization: "none"`. Both values remain part of
+candidate identity and the compatibility contract's component and required-role
+records. Changing either value without a matching independently pinned
+compatibility document leaves the candidate `unverified`.
 
 Every adapter-role or lora-role component must have exactly one adapter entry.
 Entries may name only those roles and must use each component once. Adapter
@@ -408,6 +431,26 @@ The recipe document is a separately pinned file. Its expected digest and size
 are checked in addition to compatibility claims. A changed recipe therefore
 changes or blocks the candidate rather than inheriting an earlier readiness
 result.
+
+ComfyUI uses a separate Qwen policy. A ComfyUI recipe declares the fixed claim
+`backend-policy:comfyui/qwen-image-edit-2511-reference-latent-timestep-zero/v1`
+in its compatibility evidence. When the operator selects the ComfyUI backend,
+T07 requires that claim. The matching independent authority must cover
+the complete compatibility document, whose recipe section binds the exact
+recipe document size and SHA-256. An engine identifier alone does not satisfy
+the requirement. Missing, mismatched, or untrusted policy evidence leaves the
+candidate non-ready.
+
+For `media-generation.comfyui-recipe` version 2, the ComfyUI adapter validates
+the exact Qwen edit graph while loading the candidate, before starting the
+engine, and rechecks the effective graph before dispatch. The positive and
+negative `FluxKontextMultiReferenceLatentMethod` nodes must both use
+`index_timestep_zero`, and the sampler must consume both branches. T07
+candidate inspection verifies the pinned recipe and trusted policy evidence
+but does not parse the graph. This setting is separate from the
+stable-diffusion.cpp `qwen_image_zero_cond_t` option and does not replace that
+backend's literal flag requirement. An unknown selected backend kind is
+rejected before evaluation. See ADR 0005.
 
 ## Stable identities
 

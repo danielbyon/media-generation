@@ -93,23 +93,21 @@ def test_cli_claimed_admission_reports_fence_and_lease(
     from concurrent.futures import ThreadPoolExecutor
     import threading
 
-    from media_generation.adapters import (
-        PROCESS_CONTAINED_CONTRACT,
-        DeterministicCpuAdapter,
-    )
+    from media_generation.adapters import DeterministicCpuAdapter
     from media_generation.admission import load_admission_profile, load_workload_demand
     from media_generation.service import GenerationService
 
     entered = threading.Event()
     resume = threading.Event()
 
-    class PausedAdapter(DeterministicCpuAdapter):
-        containment_contract = PROCESS_CONTAINED_CONTRACT
+    adapter = DeterministicCpuAdapter()
 
-        def generate(self, plan, destination):
-            entered.set()
-            assert resume.wait(5)
-            return super().generate(plan, destination)
+    def generate(plan, destination):
+        entered.set()
+        assert resume.wait(5)
+        return DeterministicCpuAdapter.generate(adapter, plan, destination)
+
+    adapter.generate = generate
 
     inventory, policy, demand = _operator_documents(tmp_path)
     database = tmp_path / "studio.sqlite3"
@@ -118,7 +116,7 @@ def test_cli_claimed_admission_reports_fence_and_lease(
     service = GenerationService(
         database,
         tmp_path / "images",
-        adapter=PausedAdapter(),
+        adapter=adapter,
         admission_profile=profile,
     )
     job = service.enqueue("claimed-inspection", request(), workload_demand=workload)

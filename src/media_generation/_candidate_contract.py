@@ -28,6 +28,14 @@ ACQUISITION_JOURNAL_SCHEMA = "media-generation.candidate-acquisition-journal"
 ACQUISITION_CONFIG_SCHEMA = "media-generation.candidate-acquisition-config"
 TRUSTED_EVIDENCE_SCHEMA = "media-generation.candidate-trusted-evidence"
 COMPATIBILITY_EVIDENCE_SCHEMA = "media-generation.candidate-compatibility-evidence"
+COMFYUI_ENGINE_ID = "comfyui"
+ENGINE_LAUNCH_SCHEMA = "media-generation.engine-launch"
+ENGINE_LAUNCH_SCHEMA_VERSION = 1
+PYTHON_SCRIPT_LAUNCH_KIND = "python-script"
+COMFYUI_QWEN_REFERENCE_POLICY_CLAIM = (
+    "backend-policy:comfyui/"
+    "qwen-image-edit-2511-reference-latent-timestep-zero/v1"
+)
 LICENSE_EVIDENCE_SCHEMA = "media-generation.candidate-license-evidence"
 PROVENANCE_EVIDENCE_SCHEMA = "media-generation.candidate-provenance-evidence"
 CONVERSION_EVIDENCE_SCHEMA = "media-generation.candidate-conversion-evidence"
@@ -210,6 +218,27 @@ class LicenseDeclaration:
             "terms_url": self.terms_url,
             "evidence": self.evidence.identity(),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EngineLaunch:
+    """Versioned interpreter launch contract for a readable script entrypoint."""
+
+    schema_version: int
+    kind: str
+    interpreter: ArtifactPin
+    provenance: Provenance
+    license: LicenseDeclaration
+
+    def identity(self) -> dict[str, object]:
+        return {
+            "schema": ENGINE_LAUNCH_SCHEMA,
+            "schema_version": self.schema_version,
+            "kind": self.kind,
+            "interpreter": self.interpreter.identity(),
+            "provenance": self.provenance.identity(),
+            "license": self.license.identity(),
+        }
 @dataclass(frozen=True, slots=True)
 class ConversionDeclaration:
     """Conversion lineage and supporting evidence for one component."""
@@ -231,7 +260,7 @@ class ConversionDeclaration:
         }
 @dataclass(frozen=True, slots=True)
 class EngineDeclaration:
-    """Exact local engine executable and software identity."""
+    """Exact engine entrypoint and its explicitly declared launch semantics."""
 
     id: str
     version: str
@@ -240,9 +269,10 @@ class EngineDeclaration:
     provenance: Provenance
     license: LicenseDeclaration
     architecture_flags: tuple[tuple[str, object], ...]
+    launch: EngineLaunch | None = None
 
     def identity(self) -> dict[str, object]:
-        return {
+        identity: dict[str, object] = {
             "id": self.id,
             "version": self.version,
             "build": self.build,
@@ -251,6 +281,9 @@ class EngineDeclaration:
             "license": self.license.identity(),
             "architecture_flags": dict(self.architecture_flags),
         }
+        if self.launch is not None:
+            identity["launch"] = self.launch.identity()
+        return identity
 @dataclass(frozen=True, slots=True)
 class CompatibilityEvidence:
     """Pinned document covering one or more exact compatibility claims."""
@@ -389,6 +422,14 @@ class CandidateDeclaration:
         """Return identity of declared expectations, excluding observations."""
         return digest_value(self.identity())
 
+    def requires_executable(self, target: str) -> bool:
+        """Return whether an acquisition target must have execute permission."""
+        if target == "engine":
+            return self.engine.launch is None
+        if target == "engine.interpreter":
+            return self.engine.launch is not None
+        return False
+
     def artifact_targets(self) -> dict[str, ArtifactPin]:
         """Return the explicit acquisition targets; evidence docs stay local."""
         targets = {
@@ -397,6 +438,8 @@ class CandidateDeclaration:
         }
         for component in self.components:
             targets[f"component:{component.id}"] = component.artifact
+        if self.engine.launch is not None:
+            targets["engine.interpreter"] = self.engine.launch.interpreter
         return targets
 @dataclass(frozen=True, slots=True)
 class StatusItem:
@@ -1057,6 +1100,60 @@ def _known_metric(
 def _known_version(value: object, *, label: str) -> str:
     """Return one explicit non-placeholder version or configuration value."""
     return _known_identity(value, label=label, limit=256)
+
+
+def _parse_engine_launch(
+    value: object, *, root_ids: frozenset[str]
+) -> EngineLaunch:
+    """Parse the only supported interpreter-launched entrypoint contract."""
+    item = require_mapping(value, label="engine.launch")
+    reject_unknown_keys(
+        item,
+        {
+            "schema",
+            "schema_version",
+            "kind",
+            "interpreter",
+            "provenance",
+            "license",
+        },
+        label="engine.launch",
+    )
+    if item.get("schema") != ENGINE_LAUNCH_SCHEMA:
+        raise CandidateValidationError(
+            f"engine.launch.schema must be {ENGINE_LAUNCH_SCHEMA!r}"
+        )
+    schema_version = _schema_version(
+        item.get("schema_version"),
+        label="engine.launch.schema_version",
+        expected=ENGINE_LAUNCH_SCHEMA_VERSION,
+    )
+    kind = require_string(item.get("kind"), label="engine.launch.kind")
+    if kind != PYTHON_SCRIPT_LAUNCH_KIND:
+        raise CandidateValidationError(
+            f"engine.launch.kind must be {PYTHON_SCRIPT_LAUNCH_KIND!r}"
+        )
+    return EngineLaunch(
+        schema_version=schema_version,
+        kind=kind,
+        interpreter=_parse_pin(
+            item.get("interpreter"),
+            label="engine.launch.interpreter",
+            root_ids=root_ids,
+        ),
+        provenance=_parse_provenance(
+            item.get("provenance"),
+            label="engine.launch.provenance",
+            root_ids=root_ids,
+        ),
+        license=_parse_license(
+            item.get("license"),
+            label="engine.launch.license",
+            root_ids=root_ids,
+        ),
+    )
+
+
 def _parse_engine(value: object, *, root_ids: frozenset[str]) -> EngineDeclaration:
     item = require_mapping(value, label="engine")
     reject_unknown_keys(
@@ -1069,8 +1166,14 @@ def _parse_engine(value: object, *, root_ids: frozenset[str]) -> EngineDeclarati
             "provenance",
             "license",
             "architecture_flags",
+            "launch",
         },
         label="engine",
+    )
+    launch = (
+        _parse_engine_launch(item["launch"], root_ids=root_ids)
+        if "launch" in item
+        else None
     )
     return EngineDeclaration(
         id=_known_identifier(item.get("id"), label="engine.id"),
@@ -1090,11 +1193,19 @@ def _parse_engine(value: object, *, root_ids: frozenset[str]) -> EngineDeclarati
         architecture_flags=_parse_flags(
             item.get("architecture_flags"), label="engine.architecture_flags"
         ),
+        launch=launch,
     )
-def _allowed_claims(required_roles: Iterable[str], flag_names: Iterable[str]) -> set[str]:
+def _allowed_claims(
+    required_roles: Iterable[str],
+    flag_names: Iterable[str],
+    *,
+    engine_id: str,
+) -> set[str]:
     claims = {"engine", "version", "recipe"}
     claims.update(f"role:{role}" for role in required_roles)
     claims.update(f"flag:{name}" for name in flag_names)
+    if engine_id == COMFYUI_ENGINE_ID:
+        claims.add(COMFYUI_QWEN_REFERENCE_POLICY_CLAIM)
     return claims
 def _parse_recipe(
     value: object, *, root_ids: frozenset[str]
@@ -1138,7 +1249,14 @@ def _parse_recipe(
     flags = _parse_flags(
         item.get("architecture_flags"), label="recipe.architecture_flags"
     )
-    allowed_claims = _allowed_claims(roles, (name for name, _ in flags))
+    recipe_engine_id = _known_identifier(
+        item.get("engine_id"), label="recipe.engine_id"
+    )
+    allowed_claims = _allowed_claims(
+        roles,
+        (name for name, _ in flags),
+        engine_id=recipe_engine_id,
+    )
     raw_evidence = require_list(
         item.get("compatibility_evidence"),
         label="recipe.compatibility_evidence",
@@ -1185,9 +1303,7 @@ def _parse_recipe(
             maximum=MAX_EVIDENCE_BYTES,
         ),
         required_roles=roles,
-        engine_id=_known_identifier(
-            item.get("engine_id"), label="recipe.engine_id"
-        ),
+        engine_id=recipe_engine_id,
         engine_version=_known_identity(
             item.get("engine_version"), label="recipe.engine_version", limit=256
         ),
@@ -1203,6 +1319,7 @@ def _parse_recipe(
 def _parse_component(
     value: object, *, index: int, root_ids: frozenset[str]
 ) -> ComponentDeclaration:
+    """Parse one component, including role-specific precision semantics."""
     label = f"components[{index}]"
     item = require_mapping(value, label=label)
     reject_unknown_keys(
@@ -1222,6 +1339,24 @@ def _parse_component(
     role = _identifier(item.get("role"), label=f"{label}.role")
     if role not in COMPONENT_ROLES:
         raise CandidateValidationError(f"{label}.role is unsupported")
+    raw_precision = item.get("precision")
+    if role == "other" and raw_precision == "not-applicable":
+        precision = "not-applicable"
+    else:
+        precision = _known_metric(
+            raw_precision,
+            label=f"{label}.precision",
+        )
+    quantization = _known_metric(
+        item.get("quantization"),
+        label=f"{label}.quantization",
+        allow_none=True,
+    )
+    if precision == "not-applicable" and quantization != "none":
+        raise CandidateValidationError(
+            f"{label}.precision 'not-applicable' requires "
+            f"{label}.quantization to be 'none'"
+        )
     return ComponentDeclaration(
         id=_known_identifier(item.get("id"), label=f"{label}.id"),
         role=role,
@@ -1236,12 +1371,8 @@ def _parse_component(
         license=_parse_license(
             item.get("license"), label=f"{label}.license", root_ids=root_ids
         ),
-        precision=_known_metric(item.get("precision"), label=f"{label}.precision"),
-        quantization=_known_metric(
-            item.get("quantization"),
-            label=f"{label}.quantization",
-            allow_none=True,
-        ),
+        precision=precision,
+        quantization=quantization,
         conversion=_parse_conversion(
             item.get("conversion"), label=f"{label}.conversion", root_ids=root_ids
         ),
@@ -1403,8 +1534,14 @@ def parse_candidate(path: Path) -> CandidateDeclaration:
             (recipe.document.root, recipe.document.path),
             *((component.artifact.root, component.artifact.path) for component in components),
         ]
+        if engine.launch is not None:
+            artifact_locations.append(
+                (engine.launch.interpreter.root, engine.launch.interpreter.path)
+            )
         if len(artifact_locations) != len(set(artifact_locations)):
-            raise CandidateValidationError("engine, recipe, and component paths must be unique")
+            raise CandidateValidationError(
+                "engine, interpreter, recipe, and component paths must be unique"
+            )
         root_paths = {root.id: root.path for root in roots}
         physical_locations = [
             _physical_path(root_paths[root_id] / Path(relative_path))
@@ -1412,7 +1549,7 @@ def parse_candidate(path: Path) -> CandidateDeclaration:
         ]
         if len(physical_locations) != len(set(physical_locations)):
             raise CandidateValidationError(
-                "engine, recipe, and component physical paths must be unique"
+                "engine, interpreter, recipe, and component physical paths must be unique"
             )
         file_identities: list[tuple[int, int]] = []
         for physical_path in physical_locations:
@@ -1424,7 +1561,7 @@ def parse_candidate(path: Path) -> CandidateDeclaration:
                 file_identities.append((facts.st_dev, facts.st_ino))
         if len(file_identities) != len(set(file_identities)):
             raise CandidateValidationError(
-                "engine, recipe, and component physical files must be unique"
+                "engine, interpreter, recipe, and component physical files must be unique"
             )
         adapters = _parse_adapters(item.get("adapters"), components=components)
         targets = {
@@ -1432,6 +1569,8 @@ def parse_candidate(path: Path) -> CandidateDeclaration:
             "recipe": recipe.document,
             **{f"component:{component.id}": component.artifact for component in components},
         }
+        if engine.launch is not None:
+            targets["engine.interpreter"] = engine.launch.interpreter
         acquisition_sources = _parse_acquisition_sources(
             item.get("acquisition"), targets=targets
         )
@@ -1461,6 +1600,7 @@ def parse_candidate(path: Path) -> CandidateDeclaration:
             pin.size_bytes
             for pin in (
                 engine.executable,
+                *((engine.launch.interpreter,) if engine.launch is not None else ()),
                 recipe.document,
                 *(component.artifact for component in components),
             )

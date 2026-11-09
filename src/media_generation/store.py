@@ -1,5 +1,4 @@
 """SQLite persistence for immutable requests and durable execution records."""
-
 from __future__ import annotations
 
 import json
@@ -12,13 +11,18 @@ from typing import Iterator
 
 from .admission import is_lightweight_cpu_adapter_id
 from .backend_provenance import (
+    COMFYUI_RESOLVED_BACKEND_KIND,
     EXECUTION_STATES,
+    COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS,
+    RESOLVED_RECORD_SCHEMA_VERSION,
     canonical_json as backend_canonical_json,
     digest as backend_digest,
     observation_proves_reaped_child,
     validate_launch_record,
     validate_observed_record,
     validate_resolved_record,
+    serialize_resolved_record,
+    configuration_requires_process_tree_resource_release,
 )
 from .admission_store import (
     AdmissionInspection,
@@ -42,7 +46,7 @@ from .errors import (
     RecordNotFoundError,
     UnknownReferenceError,
 )
-from .privacy import is_privacy_compliance_record
+from .privacy import COMFYUI_ADAPTER_ID, is_privacy_compliance_record
 
 _RESOLVED_OUTPUT_DIRECTORY_KEY = "_resolved_output_directory"
 _MALFORMED_STORED_PRIVACY_EVIDENCE = "stored privacy-compliance evidence is malformed"
@@ -52,6 +56,25 @@ _PRIVACY_CLAIM_EVIDENCE_REQUIRED = (
 _PRIVACY_CLAIM_CONFIGURATION_REQUIRED = (
     "protected execution claim requires exact adapter-configuration evidence"
 )
+
+
+def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
+    """Return the ComfyUI T07 pin persisted with the admitted adapter config."""
+    try:
+        configuration = json.loads(str(value))
+    except (TypeError, ValueError) as error:
+        raise BackendEvidenceError(
+            "persisted ComfyUI adapter configuration is not valid JSON"
+        ) from error
+    if (
+        not isinstance(configuration, Mapping)
+        or configuration.get("backend_kind") != COMFYUI_RESOLVED_BACKEND_KIND
+        or not isinstance(configuration.get("workflow_approval"), Mapping)
+    ):
+        raise BackendEvidenceError(
+            "persisted ComfyUI adapter configuration has no workflow approval pin"
+        )
+    return configuration["workflow_approval"]
 _WRITER_EPOCH = 6
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
 _CURRENT_SCHEMA_VERSION = 6
@@ -1598,6 +1621,115 @@ END"""
             return updated.rowcount == 1
 
     @staticmethod
+    def _attempt_requires_process_tree_resource_release(
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Return whether the admitted adapter denies direct-child release.
+
+        The immutable adapter identities on the admitted job and its attempt
+        must agree before configuration is considered. A ComfyUI identity
+        always requires process-tree evidence, even when an older configuration
+        omitted the release declaration. Missing or malformed persisted
+        configuration fails closed. The helper is consulted only after a
+        launched child has a termination observation; pre-spawn failures have
+        no descendant process to contain.
+        """
+        row = connection.execute(
+            """SELECT jobs.adapter_id AS admitted_adapter_id,
+                      admitted_attempt.adapter_id AS attempt_adapter_id,
+                      jobs.adapter_configuration_json
+            FROM generation_jobs AS jobs
+            JOIN generation_attempts AS admitted_attempt
+              ON admitted_attempt.job_id = jobs.job_id
+            JOIN execution_attempts AS attempts
+              ON attempts.attempt_id = admitted_attempt.attempt_id
+            WHERE jobs.job_id = ? AND attempts.attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+        if row is None:
+            return True
+        admitted_adapter_id = row["admitted_adapter_id"]
+        attempt_adapter_id = row["attempt_adapter_id"]
+        if (
+            not isinstance(admitted_adapter_id, str)
+            or not isinstance(attempt_adapter_id, str)
+            or not admitted_adapter_id
+            or admitted_adapter_id != attempt_adapter_id
+        ):
+            return True
+        try:
+            configuration = json.loads(str(row["adapter_configuration_json"]))
+        except (TypeError, ValueError):
+            return True
+        if not isinstance(configuration, Mapping):
+            return True
+        if (
+            configuration.get("backend_kind") == COMFYUI_RESOLVED_BACKEND_KIND
+            and admitted_adapter_id != COMFYUI_ADAPTER_ID
+        ):
+            return True
+        return configuration_requires_process_tree_resource_release(
+            configuration,
+            adapter_id=admitted_adapter_id,
+        )
+
+    @classmethod
+    def _resource_release_proven(
+        cls,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+        *,
+        containment_contract: str | None,
+        effective_termination_proven: bool,
+        direct_child_termination_proven: bool,
+        prelaunch_refusal: bool = False,
+    ) -> bool:
+        """Return whether trusted evidence permits reuse of the T06 lease.
+
+        A direct-child observation proves only that the application's child
+        was reaped. Adapters that require process-tree evidence must remain
+        quarantined because this supervisor does not observe descendants. A
+        legacy containment declaration cannot override that adapter policy.
+        A current process may assert that it never started a child; that
+        assertion releases only while no durable launch evidence exists.
+        """
+        if prelaunch_refusal:
+            return effective_termination_proven and not cls._attempt_has_launch_evidence(
+                connection, job_id, attempt_id
+            )
+        if cls._attempt_requires_process_tree_resource_release(
+            connection, job_id, attempt_id
+        ):
+            return False
+        if not effective_termination_proven:
+            return False
+        if containment_contract is not None:
+            return True
+        return direct_child_termination_proven
+
+    @staticmethod
+    def _attempt_has_launch_evidence(
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Return whether durable evidence records a process launch."""
+        row = connection.execute(
+            "SELECT state FROM backend_executions "
+            "WHERE job_id = ? AND attempt_id = ?",
+            (job_id, attempt_id),
+        ).fetchone()
+        if row is None:
+            return False
+        state = str(row["state"])
+        if state not in EXECUTION_STATES:
+            raise BackendEvidenceError("stored backend execution has unknown state")
+        return state in {"launched", "observed"}
+
+    @staticmethod
     def _attempt_termination_evidence(
         connection: sqlite3.Connection,
         job_id: str,
@@ -1609,7 +1741,12 @@ END"""
         evidence raises so finalization cannot convert it into a release.
         """
         row = connection.execute(
-            "SELECT * FROM backend_executions WHERE job_id = ? AND attempt_id = ?",
+            """SELECT executions.*,
+                      admitted.adapter_configuration_json AS adapter_configuration_json
+               FROM backend_executions AS executions
+               JOIN generation_jobs AS admitted
+                 ON admitted.job_id = executions.job_id
+               WHERE executions.job_id = ? AND executions.attempt_id = ?""",
             (job_id, attempt_id),
         ).fetchone()
         if row is None:
@@ -1626,6 +1763,48 @@ END"""
         """Read whether this attempt has durable, validated reaped-child proof."""
         with self._connection() as connection:
             return self._attempt_termination_evidence(connection, job_id, attempt_id)
+
+    def attempt_termination_proven(self, job_id: str, attempt_id: str) -> bool:
+        """Return termination proof under the attempt's persisted adapter policy.
+
+        ComfyUI attempts accept only validated direct-child observation. A
+        containment contract cannot substitute for process-tree evidence.
+        Historical adapters retain their trusted contract-or-observation
+        behavior.
+        """
+        with self._connection() as connection:
+            return self._attempt_termination_proven(
+                connection, job_id, attempt_id
+            )
+
+    @classmethod
+    def _attempt_termination_proven(
+        cls,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        direct_child_termination_proven = cls._attempt_termination_evidence(
+            connection, job_id, attempt_id
+        )
+        if cls._attempt_requires_process_tree_resource_release(
+            connection, job_id, attempt_id
+        ):
+            return direct_child_termination_proven
+        row = connection.execute(
+            """SELECT containment_contract, process_contained
+               FROM execution_attempts
+               WHERE job_id = ? AND attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+        if row is None:
+            return direct_child_termination_proven
+        contract = row["containment_contract"]
+        return direct_child_termination_proven or (
+            isinstance(contract, str)
+            and bool(contract)
+            and bool(row["process_contained"])
+        )
 
     @staticmethod
     def _decode_backend_execution(row: sqlite3.Row) -> dict[str, object]:
@@ -1647,7 +1826,24 @@ END"""
             ) from error
         if not isinstance(resolved, dict):
             raise BackendEvidenceError("stored resolved evidence must be an object")
-        validate_resolved_record(resolved)
+        if (
+            type(resolved.get("schema_version")) is int
+            and resolved.get("schema_version") in COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS
+        ):
+            try:
+                persisted_approval = _persisted_workflow_approval(
+                    row["adapter_configuration_json"]
+                )
+            except (IndexError, KeyError) as error:
+                raise BackendEvidenceError(
+                    "stored ComfyUI execution is missing its persisted workflow approval"
+                ) from error
+            validate_resolved_record(
+                resolved,
+                expected_workflow_approval=persisted_approval,
+            )
+        else:
+            validate_resolved_record(resolved)
         if resolved.get("attempt_id") != attempt_id:
             raise BackendEvidenceError("resolved evidence identifies a different attempt")
         if resolved.get("candidate_id") != str(row["candidate_id"]):
@@ -1749,8 +1945,11 @@ END"""
         with self._connection() as connection:
             if attempt_id is None:
                 row = connection.execute(
-                    """SELECT executions.*
+                    """SELECT executions.*,
+                              admitted.adapter_configuration_json AS adapter_configuration_json
                        FROM execution_jobs AS jobs
+                       JOIN generation_jobs AS admitted
+                         ON admitted.job_id = jobs.job_id
                        JOIN backend_executions AS executions
                          ON executions.attempt_id = jobs.current_attempt_id
                        WHERE jobs.job_id = ?""",
@@ -1766,7 +1965,12 @@ END"""
                         f"attempt {attempt_id} does not belong to job {job_id}"
                     )
                 row = connection.execute(
-                    "SELECT * FROM backend_executions WHERE job_id = ? AND attempt_id = ?",
+                    """SELECT executions.*,
+                              admitted.adapter_configuration_json AS adapter_configuration_json
+                       FROM backend_executions AS executions
+                       JOIN generation_jobs AS admitted
+                         ON admitted.job_id = executions.job_id
+                       WHERE executions.job_id = ? AND executions.attempt_id = ?""",
                     (job_id, attempt_id),
                 ).fetchone()
         if row is None:
@@ -1809,12 +2013,31 @@ END"""
         validate_resolved_record(record)
         if record.get("attempt_id") != attempt_id:
             raise BackendEvidenceError("resolved evidence identifies a different attempt")
-        resolved_json = backend_canonical_json(record)
+        resolved_json = serialize_resolved_record(record)
         resolved_digest = backend_digest(record)
         with self._connection(transaction=True) as connection:
             self._require_backend_authority(
                 connection, job_id, attempt_id, owner_id, claim_epoch
             )
+            if (
+                type(record.get("schema_version")) is int
+                and record.get("schema_version") in COMFYUI_RESOLVED_RECORD_SCHEMA_VERSIONS
+            ):
+                configuration_row = connection.execute(
+                    "SELECT adapter_configuration_json FROM generation_jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if configuration_row is None:
+                    raise BackendEvidenceError(
+                        "resolved ComfyUI execution has no persisted adapter configuration"
+                    )
+                persisted_approval = _persisted_workflow_approval(
+                    configuration_row["adapter_configuration_json"]
+                )
+                validate_resolved_record(
+                    record,
+                    expected_workflow_approval=persisted_approval,
+                )
             try:
                 connection.execute(
                     """INSERT INTO backend_executions
@@ -1918,7 +2141,7 @@ END"""
             if row["output_slot_id"] != artifact.output_slot_id:
                 raise RuntimeError("artifact output slot does not belong to job")
             attempt = connection.execute(
-                """SELECT status, containment_contract, owner_id
+                """SELECT status, process_contained, containment_contract, owner_id
                    FROM execution_attempts
                    WHERE job_id = ? AND attempt_id = ?""",
                 (artifact.job_id, artifact.attempt_id),
@@ -1989,12 +2212,27 @@ END"""
                     attempt_owner_id=attempt_owner_id,
                     claim_epoch=claim_epoch,
                 )
-            termination_proven = (
-                attempt["containment_contract"] is not None
-                or self._attempt_termination_evidence(
+            direct_child_termination_proven = self._attempt_termination_evidence(
+                connection, artifact.job_id, artifact.attempt_id
+            )
+            process_tree_required = (
+                self._attempt_requires_process_tree_resource_release(
                     connection, artifact.job_id, artifact.attempt_id
                 )
             )
+            termination_proven = self._attempt_termination_proven(
+                connection, artifact.job_id, artifact.attempt_id
+            )
+            resource_release_proven = self._resource_release_proven(
+                connection,
+                artifact.job_id,
+                artifact.attempt_id,
+                containment_contract=attempt["containment_contract"],
+                effective_termination_proven=termination_proven,
+                direct_child_termination_proven=direct_child_termination_proven,
+            )
+            # This field records the adapter-scoped proof used to release T06.
+            # The observation row retains the separate direct-child fact.
             connection.execute(
                 """UPDATE execution_attempts
                    SET status = 'succeeded', completed_at = ?, failure_class = NULL,
@@ -2002,7 +2240,7 @@ END"""
                    WHERE attempt_id = ? AND job_id = ? AND status = 'running'""",
                 (
                     timestamp,
-                    int(termination_proven),
+                    int(resource_release_proven),
                     artifact.attempt_id,
                     artifact.job_id,
                 ),
@@ -2014,7 +2252,7 @@ END"""
                    WHERE job_id = ? AND status = 'running'""",
                 (timestamp, artifact.job_id),
             )
-            if termination_proven:
+            if resource_release_proven:
                 connection.execute(
                     """UPDATE execution_resource
                        SET state = 'available', job_id = NULL, attempt_id = NULL,
@@ -2024,6 +2262,13 @@ END"""
                 admission_state = "released"
                 admission_reason = "termination_and_publication_reconciled"
             else:
+                quarantine_reason = (
+                    "successful publication lacks required process-tree "
+                    "termination evidence"
+                    if process_tree_required
+                    else "successful publication has no trusted "
+                    "process-termination proof"
+                )
                 connection.execute(
                     """UPDATE execution_resource
                        SET state = 'quarantined', job_id = ?, attempt_id = ?,
@@ -2032,14 +2277,12 @@ END"""
                         artifact.job_id,
                         artifact.attempt_id,
                         attempt["owner_id"],
-                        "successful publication has no trusted process-termination proof",
+                        quarantine_reason,
                         timestamp,
                     ),
                 )
                 admission_state = "quarantined"
-                admission_reason = (
-                    "successful publication has no trusted process-termination proof"
-                )
+                admission_reason = quarantine_reason
             admission_finished = AdmissionPersistence.finish(
                 connection,
                 artifact.job_id,
@@ -2359,6 +2602,7 @@ END"""
         claim_epoch: int | None = None,
         failure_class: str = "terminal",
         termination_proven: bool = False,
+        prelaunch_refusal: bool = False,
         _revoked_publication_id: str | None = None,
     ) -> bool:
         """Finalize one current attempt and apply the durable outcome.
@@ -2428,19 +2672,20 @@ END"""
             ).fetchone() is not None:
                 return False
             attempt = connection.execute(
-                """SELECT status FROM execution_attempts
-                   WHERE attempt_id = ? AND job_id = ?""",
+                """SELECT status, process_contained, containment_contract
+                   FROM execution_attempts
+                WHERE attempt_id = ? AND job_id = ?""",
                 (attempt_id, job_id),
             ).fetchone()
             if attempt is None or attempt["status"] != "running":
                 return False
             job = connection.execute(
-            """SELECT execution.max_attempts, execution.current_attempt_id,
-                      execution.fence_epoch, jobs.adapter_id
-               FROM execution_jobs AS execution
-               JOIN generation_jobs AS jobs
-                 ON jobs.job_id = execution.job_id
-               WHERE execution.job_id = ?""",
+                """SELECT execution.max_attempts, execution.current_attempt_id,
+                execution.fence_epoch, jobs.adapter_id
+                FROM execution_jobs AS execution
+                JOIN generation_jobs AS jobs
+                ON jobs.job_id = execution.job_id
+                WHERE execution.job_id = ?""",
                 (job_id,),
             ).fetchone()
             if job is None or job["current_attempt_id"] != attempt_id:
@@ -2449,12 +2694,44 @@ END"""
                 "SELECT attempt_number FROM execution_attempts WHERE attempt_id = ?",
                 (attempt_id,),
             ).fetchone()[0]
-            effective_termination_proven = (
-                termination_proven
-                or self._attempt_termination_evidence(connection, job_id, attempt_id)
+            direct_child_termination_proven = self._attempt_termination_evidence(
+                connection, job_id, attempt_id
+            )
+            process_tree_required = (
+                self._attempt_requires_process_tree_resource_release(
+                    connection, job_id, attempt_id
+                )
+            )
+            prelaunch_proven = (
+                prelaunch_refusal
+                and termination_proven
+                and not self._attempt_has_launch_evidence(
+                    connection, job_id, attempt_id
+                )
+            )
+            validated_termination_proven = self._attempt_termination_proven(
+                connection, job_id, attempt_id
+            )
+            if prelaunch_proven:
+                effective_termination_proven = True
+            elif not termination_proven:
+                # An explicit uncertainty result outranks inferred contract proof.
+                effective_termination_proven = False
+            elif process_tree_required:
+                effective_termination_proven = direct_child_termination_proven
+            else:
+                effective_termination_proven = validated_termination_proven
+            resource_release_proven = self._resource_release_proven(
+                connection,
+                job_id,
+                attempt_id,
+                containment_contract=attempt["containment_contract"],
+                effective_termination_proven=effective_termination_proven,
+                direct_child_termination_proven=direct_child_termination_proven,
+                prelaunch_refusal=prelaunch_refusal,
             )
             retry = (
-                effective_termination_proven
+            resource_release_proven
                 and failure_class in {"retryable", "crash"}
                 and int(number) < int(job["max_attempts"])
             )
@@ -2462,7 +2739,7 @@ END"""
                 "canceled"
                 if failure_class == "canceled"
                 else "ambiguous"
-                if failure_class == "ambiguous" or not effective_termination_proven
+            if failure_class == "ambiguous" or not effective_termination_proven
                 else "queued"
                 if retry
                 else "failed"
@@ -2482,7 +2759,7 @@ END"""
                 (
                     attempt_status,
                     failure_class,
-                    int(effective_termination_proven),
+                    int(resource_release_proven),
                     timestamp,
                     attempt_id,
                     job_id,
@@ -2508,8 +2785,18 @@ END"""
             )
             resource_state = (
                 "quarantined"
-                if failure_class == "ambiguous" or not effective_termination_proven
+                if failure_class == "ambiguous" or not resource_release_proven
                 else "available"
+            )
+            resource_quarantine_reason = (
+                "attempt lacks required process-tree termination evidence"
+                if process_tree_required and not resource_release_proven
+                else (
+                    "attempt has direct-child evidence but no required "
+                    "process-tree termination evidence"
+                    if effective_termination_proven and not resource_release_proven
+                    else message
+                )
             )
             connection.execute(
                 """UPDATE execution_resource
@@ -2521,7 +2808,7 @@ END"""
                     job_id if resource_state == "quarantined" else None,
                     attempt_id if resource_state == "quarantined" else None,
                     attempt_owner_id if resource_state == "quarantined" else None,
-                    message if resource_state == "quarantined" else None,
+                resource_quarantine_reason if resource_state == "quarantined" else None,
                     timestamp,
                     job_id,
                     attempt_id,
@@ -2545,7 +2832,7 @@ END"""
                 connection,
                 job_id,
                 decision=admission_state,
-                reason=message,
+            reason=resource_quarantine_reason,
                 timestamp=timestamp,
             )
             if not admission_finished:
@@ -2627,7 +2914,8 @@ END"""
                           resource.state AS resource_state,
                           resource.job_id AS resource_job_id,
                           resource.attempt_id AS resource_attempt_id,
-                          resource.owner_id AS resource_owner_id
+resource.owner_id AS resource_owner_id,
+resource.reason AS resource_reason
                    FROM generation_jobs AS jobs
                    LEFT JOIN generation_artifacts AS artifacts
                      ON artifacts.job_id = jobs.job_id
@@ -2682,7 +2970,12 @@ END"""
             current_attempt_id = job_row["current_attempt_id"]
             if current_attempt_id is not None:
                 execution_row = connection.execute(
-                    "SELECT * FROM backend_executions WHERE job_id = ? AND attempt_id = ?",
+                    """SELECT executions.*,
+                              admitted.adapter_configuration_json AS adapter_configuration_json
+                       FROM backend_executions AS executions
+                       JOIN generation_jobs AS admitted
+                         ON admitted.job_id = executions.job_id
+                       WHERE executions.job_id = ? AND executions.attempt_id = ?""",
                     (job_id, str(current_attempt_id)),
                 ).fetchone()
                 if execution_row is not None:
@@ -2724,6 +3017,7 @@ END"""
                     "resource_job_id": job_row["resource_job_id"],
                     "resource_attempt_id": job_row["resource_attempt_id"],
                     "resource_owner_id": job_row["resource_owner_id"],
+ "resource_reason": job_row["resource_reason"],
                 },
             }
 

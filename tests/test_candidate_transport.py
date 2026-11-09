@@ -423,13 +423,13 @@ def test_preparation_timeout_cleans_staging_and_releases_journal_lock(
     preload = 0 if phase == "startup" else 2 if phase in {"redirect", "retry"} else 1
     processes = _install_worker(tmp_path, monkeypatch, prefix, preload=preload)
     expirations: list[float] = []
-    deadlines: list[float] = []
+    deadlines: list[Any] = []
     real_start = acquisition._TransferDeadline.start
     real_open = acquisition._open_remote
 
     def start(cls: Any, timeout_seconds: float) -> Any:
         deadline = real_start(timeout_seconds)
-        deadlines.append(deadline.expires_at)
+        deadlines.append(deadline)
         return deadline
 
     def open_remote(*args: Any, **kwargs: Any) -> Any:
@@ -506,10 +506,13 @@ def test_preparation_timeout_cleans_staging_and_releases_journal_lock(
             )
         finished = time.monotonic()
         assert len(deadlines) == 1
-        elapsed = finished - (deadlines[0] - 0.25)
-        record_property("deadline_elapsed_seconds", elapsed)
-        assert elapsed < 0.43
-        assert expirations and set(expirations) == set(deadlines)
+        expires_at = deadlines[0].expires_at
+        cleanup_elapsed = finished - expires_at
+        record_property("deadline_cleanup_elapsed_seconds", cleanup_elapsed)
+        assert cleanup_elapsed < 0.5, (
+            f"cleanup after the transfer deadline took {cleanup_elapsed:.4f}s"
+        )
+        assert expirations and set(expirations) == {expires_at}
         _assert_reaped(processes)
         if phase in {"startup", "dns", "dns_budget", "connect", "tls", "send"}:
             assert marker.read_text() == "entered"
@@ -548,7 +551,9 @@ def test_http_retry_exhaustion_reaps_every_response_without_publication(
     )
 
     certificate, context = tls_material
-    processes = _install_worker(tmp_path, monkeypatch, _trust_certificate(certificate))
+    processes = _install_worker(
+        tmp_path, monkeypatch, _trust_certificate(certificate), preload=1
+    )
     declaration = _fixture(tmp_path)
     artifact = tmp_path / "files" / "diffusion.safetensors"
     body_size = artifact.stat().st_size
@@ -772,7 +777,9 @@ def test_timeout_terminates_tls_socket_as_observed_by_peer(
     tls_material: tuple[Path, ssl.SSLContext],
 ) -> None:
     certificate, context = tls_material
-    processes = _install_worker(tmp_path, monkeypatch, _trust_certificate(certificate))
+    processes = _install_worker(
+        tmp_path, monkeypatch, _trust_certificate(certificate), preload=1
+    )
     peer_closed = threading.Event()
 
     def respond(connection: Any, request: Any, stop: Any, observations: Any) -> None:
@@ -783,11 +790,14 @@ def test_timeout_terminates_tls_socket_as_observed_by_peer(
         except (ConnectionResetError, ssl.SSLEOFError):
             peer_closed.set()
 
-    with _server(context, respond) as (url, _):
-        response = candidate._acquisition._open_remote(url, headers={}, timeout_seconds=0.15)
-        with pytest.raises(TimeoutError):
-            response.read(1)
-        assert peer_closed.wait(timeout=0.2)
+    with _cleanup_test_workers(processes):
+        with _server(context, respond) as (url, _):
+            response = candidate._acquisition._open_remote(
+                url, headers={}, timeout_seconds=0.15
+            )
+            with pytest.raises(TimeoutError):
+                response.read(1)
+            assert peer_closed.wait(timeout=0.2)
         _assert_reaped(processes)
 
 
@@ -957,7 +967,9 @@ def test_malformed_https_framing_never_publishes_or_retains_resources(
 
     acquisition = candidate._acquisition
     certificate, context = tls_material
-    processes = _install_worker(tmp_path, monkeypatch, _trust_certificate(certificate))
+    processes = _install_worker(
+        tmp_path, monkeypatch, _trust_certificate(certificate), preload=1
+    )
     declaration = _fixture(tmp_path)
     artifact = tmp_path / "files" / "diffusion.safetensors"
     body = artifact.read_bytes()

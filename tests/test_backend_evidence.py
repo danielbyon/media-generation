@@ -999,6 +999,79 @@ def test_launch_recorder_failure_kills_and_reaps_child(tmp_path: Path) -> None:
         os.kill(child_pid, 0)
 
 
+def test_managed_listener_identity_uses_injected_backend_neutral_pid_check() -> None:
+    authority = _TestAuthority("att_listener_owner")
+    argv = (sys.executable, "-c", "import time; time.sleep(30)")
+    supervisor = ProcessSupervisor(
+        authority,
+        expected_argv=argv,
+        expected_environment={},
+        drain_timeout_seconds=0.05,
+    )
+    observed_child_pid: list[int] = []
+    resolver_calls: list[tuple[str, int]] = []
+
+    def session(control) -> str:
+        observed_child_pid.append(control.pid)
+        control.require_listener_owner("127.0.0.1", 8188)
+        return "owned"
+
+    def listener_owner_pid(host: str, port: int) -> int:
+        resolver_calls.append((host, port))
+        return observed_child_pid[-1]
+
+    result, observation = supervisor.run_managed(
+        argv,
+        env={},
+        cwd=Path.cwd(),
+        session=session,
+        listener_owner_pid=listener_owner_pid,
+        shutdown_timeout_seconds=0.2,
+    )
+
+    assert result == "owned"
+    assert resolver_calls == [("127.0.0.1", 8188)]
+    assert len(authority.launches) == len(authority.observations) == 1
+    assert observation is authority.observations[0]
+    assert observation.exit_code is None
+
+
+@pytest.mark.parametrize(
+    ("listener_owner_pid", "error"),
+    [
+        (None, "listener ownership proof is unavailable"),
+        (lambda _host, _port: 123, "not owned by the managed direct child"),
+        (lambda _host, _port: True, "not owned by the managed direct child"),
+    ],
+)
+def test_managed_listener_identity_fails_closed_without_child_pid_proof(
+    listener_owner_pid, error: str
+) -> None:
+    authority = _TestAuthority("att_listener_owner_refused")
+    argv = (sys.executable, "-c", "import time; time.sleep(30)")
+    supervisor = ProcessSupervisor(
+        authority,
+        expected_argv=argv,
+        expected_environment={},
+        drain_timeout_seconds=0.05,
+    )
+
+    with pytest.raises(BackendEvidenceError, match=error):
+        supervisor.run_managed(
+            argv,
+            env={},
+            cwd=Path.cwd(),
+            session=lambda control: control.require_listener_owner(
+                "127.0.0.1", 8188
+            ),
+            listener_owner_pid=listener_owner_pid,
+            shutdown_timeout_seconds=0.2,
+        )
+
+    assert supervisor.process_started is True
+    assert len(authority.launches) == len(authority.observations) == 1
+
+
 def _write_runtime_marker(path: Path, value: str) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(value + "\n", encoding="utf-8")

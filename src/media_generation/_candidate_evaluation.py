@@ -14,6 +14,8 @@ from typing import Iterable
 
 from ._candidate_contract import (
     COMPATIBILITY_EVIDENCE_SCHEMA,
+    COMFYUI_ENGINE_ID,
+    COMFYUI_QWEN_REFERENCE_POLICY_CLAIM,
     CONVERSION_EVIDENCE_SCHEMA,
     CORRUPT,
     HASH_CHUNK_BYTES,
@@ -57,6 +59,15 @@ _QWEN_IMAGE_EDIT = re.compile(
 )
 _QWEN_2511_VERSION = re.compile(r"(?<!\d)2511(?!\d)")
 _QWEN_ZERO_CONDITIONING_FLAG = "qwen_image_zero_cond_t"
+_COMFYUI_BACKEND_KIND = "comfyui-local-http"
+_SD_CPP_BACKEND_KIND = "local-inference"
+_KNOWN_BACKEND_KINDS = frozenset(
+    {_COMFYUI_BACKEND_KIND, _SD_CPP_BACKEND_KIND}
+)
+_COMFYUI_QWEN_POLICY_ARTIFACT = (
+    "recipe.compatibility.policy:"
+    "comfyui-qwen-image-edit-2511-reference-latent-timestep-zero"
+)
 
 
 def _declared_policy_identity_strings(declaration: CandidateDeclaration) -> list[str]:
@@ -95,6 +106,31 @@ def _declares_qwen_image_edit_2511(declaration: CandidateDeclaration) -> bool:
     )
 
 
+def _requires_sd_cpp_qwen_zero_conditioning(
+    declaration: CandidateDeclaration,
+    *,
+    selected_backend_kind: str | None = None,
+) -> bool:
+    """Return whether the selected invocation contract requires this policy.
+
+    Candidate-authored API flags cannot select an exemption. Only the
+    application-owned ComfyUI adapter may pass its selected backend kind, and
+    the candidate must also match that adapter's exact engine identity.
+    """
+    if (
+        selected_backend_kind is not None
+        and selected_backend_kind not in _KNOWN_BACKEND_KINDS
+    ):
+        raise CandidateValidationError(
+            f"selected backend kind {selected_backend_kind!r} is unknown"
+        )
+    selected_comfyui = (
+        selected_backend_kind == _COMFYUI_BACKEND_KIND
+        and declaration.engine.id == COMFYUI_ENGINE_ID
+    )
+    return _declares_qwen_image_edit_2511(declaration) and not selected_comfyui
+
+
 class _Evaluator:
     """Cache file metadata without retaining complete evidence documents."""
 
@@ -103,8 +139,17 @@ class _Evaluator:
         declaration: CandidateDeclaration,
         *,
         trusted_evidence: Iterable[TrustedEvidence] = (),
+        selected_backend_kind: str | None = None,
     ) -> None:
+        if (
+            selected_backend_kind is not None
+            and selected_backend_kind not in _KNOWN_BACKEND_KINDS
+        ):
+            raise CandidateValidationError(
+                f"selected backend kind {selected_backend_kind!r} is unknown"
+            )
         self.declaration = declaration
+        self.selected_backend_kind = selected_backend_kind
         self.roots = declaration.root_index
         self.trusted_evidence = tuple(trusted_evidence)
         authority_ids = [record.authority_id for record in self.trusted_evidence]
@@ -457,7 +502,9 @@ class _Evaluator:
                     observed={"value": engine_flags.get(name)},
                 )
             )
-        if _declares_qwen_image_edit_2511(declaration):
+        if _requires_sd_cpp_qwen_zero_conditioning(
+            declaration, selected_backend_kind=self.selected_backend_kind
+        ):
             declared_flags = dict(declaration.recipe.architecture_flags)
             policy_value = declared_flags.get(_QWEN_ZERO_CONDITIONING_FLAG)
             engine_value = engine_flags.get(_QWEN_ZERO_CONDITIONING_FLAG)
@@ -543,21 +590,24 @@ class _Evaluator:
                 key=lambda item: str(item["id"]),
             )
             roles.append({"role": role, "components": role_components})
+        engine_identity: dict[str, object] = {
+            "id": declaration.engine.id,
+            "version": declaration.engine.version,
+            "build": declaration.engine.build,
+            # Compatibility evidence binds engine switches the recipe omits.
+            "architecture_flags": dict(declaration.engine.architecture_flags),
+            "executable": {
+                "size_bytes": declaration.engine.executable.size_bytes,
+                "sha256": declaration.engine.executable.sha256,
+            },
+        }
+        if declaration.engine.launch is not None:
+            engine_identity["launch"] = declaration.engine.launch.identity()
         return {
             "schema": COMPATIBILITY_EVIDENCE_SCHEMA,
             "schema_version": SCHEMA_VERSION,
             "claims": sorted(evidence.claims),
-            "engine": {
-                "id": declaration.engine.id,
-                "version": declaration.engine.version,
-                "build": declaration.engine.build,
-                # Evidence must also bind switches that the recipe does not repeat.
-                "architecture_flags": dict(declaration.engine.architecture_flags),
-                "executable": {
-                    "size_bytes": declaration.engine.executable.size_bytes,
-                    "sha256": declaration.engine.executable.sha256,
-                },
-            },
+            "engine": engine_identity,
             "recipe": {
                 "id": declaration.recipe.id,
                 "document": {
@@ -587,6 +637,45 @@ class _Evaluator:
             if valid:
                 covered.update(evidence.claims)
         return covered
+
+    def _check_comfyui_qwen_policy(self, covered_claims: set[str]) -> None:
+        if self.selected_backend_kind != _COMFYUI_BACKEND_KIND:
+            return
+        declared_claims = {
+            claim
+            for evidence in self.declaration.recipe.evidence
+            for claim in evidence.claims
+        }
+        if COMFYUI_QWEN_REFERENCE_POLICY_CLAIM not in declared_claims:
+            status = UNVERIFIED
+            code = "comfyui_conditioning_policy_claim_missing"
+            message = (
+                "ComfyUI Qwen readiness requires the fixed backend policy claim"
+            )
+        elif COMFYUI_QWEN_REFERENCE_POLICY_CLAIM not in covered_claims:
+            status = UNVERIFIED
+            code = "comfyui_conditioning_policy_evidence_untrusted"
+            message = "ComfyUI Qwen policy claim lacks matching trusted evidence"
+        else:
+            status = READY
+            code = "comfyui_conditioning_policy_trusted"
+            message = (
+                "trusted compatibility evidence binds the fixed ComfyUI "
+                "reference-timestep-zero policy to the exact recipe digest"
+            )
+        self.items.append(
+            StatusItem(
+                artifact=_COMFYUI_QWEN_POLICY_ARTIFACT,
+                status=status,
+                code=code,
+                message=message,
+                expected={"claim": COMFYUI_QWEN_REFERENCE_POLICY_CLAIM},
+                observed={
+                    "claim_covered": COMFYUI_QWEN_REFERENCE_POLICY_CLAIM
+                    in covered_claims
+                },
+            )
+        )
 
     def _check_inventory_evidence(self) -> None:
         declaration = self.declaration
@@ -753,6 +842,11 @@ class _Evaluator:
         """Reject declared artifacts observed through the same physical file."""
         artifact_keys = (
             "engine.executable",
+            *(
+                ("engine.interpreter",)
+                if self.declaration.engine.launch is not None
+                else ()
+            ),
             "recipe.document",
             *(
                 f"component:{component.id}"
@@ -774,7 +868,7 @@ class _Evaluator:
                 status=CORRUPT,
                 code="physical_alias",
                 message=(
-                    "engine, recipe, and component files must reference "
+                    "engine, interpreter, recipe, and component files must reference "
                     "distinct physical files"
                 ),
                 expected={"distinct_physical_files": True},
@@ -787,7 +881,7 @@ class _Evaluator:
         self._add_artifact(
             "engine.executable",
             declaration.engine.executable,
-            require_executable=True,
+            require_executable=declaration.requires_executable("engine"),
         )
         self._check_provenance(
             "engine",
@@ -805,6 +899,31 @@ class _Evaluator:
             identifier=declaration.engine.id,
             role="engine",
         )
+        if declaration.engine.launch is not None:
+            launch = declaration.engine.launch
+            self._add_artifact(
+                "engine.interpreter",
+                launch.interpreter,
+                require_executable=declaration.requires_executable(
+                    "engine.interpreter"
+                ),
+            )
+            self._check_provenance(
+                "engine.interpreter",
+                launch.provenance,
+                launch.interpreter,
+                kind="engine",
+                identifier=f"{declaration.engine.id}-python-interpreter",
+                role="python-interpreter",
+            )
+            self._check_license(
+                "engine.interpreter",
+                launch.license,
+                launch.interpreter,
+                kind="engine",
+                identifier=f"{declaration.engine.id}-python-interpreter",
+                role="python-interpreter",
+            )
         self._add_artifact("recipe.document", declaration.recipe.document)
         self._check_compatibility()
         required_claims = {
@@ -816,7 +935,10 @@ class _Evaluator:
             ),
             *(f"flag:{name}" for name, _ in declaration.recipe.architecture_flags),
         }
+        if self.selected_backend_kind == _COMFYUI_BACKEND_KIND:
+            required_claims.add(COMFYUI_QWEN_REFERENCE_POLICY_CLAIM)
         covered_claims = self._check_compatibility_evidence()
+        self._check_comfyui_qwen_policy(covered_claims)
         missing_claims = sorted(required_claims - covered_claims)
         if missing_claims:
             self.items.append(
@@ -1075,7 +1197,7 @@ def _observe_target(
         root.path / Path(pin.path),
         root.path,
         maximum=pin.size_bytes + 1,
-        require_executable=target == "engine",
+        require_executable=declaration.requires_executable(target),
     )
     if observed.status == READY and observed.size_bytes != pin.size_bytes:
         return ObservedArtifact(
@@ -1092,30 +1214,47 @@ def evaluate_candidate(
     declaration: CandidateDeclaration,
     *,
     trusted_evidence: Iterable[TrustedEvidence] = (),
+    selected_backend_kind: str | None = None,
 ) -> CandidateEvaluation:
     """Run the authoritative offline static evaluation."""
     return _Evaluator(
-        declaration, trusted_evidence=trusted_evidence
+        declaration,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind=selected_backend_kind,
     ).evaluate()
 def inspect_candidate(
     declaration_path: Path,
     *,
     trusted_evidence: Iterable[TrustedEvidence] = (),
+    selected_backend_kind: str | None = None,
 ) -> dict[str, object]:
-    """Inspect and statically verify a candidate without writing anything."""
+    """Inspect a candidate without writing files.
+
+    ``selected_backend_kind`` applies compatibility rules owned by the selected
+    engine. The default keeps the stable-diffusion.cpp contract.
+    """
     declaration = parse_candidate(declaration_path)
     return evaluate_candidate(
-        declaration, trusted_evidence=trusted_evidence
+        declaration,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind=selected_backend_kind,
     ).report("inspect")
 def verify_candidate(
     declaration_path: Path,
     *,
     trusted_evidence: Iterable[TrustedEvidence] = (),
+    selected_backend_kind: str | None = None,
 ) -> dict[str, object]:
-    """Repeat offline verification without writing candidate artifacts."""
+    """Verify a candidate without writing artifacts.
+
+    ``selected_backend_kind`` applies compatibility rules owned by the selected
+    engine. The default keeps the stable-diffusion.cpp contract.
+    """
     declaration = parse_candidate(declaration_path)
     return evaluate_candidate(
-        declaration, trusted_evidence=trusted_evidence
+        declaration,
+        trusted_evidence=trusted_evidence,
+        selected_backend_kind=selected_backend_kind,
     ).report("verify")
 def candidate_exit_code(status: str) -> int:
     """Map a static result to a stable CLI exit code."""

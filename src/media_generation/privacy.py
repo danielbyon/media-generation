@@ -9,10 +9,17 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from ipaddress import ip_address
+from pathlib import Path
 
 
 PRIVACY_PROFILE_SCHEMA_VERSION = "local-inference-privacy-profile/v1"
 PRIVACY_RESULT_SCHEMA_VERSION = "local-inference-privacy-result/v1"
+COMFYUI_PRIVACY_EVIDENCE_SCHEMA = "media-generation.comfyui-privacy-evidence"
+COMFYUI_PRIVACY_EVIDENCE_SCHEMA_VERSION = 1
+COMFYUI_PRIVACY_EVIDENCE_SOURCE = (
+    "application-owned-profile+effective-configuration"
+)
 ASSURANCE_SCOPE = "configuration-compliance-only"
 
 _MISSING = object()
@@ -1069,6 +1076,110 @@ def _digest(value: object) -> str:
 
 LOCAL_INFERENCE_CONFIGURATION_VERSION = "sd-cpp-local/v1"
 LOCAL_INFERENCE_ENGINE_VERSION = "master-975-95b3090-2-gb13a482"
+COMFYUI_ADAPTER_ID = "comfyui-local-v1"
+COMFYUI_CONFIGURATION_VERSION = "comfyui-local/v2"
+COMFYUI_TOOL_ID = "comfyui"
+COMFYUI_SAFE_ENVIRONMENT_NAMES = frozenset(
+    {
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "ROCM_PATH",
+        "HIP_VISIBLE_DEVICES",
+        "CUDA_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+        "PYTHONHASHSEED",
+    }
+)
+
+
+# This is the application-owned input contract for the pinned ComfyUI graphs.
+# A new class or input must be classified here; otherwise privacy stays unverified.
+_COMFYUI_PRIVACY_INPUT_NAMES: dict[str, frozenset[str]] = {
+    "UNETLoader": frozenset({"unet_name", "weight_dtype"}),
+    "CLIPLoader": frozenset({"clip_name", "device", "type"}),
+    "VAELoader": frozenset({"vae_name"}),
+    "CLIPTextEncode": frozenset({"clip", "text"}),
+    "TextEncodeQwenImageEditPlus": frozenset(
+        {"clip", "image1", "image2", "image3", "prompt", "vae"}
+    ),
+    "FluxKontextImageScale": frozenset({"image"}),
+    "FluxKontextMultiReferenceLatentMethod": frozenset(
+        {"conditioning", "reference_latents_method"}
+    ),
+    "CFGNorm": frozenset({"model", "pre_cfg", "strength"}),
+    "ModelSamplingAuraFlow": frozenset({"model", "sampling", "shift"}),
+    "EmptyLatentImage": frozenset({"batch_size", "height", "width"}),
+    "KSampler": frozenset(
+        {
+            "cfg",
+            "denoise",
+            "latent_image",
+            "model",
+            "negative",
+            "positive",
+            "sampler_name",
+            "scheduler",
+            "seed",
+            "steps",
+        }
+    ),
+    "VAEDecode": frozenset({"samples", "vae"}),
+    "SaveImage": frozenset({"filename_prefix", "images"}),
+    "LoadImage": frozenset({"image"}),
+    "ImageScale": frozenset(
+        {"crop", "height", "image", "upscale_method", "width"}
+    ),
+    "VAEEncode": frozenset({"pixels", "vae"}),
+}
+_PYTHON_HASH_SEED_MAX = "4294967295"
+_PYTHON_HASH_SEED_DECIMAL = re.compile(r"[0-9]+\Z")
+
+
+def is_valid_python_hash_seed(value: object) -> bool:
+    """Validate the documented ``PYTHONHASHSEED`` value forms.
+
+    Accept ``random`` or ASCII decimal digits from 0 through 4294967295.
+    """
+    if not isinstance(value, str):
+        return False
+    if value == "random":
+        return True
+    if not value.isascii() or _PYTHON_HASH_SEED_DECIMAL.fullmatch(value) is None:
+        return False
+    significant_digits = value.lstrip("0") or "0"
+    return len(significant_digits) < 10 or (
+        len(significant_digits) == 10
+        and significant_digits <= _PYTHON_HASH_SEED_MAX
+    )
+
+
+_COMFYUI_PYTHON_BOOTSTRAP_PATH = str(
+    Path(__file__).with_name("_comfyui_python_bootstrap.py").resolve()
+)
+COMFYUI_VALUE_ARGUMENTS = frozenset(
+    {
+        "--listen",
+        "--port",
+        "--base-directory",
+        "--output-directory",
+        "--temp-directory",
+        "--input-directory",
+        "--front-end-root",
+        "--feature-flag",
+    }
+)
+COMFYUI_BOOLEAN_ARGUMENTS = frozenset(
+    {
+        "--disable-all-custom-nodes",
+        "--disable-auto-launch",
+        "--offline",
+    }
+)
+_COMFYUI_CREDENTIAL_VALUE = re.compile(
+    r"(?i)\b(?:authorization|bearer|access[_-]?token|api[_-]?key|"
+    r"client[_-]?secret|password|passwd|secret|token)\b\s*[:=]\s*\S+"
+)
+_COMFYUI_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
 """Exact stable-diffusion.cpp revision identity the local profile covers.
 
 The value is the revision identity reported by the pinned stable-diffusion.cpp
@@ -1129,9 +1240,11 @@ _SAFE_ENVIRONMENT_NAMES = frozenset(
         "ROCM_PATH",
         "HIP_VISIBLE_DEVICES",
         "HSA_OVERRIDE_GFX_VERSION",
+        "PYTHONHASHSEED",
     }
 )
 _REMOTE_URL = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+_DATA_URL = re.compile(r"data:image/", re.IGNORECASE)
 _WORD = re.compile(r"[a-z0-9]+")
 
 
@@ -1208,6 +1321,8 @@ def invocation_privacy_settings(
 
     for name, value in environment.items():
         normalized = name.lower()
+        if name == "PYTHONHASHSEED" and not is_valid_python_hash_seed(value):
+            unknown = True
         if normalized.endswith("_proxy"):
             settings[PrivacyControl.REMOTE_ENDPOINT_OR_PROXY.value] = True
         elif name not in _SAFE_ENVIRONMENT_NAMES:
@@ -1223,6 +1338,599 @@ def invocation_privacy_settings(
             if value is False:
                 settings[control] = None
     return settings
+
+
+def _all_cached_privacy_settings() -> dict[str, bool | None]:
+    return {control.value: None for control in PrivacyControl}
+
+
+def _comfyui_listen_address_is_prohibited(value: object) -> bool:
+    """Return whether a literal ComfyUI bind address is non-loopback."""
+    if not isinstance(value, str):
+        return False
+    try:
+        address = ip_address(value)
+    except ValueError:
+        return False
+    return not address.is_loopback
+
+
+def _comfyui_explicit_privacy_failures(
+    argv: Iterable[str],
+    environment: Mapping[str, str],
+    effective_execution: Mapping[str, object],
+) -> frozenset[PrivacyControl]:
+    """Return controls disabled by exact, recognized ComfyUI settings.
+
+    This pass recognizes only settings whose names and prohibited values are
+    defined by the ComfyUI adapter contract. Prompt arguments and their values
+    are skipped so prompt text cannot change the verdict. Any setting not
+    recognized here remains unverified through the full invocation check.
+    """
+    failures: set[PrivacyControl] = set()
+    for name in environment:
+        if isinstance(name, str) and name.casefold().endswith("_proxy"):
+            failures.add(PrivacyControl.REMOTE_ENDPOINT_OR_PROXY)
+
+    tokens = tuple(argv)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not isinstance(token, str):
+            index += 1
+            continue
+        if token == "--listen":
+            value = tokens[index + 1] if index + 1 < len(tokens) else None
+            if _comfyui_listen_address_is_prohibited(value):
+                failures.add(PrivacyControl.REMOTE_ENDPOINT_OR_PROXY)
+            index += 2
+            continue
+        if token in _PROMPT_FLAGS:
+            index += 2
+            continue
+        if token == "--feature-flag":
+            value = tokens[index + 1] if index + 1 < len(tokens) else None
+            if value == "enable_upload=true":
+                failures.add(PrivacyControl.CONTENT_UPLOAD)
+            elif value == "enable_telemetry=true":
+                failures.add(PrivacyControl.TELEMETRY)
+            elif value == "enable_remote=true":
+                failures.add(PrivacyControl.REMOTE_ENDPOINT_OR_PROXY)
+            index += 2
+            continue
+        if token in {"--proxy", "--remote-backend"}:
+            failures.add(PrivacyControl.REMOTE_ENDPOINT_OR_PROXY)
+            index += 2
+            continue
+        if token in {"--enable-upload", "--enable-remote-upload"}:
+            failures.add(PrivacyControl.CONTENT_UPLOAD)
+        index += 1
+
+    configuration = effective_execution.get("configuration")
+    if isinstance(configuration, Mapping):
+        server = configuration.get("server")
+        if isinstance(server, Mapping):
+            host = server.get("host")
+            if isinstance(host, str) and host != "127.0.0.1":
+                failures.add(PrivacyControl.REMOTE_ENDPOINT_OR_PROXY)
+            if server.get("offline") is False:
+                failures.add(PrivacyControl.AUTOMATIC_NETWORK_FETCH_OR_UPDATE)
+    return frozenset(failures)
+
+
+def _privacy_settings_with_failures(
+    failures: Iterable[PrivacyControl],
+) -> dict[str, bool | None]:
+    settings = _all_cached_privacy_settings()
+    for control in failures:
+        settings[control.value] = True
+    return settings
+
+
+_COMFYUI_PRIVACY_EVIDENCE_FIELDS = frozenset(
+    {
+        "schema",
+        "schema_version",
+        "status",
+        "evidence_source",
+        "adapter_id",
+        "engine_id",
+        "engine_version",
+        "configuration_version",
+        "profile_id",
+        "profile_version",
+        "profile_fingerprint",
+        "effective_configuration_sha256",
+        "reasons",
+        "fingerprint",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ComfyUIResolvedPrivacyEvidence:
+    """Redacted privacy result bound to one exact effective configuration."""
+
+    status: PrivacyComplianceStatus
+    adapter_id: str
+    engine_id: str
+    engine_version: str
+    configuration_version: bool | int | str
+    profile_id: str
+    profile_version: int
+    profile_fingerprint: str
+    effective_configuration_sha256: str
+    reasons: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema": COMFYUI_PRIVACY_EVIDENCE_SCHEMA,
+            "schema_version": COMFYUI_PRIVACY_EVIDENCE_SCHEMA_VERSION,
+            "status": self.status.value,
+            "evidence_source": COMFYUI_PRIVACY_EVIDENCE_SOURCE,
+            "adapter_id": self.adapter_id,
+            "engine_id": self.engine_id,
+            "engine_version": self.engine_version,
+            "configuration_version": self.configuration_version,
+            "profile_id": self.profile_id,
+            "profile_version": self.profile_version,
+            "profile_fingerprint": self.profile_fingerprint,
+            "effective_configuration_sha256": self.effective_configuration_sha256,
+            "reasons": list(self.reasons),
+        }
+        payload["fingerprint"] = _digest(payload)
+        return payload
+
+
+def comfyui_resolved_privacy_evidence(
+    result: PrivacyComplianceResult,
+    effective_execution: Mapping[str, object],
+    *,
+    configuration_version: object,
+) -> ComfyUIResolvedPrivacyEvidence:
+    """Bind one policy result to exact ComfyUI effective evidence."""
+
+    configuration = effective_execution.get("configuration")
+    if not isinstance(configuration, Mapping):
+        raise ValueError("effective configuration must be an object")
+    engine = configuration.get("engine")
+    if not isinstance(engine, Mapping):
+        raise ValueError("effective engine must be an object")
+    engine_id = engine.get("id")
+    engine_version = engine.get("version")
+    if (
+        engine_id != COMFYUI_TOOL_ID
+        or not isinstance(engine_version, str)
+        or not engine_version
+        or configuration_version != COMFYUI_CONFIGURATION_VERSION
+        or result.adapter_id != COMFYUI_ADAPTER_ID
+        or result.tool_id != engine_id
+        or result.tool_version != engine_version
+        or result.configuration_version != configuration_version
+        or result.profile_id is None
+        or result.profile_version is None
+        or result.profile_fingerprint is None
+    ):
+        raise ValueError("privacy result does not bind the ComfyUI profile")
+    profile = comfyui_local_privacy_profile(
+        adapter_id=result.adapter_id,
+        tool_version=engine_version,
+        configuration_version=configuration_version,
+    )
+    if (
+        result.profile_id != profile.profile_id
+        or result.profile_version != profile.profile_version
+        or result.profile_fingerprint != profile.fingerprint
+    ):
+        raise ValueError("privacy result does not match the application-owned profile")
+    return ComfyUIResolvedPrivacyEvidence(
+        status=result.status,
+        adapter_id=result.adapter_id,
+        engine_id=engine_id,
+        engine_version=engine_version,
+        configuration_version=configuration_version,
+        profile_id=result.profile_id,
+        profile_version=result.profile_version,
+        profile_fingerprint=result.profile_fingerprint,
+        effective_configuration_sha256=_digest(configuration),
+        reasons=tuple(sorted(result.reason_codes)),
+    )
+
+
+def validate_comfyui_resolved_privacy_evidence(value: object) -> None:
+    """Validate one current ComfyUI privacy evidence object."""
+
+    if not isinstance(value, dict) or set(value) != _COMFYUI_PRIVACY_EVIDENCE_FIELDS:
+        raise ValueError("ComfyUI privacy evidence fields are invalid")
+    if (
+        value["schema"] != COMFYUI_PRIVACY_EVIDENCE_SCHEMA
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != COMFYUI_PRIVACY_EVIDENCE_SCHEMA_VERSION
+        or value["evidence_source"] != COMFYUI_PRIVACY_EVIDENCE_SOURCE
+    ):
+        raise ValueError("ComfyUI privacy evidence schema is unsupported")
+    status = value["status"]
+    if status not in {item.value for item in PrivacyComplianceStatus}:
+        raise ValueError("ComfyUI privacy evidence status is invalid")
+    adapter_id = value["adapter_id"]
+    engine_id = value["engine_id"]
+    engine_version = value["engine_version"]
+    configuration_version = value["configuration_version"]
+    profile_id = value["profile_id"]
+    profile_version = value["profile_version"]
+    profile_fingerprint = value["profile_fingerprint"]
+    effective_digest = value["effective_configuration_sha256"]
+    if (
+        adapter_id != COMFYUI_ADAPTER_ID
+        or engine_id != COMFYUI_TOOL_ID
+        or not isinstance(engine_version, str)
+        or not engine_version
+        or configuration_version != COMFYUI_CONFIGURATION_VERSION
+        or profile_id != "comfyui-local"
+        or isinstance(profile_version, bool)
+        or not isinstance(profile_version, int)
+        or profile_version < 1
+        or not _is_sha256_hex(profile_fingerprint)
+        or not _is_sha256_hex(effective_digest)
+    ):
+        raise ValueError("ComfyUI privacy evidence identity is invalid")
+    profile = comfyui_local_privacy_profile(
+        adapter_id=adapter_id,
+        tool_version=engine_version,
+        configuration_version=configuration_version,
+    )
+    if (
+        profile_id != profile.profile_id
+        or profile_version != profile.profile_version
+        or profile_fingerprint != profile.fingerprint
+    ):
+        raise ValueError("ComfyUI privacy evidence profile does not match")
+    reasons = value["reasons"]
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(reason, str) or not reason for reason in reasons)
+        or reasons != sorted(set(reasons))
+        or any(reason not in _PRIVACY_REASON_CODES for reason in reasons)
+    ):
+        raise ValueError("ComfyUI privacy evidence reasons are invalid")
+    reason_set = set(reasons)
+    if status == PrivacyComplianceStatus.PASS.value:
+        if reason_set != {"all_required_settings_verified"}:
+            raise ValueError("passing ComfyUI privacy evidence has failing reasons")
+    elif status == PrivacyComplianceStatus.FAIL.value:
+        if not reason_set & {
+            "acquisition_configuration_present",
+            "credential_material_present",
+            "prohibited_setting_enabled",
+        }:
+            raise ValueError("failing ComfyUI privacy evidence lacks a failure")
+    elif reason_set & {
+        "all_required_settings_verified",
+        "acquisition_configuration_present",
+        "credential_material_present",
+        "prohibited_setting_enabled",
+    }:
+        raise ValueError("unverified ComfyUI privacy evidence has a verdict reason")
+    payload = {key: item for key, item in value.items() if key != "fingerprint"}
+    if not _is_sha256_hex(value["fingerprint"]) or _digest(payload) != value["fingerprint"]:
+        raise ValueError("ComfyUI privacy evidence fingerprint does not match")
+
+
+def is_comfyui_resolved_privacy_evidence(value: object) -> bool:
+    """Return whether value is one valid ComfyUI privacy evidence object."""
+
+    try:
+        validate_comfyui_resolved_privacy_evidence(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def comfyui_invocation_privacy_settings(
+    argv: Iterable[str],
+    environment: Mapping[str, str],
+    effective_execution: Mapping[str, object],
+) -> dict[str, bool | None]:
+    """Evaluate local-only privacy for a resolved ComfyUI launch and API.
+
+    A bound launch has a fixed Python bootstrap prefix. Validate it before
+    parsing engine options after ``--``. The ``--offline`` flag records a
+    frontend and Partner Node control. It does not prove operating-system
+    egress isolation or prevent backend dependencies from connecting remotely.
+    """
+    try:
+        tokens = tuple(argv)
+        configuration = effective_execution["configuration"]
+        graph = effective_execution["graph"]
+        request_body = effective_execution["request_body"]
+        explicit_failures = _comfyui_explicit_privacy_failures(
+            tokens, environment, effective_execution
+        )
+        if explicit_failures:
+            return _privacy_settings_with_failures(explicit_failures)
+        if (
+            len(tokens) < 14
+            or not all(isinstance(token, str) and token for token in tokens)
+            or not isinstance(configuration, Mapping)
+            or not isinstance(graph, Mapping)
+            or not isinstance(request_body, Mapping)
+        ):
+            return _all_cached_privacy_settings()
+        if set(configuration) != {
+            "engine", "workflow", "server", "nodes", "components", "model_files",
+            "model_facing", "api", "output",
+        }:
+            return _all_cached_privacy_settings()
+        server = configuration["server"]
+        nodes = configuration["nodes"]
+        api = configuration["api"]
+        model_components = configuration["components"]
+        if not all(isinstance(value, Mapping) for value in (server, nodes, api)):
+            return _all_cached_privacy_settings()
+        if not isinstance(model_components, list):
+            return _all_cached_privacy_settings()
+        base_server_fields = {
+        "host", "port", "offline", "base_directory", "models_directory",
+        "frontend_root", "frontend_root_sha256",
+            "output_directory", "temp_directory", "input_directory",
+        }
+        if set(server) not in (
+            base_server_fields,
+            base_server_fields | {"argv", "environment"},
+        ):
+            return _all_cached_privacy_settings()
+        server_argument_start = 2
+        if "argv" in server:
+            engine = configuration["engine"]
+            try:
+                stdlib_marker = tokens.index("--stdlib-paths")
+                imports_marker = tokens.index("--import-roots", stdlib_marker + 1)
+                separator = tokens.index("--", imports_marker + 1)
+            except ValueError:
+                return _all_cached_privacy_settings()
+            entrypoint_index = separator + 1
+            runtime_paths = (
+                tokens[5:7]
+                + tokens[stdlib_marker + 1 : imports_marker]
+                + tokens[imports_marker + 1 : imports_marker + 3]
+            )
+            if (
+                not isinstance(engine, Mapping)
+                or server["argv"] != list(tokens)
+                or not isinstance(server["environment"], Mapping)
+                or server["environment"] != dict(environment)
+                or not Path(tokens[0]).is_absolute()
+                or ".." in Path(tokens[0]).parts
+                or str(Path(tokens[0])) != tokens[0]
+                or tuple(tokens[1:5])
+                != (
+                    "-P",
+                    "-s",
+                    "-S",
+                    _COMFYUI_PYTHON_BOOTSTRAP_PATH,
+                )
+                or stdlib_marker != 7
+                or imports_marker <= stdlib_marker + 1
+                or separator != imports_marker + 3
+                or entrypoint_index >= len(tokens)
+                or engine.get("executable_path") != tokens[entrypoint_index]
+                or engine.get("runtime_fingerprint_sha256") is None
+                or any(
+                    not Path(path).is_relative_to(Path(tokens[6]))
+                    for path in tokens[stdlib_marker + 1 : imports_marker]
+                )
+                or any(
+                    not Path(value).is_absolute()
+                    or ".." in Path(value).parts
+                    or str(Path(value)) != value
+                    for value in (*runtime_paths, tokens[entrypoint_index])
+                )
+            ):
+                return _all_cached_privacy_settings()
+            server_argument_start = entrypoint_index + 1
+            if (
+                set(environment) - COMFYUI_SAFE_ENVIRONMENT_NAMES
+                or any(_is_sensitive_name(name) for name in environment)
+                or any(not isinstance(value, str) for value in environment.values())
+                or (
+                    "PYTHONHASHSEED" in environment
+                    and not is_valid_python_hash_seed(environment["PYTHONHASHSEED"])
+                )
+                or any(
+                    name.upper().startswith("PYTHON")
+                    and name.upper() != "PYTHONHASHSEED"
+                    and not (
+                        name.upper() == "PYTHONHASHSEED"
+                        and is_valid_python_hash_seed(value)
+                    )
+                    for name, value in environment.items()
+                )
+            ):
+                return _all_cached_privacy_settings()
+        if api != {
+            "prompt": "/prompt",
+            "jobs": "/api/jobs?limit=1000",
+            "queue": "/queue",
+            "node_replacements": "/node_replacements",
+            "history": "/history/{prompt_id}",
+            "view": "/view",
+            "upload": "/upload/image",
+        }:
+            return _all_cached_privacy_settings()
+        if server["host"] != "127.0.0.1" or server["offline"] is not True:
+            return _all_cached_privacy_settings()
+        port = server["port"]
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            return _all_cached_privacy_settings()
+        frontend_root = server["frontend_root"]
+        base_directory = server["base_directory"]
+        models_directory = server["models_directory"]
+        if (
+            not isinstance(frontend_root, str)
+            or not frontend_root.startswith("/")
+            or "\\" in frontend_root
+            or _REMOTE_URL.search(frontend_root)
+            or not isinstance(server["frontend_root_sha256"], str)
+            or not _COMFYUI_SHA256.fullmatch(server["frontend_root_sha256"])
+            or not isinstance(base_directory, str)
+            or not base_directory.startswith("/")
+            or "\\" in base_directory
+            or _REMOTE_URL.search(base_directory)
+            or models_directory != f"{base_directory}/models"
+        ):
+            return _all_cached_privacy_settings()
+
+        used_classes: set[str] = set()
+        for node in graph.values():
+            if not isinstance(node, Mapping):
+                return _all_cached_privacy_settings()
+            class_type = node.get("class_type")
+            inputs = node.get("inputs")
+            if (
+                not isinstance(class_type, str)
+            or not class_type
+                or not isinstance(inputs, Mapping)
+            ):
+                return _all_cached_privacy_settings()
+            used_classes.add(class_type)
+            for input_name, value in inputs.items():
+                if not isinstance(input_name, str) or _is_sensitive_name(input_name):
+                    return _all_cached_privacy_settings()
+                if _comfyui_private_graph_value(value):
+                    return _all_cached_privacy_settings()
+        if used_classes != set(nodes) or not nodes:
+            return _all_cached_privacy_settings()
+        node_components = {
+            component.get("id"): component.get("sha256")
+            for component in model_components
+            if isinstance(component, Mapping) and component.get("role") == "other"
+        }
+        if not node_components:
+            return _all_cached_privacy_settings()
+        require_explicit_pin_class = "argv" in server
+        for class_type, pin in nodes.items():
+            pin_fields = {"component_id", "sha256", "inputs"}
+            if isinstance(pin, Mapping) and "class" in pin:
+                pin_fields.add("class")
+            if (
+                not isinstance(class_type, str)
+            or not class_type
+            or not isinstance(pin, Mapping)
+            or set(pin) != pin_fields
+            or (require_explicit_pin_class and "class" not in pin)
+            or ("class" in pin and pin["class"] != class_type)
+            or node_components.get(pin.get("component_id")) != pin.get("sha256")
+            or not isinstance(pin.get("inputs"), list)
+            or not pin["inputs"]
+            or any(not isinstance(name, str) or not name for name in pin["inputs"])
+            ):
+                return _all_cached_privacy_settings()
+            allowed_input_names = _COMFYUI_PRIVACY_INPUT_NAMES.get(class_type)
+            if allowed_input_names is None or any(
+                name not in allowed_input_names for name in pin["inputs"]
+            ):
+                return _all_cached_privacy_settings()
+
+            graph_inputs = {
+                str(input_name)
+                for node in graph.values()
+                if isinstance(node, Mapping)
+                and node.get("class_type") == class_type
+                and isinstance(node.get("inputs"), Mapping)
+                for input_name in node["inputs"]
+            }
+            if not graph_inputs <= set(pin["inputs"]):
+                return _all_cached_privacy_settings()
+
+        observed: dict[str, str | bool] = {}
+        feature_flags: list[str] = []
+        index = server_argument_start
+        while index < len(tokens):
+            token = tokens[index]
+            if token in COMFYUI_BOOLEAN_ARGUMENTS:
+                if token in observed:
+                    return _all_cached_privacy_settings()
+                observed[token] = True
+                index += 1
+                continue
+            if token in COMFYUI_VALUE_ARGUMENTS:
+                if index + 1 >= len(tokens):
+                    return _all_cached_privacy_settings()
+                value = tokens[index + 1]
+                if token == "--feature-flag":
+                    if value != "enable_telemetry=false":
+                        return _all_cached_privacy_settings()
+                    feature_flags.append(value)
+                elif token in observed or not value:
+                    return _all_cached_privacy_settings()
+                else:
+                    observed[token] = value
+                index += 2
+                continue
+            return _all_cached_privacy_settings()
+        if feature_flags != ["enable_telemetry=false"]:
+            return _all_cached_privacy_settings()
+        if (
+            observed.get("--listen") != "127.0.0.1"
+            or observed.get("--port") != str(port)
+            or observed.get("--base-directory") != base_directory
+            or observed.get("--front-end-root") != frontend_root
+            or observed.get("--offline") is not True
+            or observed.get("--disable-all-custom-nodes") is not True
+            or observed.get("--disable-auto-launch") is not True
+        ):
+            return _all_cached_privacy_settings()
+        for flag in (
+            "--base-directory",
+            "--output-directory",
+            "--temp-directory",
+            "--input-directory",
+        ):
+            if observed.get(flag) != server[flag.removeprefix("--").replace("-", "_")]:
+                return _all_cached_privacy_settings()
+        if request_body.get("prompt") != graph:
+            return _all_cached_privacy_settings()
+        if _comfyui_private_graph_value(configuration) or _comfyui_private_graph_value(request_body):
+            return _all_cached_privacy_settings()
+
+        for name, value in environment.items():
+            if (
+                not isinstance(name, str)
+                or not isinstance(value, str)
+                or name.lower().endswith("_proxy")
+                or _is_sensitive_name(name)
+                or name not in COMFYUI_SAFE_ENVIRONMENT_NAMES
+                or (
+                    name == "PYTHONHASHSEED"
+                    and not is_valid_python_hash_seed(value)
+                )
+                or _REMOTE_URL.search(value)
+            ):
+                return _all_cached_privacy_settings()
+        return {control.value: False for control in PrivacyControl}
+    except (KeyError, TypeError, ValueError):
+        return _all_cached_privacy_settings()
+
+
+def _comfyui_private_graph_value(value: object) -> bool:
+    """Return true when nested ComfyUI evidence contains remote or secret data."""
+    if isinstance(value, str):
+        return bool(
+            _REMOTE_URL.search(value)
+            or _DATA_URL.search(value)
+            or _COMFYUI_CREDENTIAL_VALUE.search(value)
+        )
+    if isinstance(value, Mapping):
+        return any(
+            not isinstance(name, str)
+            or _is_sensitive_name(name)
+            or _comfyui_private_graph_value(child)
+            for name, child in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return any(_comfyui_private_graph_value(child) for child in value)
+    return False
 
 
 def _matches_remote_token(value: str) -> bool:
@@ -1263,6 +1971,37 @@ def local_inference_privacy_profile(
         profile_version=1,
         adapter_id=adapter_id,
         tool_id="stable-diffusion.cpp",
+        tool_version=tool_version,
+        configuration_version=configuration_version,
+        requirements=requirements,
+        supports_configuration_compliance=True,
+    )
+
+
+def comfyui_local_privacy_profile(
+    *,
+    adapter_id: str = COMFYUI_ADAPTER_ID,
+    tool_version: str,
+    configuration_version: object = COMFYUI_CONFIGURATION_VERSION,
+) -> PrivacyProfile:
+    """Return the independent application-owned ComfyUI local-only profile."""
+    if not isinstance(tool_version, str) or not tool_version.strip():
+        raise ValueError("tool_version must be a non-empty string")
+    requirements = tuple(
+        PrivacySettingRule(
+            control=control,
+            path=("privacy", control.value),
+            expected=False,
+            prohibited=(True,),
+        )
+        for control in PrivacyControl
+    )
+    return PrivacyProfile(
+        schema_version=PRIVACY_PROFILE_SCHEMA_VERSION,
+        profile_id="comfyui-local",
+        profile_version=1,
+        adapter_id=adapter_id,
+        tool_id=COMFYUI_TOOL_ID,
         tool_version=tool_version,
         configuration_version=configuration_version,
         requirements=requirements,
@@ -1316,6 +2055,12 @@ class LocalInferencePrivacyRegistration:
     def profile(self) -> PrivacyProfile:
         """Return the exact pinned profile this registration authorizes."""
 
+        if self.tool_id == COMFYUI_TOOL_ID:
+            return comfyui_local_privacy_profile(
+                adapter_id=self.adapter_id,
+                tool_version=self.tool_version,
+                configuration_version=self.configuration_version,
+            )
         return local_inference_privacy_profile(
             adapter_id=self.adapter_id,
             tool_version=self.tool_version,
@@ -1350,6 +2095,23 @@ def application_privacy_registration(
 
     if not isinstance(adapter_id, str) or not adapter_id:
         raise ValueError("backend execution adapter must declare adapter_id")
+    if adapter_id == COMFYUI_ADAPTER_ID:
+        try:
+            from .comfyui_runtime_pins import load_runtime_pin_approval
+
+            approval = load_runtime_pin_approval(verify_paths=False)
+        except (ImportError, OSError, ValueError) as error:
+            raise ValueError(
+                "ComfyUI has no independently authenticated runtime version registration"
+            ) from error
+        if approval.configuration_version != COMFYUI_CONFIGURATION_VERSION:
+            raise ValueError("ComfyUI runtime configuration version is unsupported")
+        return LocalInferencePrivacyRegistration(
+            adapter_id=COMFYUI_ADAPTER_ID,
+            tool_id=COMFYUI_TOOL_ID,
+            tool_version=approval.tool_version,
+            configuration_version=approval.configuration_version,
+        )
     registration = APPLICATION_PRIVACY_REGISTRY.get(adapter_id)
     if registration is None:
         raise ValueError(
