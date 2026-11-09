@@ -328,6 +328,7 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
     resource = service._store.resource_snapshot()
     listener_marker = bundle.files / "listener-bound.json"
     listener_bind_error = bundle.files / "listener-bind-error.json"
+    listener_pre_bind = bundle.files / "listener-pre-bind.json"
     observed = execution["observed"]
     listener_bound = (
         listener_marker.read_text(encoding="utf-8") if listener_marker.exists() else None
@@ -338,11 +339,15 @@ def test_comfyui_release_policy_fails_closed_for_untrusted_configuration(
         else None
     )
     child_exit_code = observed.get("exit_code") if observed else None
+    child_signal = observed.get("signal") if observed else None
     child_stderr_bytes = observed.get("stderr_bytes") if observed else None
+    child_duration_seconds = observed.get("duration_seconds") if observed else None
     diagnostics = (
         f"failure={provenance['execution']['failure_message']}; "
         f"state={execution['state']}; launch_recorded={execution['launch'] is not None}; "
-        f"exit_code={child_exit_code}; stderr_bytes={child_stderr_bytes}; "
+        f"exit_code={child_exit_code}; signal={child_signal}; "
+        f"duration={child_duration_seconds}; stderr_bytes={child_stderr_bytes}; "
+        f"pre_bind={'present' if listener_pre_bind.exists() else 'absent'}; "
         f"listener_bound={listener_bound}; listener_bind_error={bind_error}"
     )
     assert provenance["status"] == "succeeded", diagnostics

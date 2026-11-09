@@ -358,6 +358,17 @@ def main() -> int:
                 return
             self._json(404, {"error": "missing"})
 
+    (cwd / "listener-pre-bind.json").write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "host": options.listen,
+                "port": options.port,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     try:
         server = ThreadingHTTPServer((options.listen, options.port), Handler)
     except OSError as error:

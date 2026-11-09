@@ -58,6 +58,11 @@ def test_comfyui_fixture_records_listener_bind_failure(tmp_path: Path) -> None:
         )
 
     assert result.returncode == 7
+    pre_bind = json.loads(
+        (source_root / "listener-pre-bind.json").read_text(encoding="utf-8")
+    )
+    assert pre_bind["host"] == "127.0.0.1"
+    assert pre_bind["port"] == port
     bind_error = json.loads(
         (source_root / "listener-bind-error.json").read_text(encoding="utf-8")
     )
