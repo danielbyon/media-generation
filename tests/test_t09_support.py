@@ -6,8 +6,9 @@ import os
 import hashlib
 import json
 import sys
-import sysconfig
+import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -206,11 +207,12 @@ def synthetic_comfyui_runtime_roots_for_tests(
     candidate: Any | None = None,
 ) -> list[dict[str, str]]:
     """Build all six runtime roots required by synthetic ComfyUI launches."""
-    python_home = Path(sys.base_prefix).resolve()
-    python_imports = Path(sysconfig.get_paths()["purelib"]).resolve()
-    native_dependencies = Path(
-        sysconfig.get_config_var("LIBDIR") or sys.base_prefix
-    ).resolve()
+    python_runtime = _probe_synthetic_python_runtime_for_tests(
+        _synthetic_interpreter_path_for_tests(candidate)
+    )
+    python_home = Path(python_runtime["prefix"])
+    python_imports = Path(python_runtime["purelib"])
+    native_dependencies = Path(python_runtime["libdir"])
     if candidate is None:
         source_root = COMFYUI_SOURCE.parent.resolve()
         frontend_root = source_root
@@ -231,14 +233,83 @@ def synthetic_comfyui_runtime_roots_for_tests(
     ]
 
 
-def _synthetic_python_runtime_paths_for_tests() -> dict[str, object]:
-    stdlib = Path(sysconfig.get_path("stdlib")).resolve()
-    dynload = Path(
-        sysconfig.get_config_var("DESTSHARED") or stdlib / "lib-dynload"
-    ).resolve()
+def _synthetic_interpreter_path_for_tests(candidate: Any | None = None) -> Path:
+    """Resolve the interpreter path that the launch contract will execute."""
+    if candidate is None:
+        interpreter = Path(sys.executable)
+    else:
+        declaration = candidate.declaration
+        launch = declaration.engine.launch
+        if launch is None or launch.kind != "python-script":
+            raise AssertionError(
+                "synthetic ComfyUI candidate must declare Python-script launch"
+            )
+        interpreter = launch.interpreter.resolved_path(declaration.root_index)
+    return interpreter.resolve(strict=True)
+
+
+@lru_cache(maxsize=16)
+def _probe_synthetic_python_runtime_for_tests(
+    interpreter_path: Path,
+) -> dict[str, str]:
+    """Read prefixes and import roots from an isolated interpreter startup."""
+    environment = {"PATH": COMFYUI_CLOSED_PATH}
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT")
+        if system_root:
+            environment["SystemRoot"] = system_root
+    probe = (
+        "import json,os,sys,sysconfig;"
+        "paths=sysconfig.get_paths();stdlib=paths['stdlib'];"
+        "print(json.dumps({"
+        "'prefix':sys.prefix,'exec_prefix':sys.exec_prefix,"
+        "'base_prefix':sys.base_prefix,'base_exec_prefix':sys.base_exec_prefix,"
+        "'stdlib':stdlib,'purelib':paths['purelib'],"
+        "'dynload':sysconfig.get_config_var('DESTSHARED') or os.path.join(stdlib,'lib-dynload'),"
+        "'libdir':sysconfig.get_config_var('LIBDIR') or sys.base_prefix}))"
+    )
+    result = subprocess.run(
+        [str(interpreter_path), "-P", "-s", "-S", "-c", probe],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+        timeout=10,
+    )
+    observed = json.loads(result.stdout)
+    paths: dict[str, str] = {}
+    for name in (
+        "prefix",
+        "exec_prefix",
+        "base_prefix",
+        "base_exec_prefix",
+        "stdlib",
+        "purelib",
+        "dynload",
+        "libdir",
+    ):
+        value = observed.get(name)
+        if not isinstance(value, str) or not value:
+            raise AssertionError(f"Python runtime probe returned an invalid {name}")
+        paths[name] = str(Path(value).resolve())
+    if paths["prefix"] != paths["exec_prefix"]:
+        raise AssertionError("isolated Python exec prefix differs from its prefix")
+    if paths["base_prefix"] != paths["base_exec_prefix"]:
+        raise AssertionError("isolated Python base exec prefix differs from its base prefix")
+    return paths
+
+
+def _synthetic_python_runtime_paths_for_tests(
+    candidate: Any | None = None,
+) -> dict[str, object]:
+    python_runtime = _probe_synthetic_python_runtime_for_tests(
+        _synthetic_interpreter_path_for_tests(candidate)
+    )
     return {
-        "python_base_prefix": str(Path(sys.base_prefix).resolve()),
-        "python_stdlib_paths": list(dict.fromkeys((str(stdlib), str(dynload)))),
+        "python_base_prefix": python_runtime["base_prefix"],
+        "python_stdlib_paths": list(
+            dict.fromkeys((python_runtime["stdlib"], python_runtime["dynload"]))
+        ),
     }
 
 
@@ -250,7 +321,9 @@ def synthetic_runtime_approval_for_tests() -> SimpleNamespace:
         manifest_sha256="0" * 64,
         public_key_sha256="0" * 64,
         payload={
-            "interpreter": {"path": sys.executable},
+            "interpreter": {
+                "path": str(_synthetic_interpreter_path_for_tests())
+            },
             "roots": synthetic_comfyui_runtime_roots_for_tests(),
             **_synthetic_python_runtime_paths_for_tests(),
         },
@@ -271,16 +344,14 @@ def allow_synthetic_runtime_for_tests(
         payload["roots"] = synthetic_comfyui_runtime_roots_for_tests(candidate)
         declaration = candidate.declaration
         launch = declaration.engine.launch
-        if launch is None or launch.kind != "python-script":
-            raise AssertionError(
-                "synthetic ComfyUI candidate must declare Python-script launch"
-            )
-        interpreter = launch.interpreter.resolved_path(declaration.root_index)
+        assert launch is not None
+        interpreter = _synthetic_interpreter_path_for_tests(candidate)
         payload["interpreter"] = {
-            "path": str(interpreter.resolve(strict=True)),
+            "path": str(interpreter),
             "size_bytes": launch.interpreter.size_bytes,
             "sha256": launch.interpreter.sha256,
         }
+        payload.update(_synthetic_python_runtime_paths_for_tests(candidate))
         entrypoint = declaration.engine.executable.resolved_path(
             declaration.root_index
         )

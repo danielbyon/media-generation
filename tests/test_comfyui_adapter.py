@@ -12,6 +12,7 @@ import subprocess
 import struct
 import threading
 import sys
+import venv
 import zlib
 import select
 import socket
@@ -86,7 +87,68 @@ def test_synthetic_python_home_matches_resolved_interpreter_prefix() -> None:
         env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
     )
 
-    assert runtime_roots["python_home"] == result.stdout.strip()
+    assert runtime_roots["python_home"] == str(Path(result.stdout.strip()).resolve())
+
+
+@pytest.mark.parametrize(
+    ("symlinks", "expected_prefix_relation"),
+    [(False, "different"), (True, "same")],
+    ids=["copied-venv", "symlinked-venv-resolved-to-base"],
+)
+def test_synthetic_python_runtime_matches_resolved_venv_executable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    symlinks: bool,
+    expected_prefix_relation: str,
+) -> None:
+    environment = tmp_path / "python-env"
+    venv.EnvBuilder(with_pip=False, symlinks=symlinks).create(environment)
+    executable = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if symlinks and not executable.is_symlink():
+        pytest.skip("this platform does not provide symlink-based venv interpreters")
+
+    resolved_interpreter = executable.resolve(strict=True)
+    probe_environment = {"PATH": comfyui_runtime_pins.COMFYUI_CLOSED_PATH}
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT")
+        if system_root:
+            probe_environment["SystemRoot"] = system_root
+    result = subprocess.run(
+        [
+            str(resolved_interpreter),
+            "-P",
+            "-s",
+            "-S",
+            "-c",
+            "import json,sys;print(json.dumps({'prefix':sys.prefix,'exec_prefix':sys.exec_prefix,'base_prefix':sys.base_prefix,'base_exec_prefix':sys.base_exec_prefix}))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=probe_environment,
+        timeout=10,
+    )
+    startup = json.loads(result.stdout)
+    prefixes = {
+        name: str(Path(startup[name]).resolve())
+        for name in ("prefix", "exec_prefix", "base_prefix", "base_exec_prefix")
+    }
+    monkeypatch.setattr(sys, "executable", str(executable))
+
+    roots = {
+        item["role"]: item["path"]
+        for item in synthetic_comfyui_runtime_roots_for_tests()
+    }
+    approval = synthetic_runtime_approval_for_tests()
+
+    assert roots["python_home"] == prefixes["prefix"]
+    assert prefixes["exec_prefix"] == prefixes["prefix"]
+    assert approval.payload["python_base_prefix"] == prefixes["base_prefix"]
+    assert prefixes["base_exec_prefix"] == prefixes["base_prefix"]
+    assert approval.payload["interpreter"]["path"] == str(resolved_interpreter)
+    assert (prefixes["prefix"] == prefixes["base_prefix"]) is (
+        expected_prefix_relation == "same"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -171,8 +233,6 @@ def test_python_bootstrap_rejects_wrong_prefix_and_accepts_fixture_prefix(
         ),
     )
 
-    assert python_home == str(Path(sys.base_prefix).resolve())
-    assert python_base_prefix == str(Path(sys.base_prefix).resolve())
     with pytest.raises(
         SystemExit,
         match="sys.prefix does not match the signed Python home",
@@ -557,10 +617,21 @@ def test_qwen_profile_v2_resolves_reference_generate_and_source_edit(
     [("generate", "reference"), ("edit", "source")],
 )
 def test_qwen_profile_v2_operations_complete_through_generation_service(
-    tmp_path: Path, operation: str, role: str
+    tmp_path: Path,
+    operation: str,
+    role: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = build_comfyui_bundle(tmp_path, profile_version=2)
     service = _service(tmp_path, bundle)
+    successful_listener_checks: list[bool] = []
+    wait_ready = service.adapter._wait_ready
+
+    def record_listener_check(control, resolved) -> None:
+        wait_ready(control, resolved)
+        successful_listener_checks.append(control.is_running())
+
+    monkeypatch.setattr(service.adapter, "_wait_ready", record_listener_check)
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / f"{role}.png").write_bytes(_rgb_png(64, 64))
@@ -580,6 +651,7 @@ def test_qwen_profile_v2_operations_complete_through_generation_service(
 
     assert service.work()["processed"] == 1
     assert service.get_provenance(job_id)["status"] == "succeeded"
+    assert successful_listener_checks == [True]
     effective = service.get_execution(job_id)["resolved"]["effective_execution"]
     workflow = effective["configuration"]["workflow"]
     assert workflow["profile_version"] == 2

@@ -776,6 +776,90 @@ def test_isolated_bootstrap_ignores_user_site_hooks_and_python_path_injection(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize(
+    ("drift", "expected_error"),
+    [
+        ("python_home", "sys.prefix does not match the signed Python home"),
+        (
+            "python_base_prefix",
+            "sys.base_prefix does not match the signed Python base prefix",
+        ),
+    ],
+)
+def test_isolated_bootstrap_rejects_incorrect_signed_prefixes(
+    tmp_path: Path, drift: str, expected_error: str
+) -> None:
+    interpreter = Path(sys.executable).resolve(strict=True)
+    environment = {"PATH": comfyui_runtime_pins.COMFYUI_CLOSED_PATH}
+    if os.name == "nt":
+        system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT")
+        if system_root:
+            environment["SystemRoot"] = system_root
+    startup_result = subprocess.run(
+        [
+            str(interpreter),
+            "-P",
+            "-s",
+            "-S",
+            "-c",
+            "import json,sys,sysconfig;print(json.dumps({'prefix':sys.prefix,'base_prefix':sys.base_prefix,'stdlib':sysconfig.get_path('stdlib'),'dynload':sysconfig.get_config_var('DESTSHARED')}))",
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert startup_result.returncode == 0, startup_result.stderr
+    startup = json.loads(startup_result.stdout)
+    python_home = startup["prefix"]
+    python_base_prefix = startup["base_prefix"]
+    stdlib = startup["stdlib"]
+    stdlib_paths = [
+        stdlib,
+        startup["dynload"] or str(Path(stdlib) / "lib-dynload"),
+    ]
+    source_root = tmp_path / "approved-source"
+    source_root.mkdir()
+    import_root = tmp_path / "approved-imports"
+    import_root.mkdir()
+    entrypoint = source_root / "probe.py"
+    entrypoint.write_text("print('started')\n", encoding="utf-8")
+    if drift == "python_home":
+        python_home = str((tmp_path / "incorrect-python-home").resolve())
+    else:
+        python_base_prefix = str((tmp_path / "incorrect-base-prefix").resolve())
+
+    bootstrap = Path(comfyui.__file__).with_name("_comfyui_python_bootstrap.py")
+    process = subprocess.run(
+        [
+            str(interpreter),
+            "-P",
+            "-s",
+            "-S",
+            str(bootstrap),
+            python_home,
+            python_base_prefix,
+            "--stdlib-paths",
+            *stdlib_paths,
+            "--import-roots",
+            str(import_root),
+            str(source_root),
+            "--",
+            str(entrypoint),
+        ],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert process.returncode != 0
+    assert expected_error in process.stderr
+    assert process.stdout == ""
+
+
 def test_runtime_role_must_be_a_string_before_set_membership() -> None:
     malformed = [
         {"role": role, "path": f"/runtime/{role}", "sha256": "0" * 64}
