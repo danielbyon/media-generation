@@ -1,0 +1,24 @@
+tests/test_t09_support.py
+  s_ce5a4681e7ca91::t_1959b7ee571c7e 9,11,210-215,236-307,309-312,324-326,347-348,350,354
+tests/test_comfyui_adapter.py
+  s_ce5a4681e7ca91::t_1959b7ee571c7e 90
+  s_ce5a4681e7ca91::t_07d0037c58b6dd 15,91-151
+tests/test_comfyui_runtime_pins.py
+  s_ce5a4681e7ca91::t_07d0037c58b6dd 779-862
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dd59a20ec1790135d4b5b9932ba23e53a9f4423f",
+  "prompts": {},
+  "sessions": {
+    "s_ce5a4681e7ca91": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1bbae-2a41-7881-897c-4327bd62231b",
+        "model": "gpt-6-luna"
+      },
+      "human_author": "Daniel Byon <327737+danielbyon@users.noreply.github.com>"
+    }
+  }
+}
