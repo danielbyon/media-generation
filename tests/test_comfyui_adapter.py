@@ -617,10 +617,21 @@ def test_qwen_profile_v2_resolves_reference_generate_and_source_edit(
     [("generate", "reference"), ("edit", "source")],
 )
 def test_qwen_profile_v2_operations_complete_through_generation_service(
-    tmp_path: Path, operation: str, role: str
+    tmp_path: Path,
+    operation: str,
+    role: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     bundle = build_comfyui_bundle(tmp_path, profile_version=2)
     service = _service(tmp_path, bundle)
+    successful_listener_checks: list[bool] = []
+    wait_ready = service.adapter._wait_ready
+
+    def record_listener_check(control, resolved) -> None:
+        wait_ready(control, resolved)
+        successful_listener_checks.append(control.is_running())
+
+    monkeypatch.setattr(service.adapter, "_wait_ready", record_listener_check)
     source_root = tmp_path / "source"
     source_root.mkdir()
     (source_root / f"{role}.png").write_bytes(_rgb_png(64, 64))
@@ -640,6 +651,7 @@ def test_qwen_profile_v2_operations_complete_through_generation_service(
 
     assert service.work()["processed"] == 1
     assert service.get_provenance(job_id)["status"] == "succeeded"
+    assert successful_listener_checks == [True]
     effective = service.get_execution(job_id)["resolved"]["effective_execution"]
     workflow = effective["configuration"]["workflow"]
     assert workflow["profile_version"] == 2
