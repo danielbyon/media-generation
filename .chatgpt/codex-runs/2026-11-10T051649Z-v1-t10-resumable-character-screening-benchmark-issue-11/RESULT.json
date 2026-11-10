@@ -1,0 +1,170 @@
+{
+  "schema_version": 3,
+  "repo_id": "media-generation",
+  "run_id": "2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11",
+  "status": "blocked",
+  "summary": "T10 implementation and software validation passed. Live APEX execution and qualification evidence remain unavailable, so this result stays blocked and issue #11 remains open.",
+  "changed_files": [
+    "README.md",
+    "docs/architecture/character-screening.md",
+    ".chatgpt/codex-runs/2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11/RESULT.json",
+    "src/media_generation/cli.py",
+    "src/media_generation/publication.py",
+    "src/media_generation/screening.py",
+    "src/media_generation/screening_execution.py",
+    "src/media_generation/screening_manifest.py",
+    "src/media_generation/screening_report.py",
+    "src/media_generation/screening_runner.py",
+    "src/media_generation/screening_store.py",
+    "src/media_generation/service.py",
+    "src/media_generation/store.py",
+    "tests/test_screening.py",
+    "tests/test_screening_cli.py"
+  ],
+  "connected_changes": [
+    {
+      "path": "README.md",
+      "reason": "Links the character-screening architecture guide from the project entry point."
+    },
+    {
+      "path": "docs/architecture/character-screening.md",
+      "reason": "Documents run recovery, benchmark versus execution counts, read-only artifact integrity inspection, and the unverified APEX qualification boundary."
+    },
+    {
+      "path": ".chatgpt/codex-runs/2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11/RESULT.json",
+      "reason": "Records validation evidence, review limits, matching changed-file metadata, and unresolved APEX evidence status for this run."
+    },
+    {
+      "path": "src/media_generation/cli.py",
+      "reason": "Adds headless run, resume, and report commands; report retrieval succeeds independently of execution completeness and qualification, while run/resume exit status follows matrix execution."
+    },
+    {
+      "path": "src/media_generation/publication.py",
+      "reason": "Adds read-only artifact integrity inspection while preserving the existing persisted integrity observation API."
+    },
+    {
+      "path": "src/media_generation/screening.py",
+      "reason": "Preserves the screening import surface and delegates manifest, orchestration, and reporting behavior to focused modules."
+    },
+    {
+      "path": "src/media_generation/screening_execution.py",
+      "reason": "Advances claimed cases through read-only reconciliation, fixture checks, GenerationService gates, and case-state updates."
+    },
+    {
+      "path": "src/media_generation/screening_manifest.py",
+      "reason": "Validates frozen manifests, expands the 24-case matrix and supplements, checks candidate component identity, and requires preview/final pairing."
+    },
+    {
+      "path": "src/media_generation/screening_report.py",
+      "reason": "Builds read-only reports that preserve benchmark errors and separate service state, execution completeness, artifact integrity, and APEX qualification."
+    },
+    {
+      "path": "src/media_generation/screening_runner.py",
+      "reason": "Coordinates run creation, durable case claims, resume and heartbeat fencing; preserves the live service-factory interface for the case executor."
+    },
+    {
+      "path": "src/media_generation/screening_store.py",
+      "reason": "Stores frozen benchmark runs and cases in a versioned SQLite ledger with durable per-case claims separate from GenerationService state."
+    },
+    {
+      "path": "src/media_generation/service.py",
+      "reason": "Exposes narrow read-only idempotency lookup and the resolved service database path for recovery and execution identity checks."
+    },
+    {
+      "path": "src/media_generation/store.py",
+      "reason": "Adds a read-only connection mode that does not initialize or create the GenerationService database, alongside persisted-key lookup."
+    },
+    {
+      "path": "tests/test_screening.py",
+      "reason": "Covers candidate identity, mandatory pairing, read-only recovery/report inspection, missing-database safety, separate benchmark and service states, execution completeness, and the 24-case denominator."
+    },
+    {
+      "path": "tests/test_screening_cli.py",
+      "reason": "Covers screening command parsing and early run ID output after simulated interruption."
+    }
+  ],
+  "commands_run": [
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -VV -> Python 3.14.4 (v3.14.4:23116f998f6, Apr 7 2026, 09:45:22) [Clang 17.0.0 (clang-1700.6.4.2)].",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py tests/test_screening_cli.py -q --tb=no -> 43 passed in 3.61s.",
+    "PYTHONPATH=src:tests make check PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python -> 2156 passed, 5 skipped in 178.09s; make check completed the CLI --help smoke check.",
+    "git diff --cached --check -> exit 0.",
+    "/Users/daniel/.cubic/bin/cubic review -> completed; no issues found. Cubic reported missing repository context but reviewed the staged candidate."
+  ],
+  "tests": [
+    "Focused screening suite: 43 passed in 3.61s on Python 3.14.4.",
+    "Full make check: 2156 passed, 5 skipped in 178.09s. The CLI --help smoke check completed; the five skips require native Linux/APEX conditions.",
+    "The missing preview/final pairing regression failed before the validator fix and passed afterward; valid paired cases remain accepted.",
+    "Read-only integrity regressions confirm recovery and report inspection do not persist integrity observations and do not recreate a missing GenerationService database.",
+    "The matrix status regression confirms summary counts follow benchmark_status while matrix_execution reflects the persisted service execution outcome.",
+    "Independent source reviews found integrity persistence during report/recovery, omitted facade constants, and stale documentation about integrity persistence. Those findings were corrected and covered by tests or documentation updates; no independent approval is claimed.",
+    "Final staged Cubic review completed with no issues found. Its earlier matrix-count concern was checked against the separate benchmark and execution fields and covered by a regression test.",
+    "Formal gpt-repo-local Delegation v3 review could not bind this worktree: the approved-root inventory lists the primary checkout but not this worktree, and no root-registration action is exposed. No formal approval is claimed.",
+    "TAC-6, TAC-7, and TAC-11 remain unverified because live APEX execution and owner-verified hardware evidence are unavailable; issue #11 remains open."
+  ],
+  "product_acceptance_criteria": [],
+  "technical_acceptance_criteria": [
+    {
+      "id": "TAC-1",
+      "status": "passed",
+      "evidence": "Manifest validation requires three distinct conditioning styles, four distinct prompt/operation scenarios, and two distinct seeds. Tests confirm 24 unique case identities and request digests with one output request per case."
+    },
+    {
+      "id": "TAC-2",
+      "status": "passed",
+      "evidence": "The versioned benchmark ledger atomically freezes run identity, all case requests, canonical digests, operation intent, and stable keys before service submission. Changed execution identity blocks new admission; the GenerationService schema is unchanged."
+    },
+    {
+      "id": "TAC-3",
+      "status": "passed",
+      "evidence": "A deterministic termination test stops after service acceptance and resumes by the persisted key, verifies the original digest and job/request IDs, and confirms no duplicate job is created, even when current execution configuration is unavailable."
+    },
+    {
+      "id": "TAC-4",
+      "status": "passed",
+      "evidence": "Resume reconciles persisted jobs before checking whether new execution is allowed. SQLite claims fence competing runners, stale claim epochs cannot update cases, and a deliberately new run receives fresh service-generated request and job identities."
+    },
+    {
+      "id": "TAC-5",
+      "status": "passed",
+      "evidence": "New submissions and queued continuations reach GenerationService only after fixture preflight, compatible frozen execution identity, and service-path checks; GenerationService retains current privacy, capability, adapter, admission, and attempt-budget gates. The selected T07 component identity is checked by ID, role, SHA-256, precision, and quantization. Auxiliary candidate components are permitted, while the exact deterministic CPU test configuration is the only candidate-free path."
+    },
+    {
+      "id": "TAC-6",
+      "status": "unverified",
+      "evidence": "The protocol creates separately counted capability, edit, regeneration, chain, composition, and outfit cases and preserves ordered conditioning inputs and chain steps. No live pinned APEX outputs are available to evaluate those supplementary results or chain identity drift."
+    },
+    {
+      "id": "TAC-7",
+      "status": "unverified",
+      "evidence": "Preview and final are separate experimental requests with pairing and creative-origin relations distinct from conditioning inputs. No live APEX pair artifacts are available to inspect composition or identity differences."
+    },
+    {
+      "id": "TAC-8",
+      "status": "passed",
+      "evidence": "Reports preserve all 24 matrix denominator slots and distinguish retrieval, benchmark outcome, reconciled service execution, and artifact integrity. Summary status counts follow benchmark_status, while matrix_execution derives completeness and success from service_execution_status. Read-only artifact checks do not create a missing service database or persist integrity observations. A fully executed deterministic CPU matrix remains separate from unverified APEX execution and qualification."
+    },
+    {
+      "id": "TAC-9",
+      "status": "passed",
+      "evidence": "The Python 3.14.4 focused suite passes 43 tests, covering exact candidate identity, missing preview/final pairing, read-only recovery/report integrity, missing database safety, separate benchmark and service statuses, submission accounting, and CPU matrix execution. Full make check passes 2156 tests with 5 native Linux/APEX-only skips."
+    },
+    {
+      "id": "TAC-10",
+      "status": "passed",
+      "evidence": "The architecture guide documents report retrieval status, all 24 denominator slots, separate benchmark and service execution counts, read-only artifact inspection, report CLI success, and the unverified APEX execution and qualification boundary."
+    },
+    {
+      "id": "TAC-11",
+      "status": "unverified",
+      "evidence": "Python 3.14.4 focused tests passed (43); full make check passed (2156 passed, 5 skipped). Native Linux/APEX-only tests were skipped, and the pinned 24-case live APEX screening with owner hardware outputs was not run. TAC-11 remains unverified."
+    }
+  ],
+  "scope_extension_required": [],
+  "blockers": [
+    "No live APEX execution or owner-verified hardware outputs were available. TAC-6, TAC-7, and TAC-11 remain unverified; issue #11 must remain open pending those results."
+  ],
+  "followups": [
+    "Run the 24-case matrix on the owner-selected APEX configuration using the approved T07 candidate, current admission inputs, and three approved reference fixtures; retain the run report and generated artifacts.",
+    "Inspect supplementary chain and preview/final artifacts from the live run, update the hardware evidence on issue #11, and keep the issue open until that evidence is reviewed."
+  ]
+}

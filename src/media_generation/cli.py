@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -43,6 +44,15 @@ from .candidate import (
     verify_candidate,
 )
 from .service import GenerationService
+from .screening import (
+    ScreeningConfigurationError,
+    ScreeningError,
+    ScreeningManifest,
+    ScreeningManifestError,
+    ScreeningRunner,
+    render_summary,
+)
+from .screening_store import ScreeningLedger, ScreeningStoreError
 from .inventory import (
     InventoryOptions,
     InventoryOutputError,
@@ -104,11 +114,14 @@ def _admission_inputs(
     )
 
 
-def _add_engine_arguments(command: argparse.ArgumentParser) -> None:
+def _add_engine_arguments(
+    command: argparse.ArgumentParser, *, required_candidate: bool = False
+) -> None:
     """Add the optional declared local engine selection to one command."""
     command.add_argument(
         "--engine-candidate",
         type=Path,
+        required=required_candidate,
         help="strict T07 candidate declaration for pinned local inference",
     )
     command.add_argument(
@@ -280,6 +293,40 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile = commands.add_parser("reconcile", help="recover owned publications and inspect integrity")
     reconcile.add_argument("--db", required=True, type=Path)
     reconcile.add_argument("--output-dir", required=True, type=Path)
+
+    screen = commands.add_parser(
+        "screen", help="run, resume, or report a versioned character-screening benchmark"
+    )
+    screen_commands = screen.add_subparsers(dest="screen_command", required=True)
+    screen_run = screen_commands.add_parser("run", help="freeze and execute a new screening run")
+    screen_run.add_argument("--manifest", required=True, type=Path)
+    screen_run.add_argument("--data-dir", required=True, type=Path)
+    screen_run.add_argument("--service-db", type=Path)
+    screen_run.add_argument("--output-dir", type=Path)
+    _add_admission_arguments(screen_run)
+    _add_engine_arguments(screen_run, required_candidate=True)
+    screen_run.add_argument("--max-cases", type=int)
+
+    screen_resume = screen_commands.add_parser(
+        "resume", help="reconcile and continue incomplete cases in an existing run"
+    )
+    screen_resume.add_argument("--run-id", required=True)
+    screen_resume.add_argument("--data-dir", required=True, type=Path)
+    screen_resume.add_argument("--service-db", type=Path)
+    screen_resume.add_argument("--output-dir", type=Path)
+    _add_admission_arguments(screen_resume)
+    _add_engine_arguments(screen_resume)
+    screen_resume.add_argument("--max-cases", type=int)
+
+    screen_report = screen_commands.add_parser(
+        "report", help="print a machine-readable report or readable case summary"
+    )
+    screen_report.add_argument("--run-id", required=True)
+    screen_report.add_argument("--data-dir", required=True, type=Path)
+    screen_report.add_argument("--service-db", type=Path)
+    screen_report.add_argument("--output-dir", type=Path)
+    screen_report.add_argument("--format", choices=("json", "summary"), default="json")
+
     candidate = commands.add_parser(
         "candidate", help="inspect, verify, or prepare an exact declared model candidate"
     )
@@ -341,6 +388,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _run_candidate(options)
         if options.command == "inventory":
             return _run_inventory(options)
+        if options.command == "screen":
+            return _run_screen(options)
         if options.command == "submit":
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
@@ -545,6 +594,142 @@ def _run_inventory(options: argparse.Namespace) -> int:
         return _write_error("inventory_output_error", str(error), 3)
     _write_json({**published.summary, **(published.publication or {})}, sys.stdout)
     return published.exit_code
+
+
+def _run_screen(options: argparse.Namespace) -> int:
+    """Run one headless screening operation against external durable storage."""
+    try:
+        data_directory = _require_external_path(options.data_dir, "screening data directory")
+        ledger = ScreeningLedger(data_directory / "screening.sqlite3")
+
+        if options.screen_command == "run":
+            manifest_path = _require_external_path(options.manifest, "screening manifest")
+            manifest = ScreeningManifest.from_json(manifest_path)
+            service_database = options.service_db or data_directory / "generation.sqlite3"
+            output_directory = options.output_dir or data_directory / "artifacts"
+            profile, demand = _admission_inputs(options)
+            adapter = _engine_adapter(options, output_directory)
+            if adapter is None:
+                raise ScreeningConfigurationError(
+                    "screening runs require an explicitly selected pinned engine candidate"
+                )
+            identity = _screen_execution_identity(adapter, profile, demand)
+            runner = ScreeningRunner(
+                data_directory=data_directory,
+                service_database=service_database,
+                output_directory=output_directory,
+                execution_identity=identity,
+                service_factory=lambda: GenerationService(
+                    service_database,
+                    output_directory,
+                    adapter=adapter,
+                    admission_profile=profile,
+                ),
+                workload_demand=demand,
+            )
+            run_id = runner.create_run(manifest)
+            sys.stderr.write(f"screening_run_id={run_id}\n")
+            sys.stderr.flush()
+            report = runner.resume(run_id, max_cases=options.max_cases)
+        elif options.screen_command == "resume":
+            frozen_run = ledger.get_run(options.run_id)
+            frozen_identity = frozen_run["execution_identity"]
+            assert isinstance(frozen_identity, dict)
+            service_database = options.service_db or Path(
+                str(frozen_identity.get("service_database", data_directory / "generation.sqlite3"))
+            )
+            output_directory = options.output_dir or Path(
+                str(frozen_identity.get("output_directory", data_directory / "artifacts"))
+            )
+            if options.engine_candidate is None:
+                if options.engine_trusted_evidence is not None:
+                    raise ScreeningConfigurationError(
+                        "--engine-trusted-evidence requires --engine-candidate"
+                    )
+                identity = None
+                factory = None
+                demand = None
+            else:
+                profile, demand = _admission_inputs(options)
+                adapter = _engine_adapter(options, output_directory)
+                assert adapter is not None
+                identity = _screen_execution_identity(adapter, profile, demand)
+                factory = lambda: GenerationService(
+                    service_database,
+                    output_directory,
+                    adapter=adapter,
+                    admission_profile=profile,
+                )
+            runner = ScreeningRunner(
+                data_directory=data_directory,
+                service_database=service_database,
+                output_directory=output_directory,
+                execution_identity=identity,
+                service_factory=factory,
+                workload_demand=demand,
+            )
+            report = runner.resume(options.run_id, max_cases=options.max_cases)
+        else:
+            frozen_run = ledger.get_run(options.run_id)
+            frozen_identity = frozen_run["execution_identity"]
+            assert isinstance(frozen_identity, dict)
+            service_database = options.service_db or Path(
+                str(frozen_identity.get("service_database", data_directory / "generation.sqlite3"))
+            )
+            output_directory = options.output_dir or Path(
+                str(frozen_identity.get("output_directory", data_directory / "artifacts"))
+            )
+            runner = ScreeningRunner(
+                data_directory=data_directory,
+                service_database=service_database,
+                output_directory=output_directory,
+                execution_identity=None,
+                service_factory=None,
+            )
+            report = runner.report(options.run_id)
+
+        if options.screen_command == "report" and options.format == "summary":
+            sys.stdout.write(render_summary(report))
+        else:
+            _write_json(report, sys.stdout)
+        if options.screen_command == "report":
+            return 0
+        matrix_execution = report.get("matrix_execution")
+        return (
+            0
+            if isinstance(matrix_execution, dict)
+            and matrix_execution.get("execution_success") is True
+            else 1
+        )
+    except ScreeningManifestError as error:
+        return _write_error("screening_manifest_error", str(error), 2)
+    except (ScreeningError, ScreeningStoreError, ValueError, OSError, sqlite3.Error) as error:
+        return _write_error("screening_error", str(error), 2)
+    except GenerationError as error:
+        return _write_error("screening_execution_error", str(error), 3)
+
+
+def _screen_execution_identity(
+    adapter: object,
+    profile: AdmissionProfile | None,
+    demand: WorkloadDemand | None,
+) -> dict[str, object]:
+    """Freeze engine, admission evidence, and candidate identity for one run."""
+    return {
+        "adapter_id": adapter.adapter_id,
+        "adapter_configuration": adapter.configuration,
+        "admission_profile": None if profile is None else profile.to_dict(),
+        "workload_demand": None if demand is None else demand.to_dict(),
+    }
+
+
+def _require_external_path(path: Path, label: str) -> Path:
+    """Reject input paths that would bind private screening state into Git."""
+    resolved = path.expanduser().resolve()
+    for parent in (resolved, *resolved.parents):
+        if (parent / ".git").exists():
+            raise ScreeningConfigurationError(f"{label} must be outside Git worktrees")
+    return resolved
 
 
 def _run_candidate(options: argparse.Namespace) -> int:

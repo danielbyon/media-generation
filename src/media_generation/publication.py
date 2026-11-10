@@ -553,8 +553,15 @@ class PublicationManager:
         publication = self.store.publication_for_artifact(artifact_id)
         return self._integrity(artifact, publication)
 
+    def inspect_integrity(self, artifact_id: str) -> dict[str, object]:
+        """Verify current artifact bytes without persisting an integrity observation."""
+        artifact = self.store.get_artifact(artifact_id)
+        publication = self.store.publication_for_artifact(artifact_id)
+        return self._integrity(artifact, publication, persist_observation=False)
+
     def _integrity(self, artifact: Artifact,
-                   publication: dict[str, object] | None) -> dict[str, object]:
+                   publication: dict[str, object] | None,
+                   *, persist_observation: bool = True) -> dict[str, object]:
         """Inspect using journal or durable lineage ownership evidence."""
         artifact_id = artifact.artifact_id
         artifact_path = Path(artifact.path)
@@ -583,7 +590,8 @@ class PublicationManager:
             # Decoder and safe-open errors must remain inspectable, not trusted.
             status, detail = 'corrupt', str(error)
         checked = now()
-        self.store.record_integrity(artifact_id, status, checked, detail)
+        if persist_observation:
+            self.store.record_integrity(artifact_id, status, checked, detail)
         return {'artifact_id': artifact_id, 'status': status, 'checked_at': checked, 'detail': detail}
 
     def _legacy_linked_to_root(self, artifact_id: str, authorized_root: Path) -> bool:

@@ -359,12 +359,15 @@ filesystem limitations.
 
 ## Current limits
 
-This slice proves the local request-to-image and provenance path and the software
+This project provides a local request-to-image and provenance path with software
 contracts for supervised engine execution. The bundled CPU adapter creates a
-deterministic test image, not a production model result. There is no HTTP API,
-graphical interface, distributed worker pool, or benchmark orchestration. All
-cooperating workers must use the same SQLite database and local output
-directory; the database enforces one heavyweight attempt at a time. The
+deterministic test image. It does not produce a model result. There is no HTTP
+API, graphical interface, or distributed worker pool. The headless T10 runner
+records a fixed character-screening matrix; it does not measure T11 timing or
+score outputs under T15. See [character screening](docs/architecture/character-screening.md)
+for the manifest, resume, and evidence requirements. All cooperating workers
+must use the same SQLite database and local output directory; the database
+enforces one heavyweight attempt at a time. The
 stable-diffusion.cpp adapter is opt-in and has no repository-supplied production
 candidate. Its privacy profile proves application configuration only. APEX
 hardware, real GPU inference, model quality, process-tree containment, network
