@@ -326,14 +326,74 @@ def test_screening_facade_preserves_manifest_schema_constants() -> None:
     assert screening.MAX_MANIFEST_BYTES == 4 * 1024 * 1024
 
 
-def _t07_candidate_identity(components: list[dict[str, object]]) -> dict[str, object]:
+def _t07_candidate_identity(
+    components: list[dict[str, object]],
+    *,
+    operations: dict[str, dict[str, list[str]]] | None = None,
+) -> dict[str, object]:
+    configuration: dict[str, object] = {
+        "candidate_id": "t07-approved-candidate-1",
+        "components": components,
+    }
+    if operations is not None:
+        configuration["operations"] = operations
     return {
         "adapter_id": "stable-diffusion-cpp-local-v1",
-        "adapter_configuration": {
-            "candidate_id": "t07-approved-candidate-1",
-            "components": components,
-        },
+        "adapter_configuration": configuration,
     }
+
+
+def _candidate_components_for_variant(
+    variant: dict[str, object],
+) -> tuple[list[dict[str, object]], list[str]]:
+    raw_components = variant["components"]
+    assert isinstance(raw_components, list)
+    fields = ("id", "role", "sha256", "precision", "quantization")
+    candidate_components: list[dict[str, object]] = []
+    selected_roles: list[str] = []
+    for component in raw_components:
+        assert isinstance(component, dict)
+        candidate_components.append({field: component[field] for field in fields})
+        selected_roles.append(str(component["role"]))
+    return candidate_components, selected_roles
+
+
+def _candidate_component_with_role(role: str) -> dict[str, object]:
+    return {
+        "id": f"candidate-{role}",
+        "role": role,
+        "sha256": "e" * 64,
+        "precision": "fp16",
+        "quantization": "none",
+    }
+
+
+def _candidate_runner(
+    tmp_path: Path,
+    variant: dict[str, object],
+    *,
+    operations: dict[str, dict[str, list[str]]],
+    additional_roles: tuple[str, ...] = (),
+) -> ScreeningRunner:
+    candidate_components, _ = _candidate_components_for_variant(variant)
+    candidate_components.extend(
+        _candidate_component_with_role(role) for role in additional_roles
+    )
+    identity = _t07_candidate_identity(candidate_components, operations=operations)
+    database = tmp_path / "generation.sqlite3"
+    output = tmp_path / "artifacts"
+    return ScreeningRunner(
+        data_directory=tmp_path / "screening-data",
+        service_database=database,
+        output_directory=output,
+        execution_identity=identity,
+        service_factory=lambda: GenerationService(
+            database, output, adapter=DeterministicCpuAdapter()
+        ),
+        clock=lambda: 1000.0,
+        lease_seconds=10,
+        heartbeat_interval=None,
+    )
 
 
 def test_candidate_validation_rejects_a_missing_selected_component() -> None:
@@ -398,22 +458,168 @@ def test_candidate_validation_checks_selected_precision_and_quantization(
 def test_candidate_validation_allows_unselected_auxiliary_candidate_components() -> None:
     variant = _manifest_mapping()["selected_model_variant"]
     assert isinstance(variant, dict)
-    selected = {
-        key: str(value)
-        for key, value in variant["components"][0].items()
-        if key in {"id", "role", "sha256", "precision", "quantization"}
-    }
-    auxiliary = {
-        "id": "tokenizer",
-        "role": "text_encoder",
-        "sha256": "c" * 64,
-        "precision": "fp32",
-        "quantization": "none",
-    }
+    candidate_components, selected_roles = _candidate_components_for_variant(variant)
+    selected_role_set = set(selected_roles)
+    auxiliary_role = next(
+        role
+        for role in ("tokenizer", "projector", "upscaler", "controlnet", "other")
+        if role not in selected_role_set
+    )
+    candidate_components.append(_candidate_component_with_role(auxiliary_role))
 
     _validate_variant_against_candidate(
-        variant, _t07_candidate_identity([selected, auxiliary])
+        variant,
+        _t07_candidate_identity(
+            candidate_components,
+            operations={"generate": {"required_roles": selected_roles}},
+        ),
+        operation_intents=("generate",),
     )
+
+
+@pytest.mark.parametrize("role", [None, "not-a-t07-role"])
+def test_candidate_validation_rejects_malformed_unselected_candidate_role(
+    role: object,
+) -> None:
+    variant = _manifest_mapping()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    candidate_components, selected_roles = _candidate_components_for_variant(variant)
+    malformed_auxiliary = _candidate_component_with_role("unused")
+    malformed_auxiliary["role"] = role
+    candidate_components.append(malformed_auxiliary)
+
+    with pytest.raises(ScreeningConfigurationError, match="role"):
+        _validate_variant_against_candidate(
+            variant,
+            _t07_candidate_identity(
+                candidate_components,
+                operations={"generate": {"required_roles": selected_roles}},
+            ),
+            operation_intents=("generate",),
+        )
+
+
+def test_candidate_validation_rejects_ambiguous_required_candidate_role() -> None:
+    variant = _manifest_mapping()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    candidate_components, selected_roles = _candidate_components_for_variant(variant)
+    required_role = selected_roles[0]
+    candidate_components.append(_candidate_component_with_role(required_role))
+
+    with pytest.raises(ScreeningConfigurationError, match=required_role):
+        _validate_variant_against_candidate(
+            variant,
+            _t07_candidate_identity(
+                candidate_components,
+                operations={"generate": {"required_roles": [required_role]}},
+            ),
+            operation_intents=("generate",),
+        )
+
+
+def test_candidate_validation_requires_frozen_operation_intents() -> None:
+    variant = _manifest_mapping()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    candidate_components, selected_roles = _candidate_components_for_variant(variant)
+
+    with pytest.raises(ScreeningConfigurationError, match="operation intent"):
+        _validate_variant_against_candidate(
+            variant,
+            _t07_candidate_identity(
+                candidate_components,
+                operations={"generate": {"required_roles": selected_roles}},
+            ),
+            operation_intents=(),
+        )
+
+
+def test_create_run_rejects_component_omitted_for_an_exercised_operation(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    cases = build_case_definitions(manifest, run_id="run_" + "0" * 32)
+    operation_intents = {str(case["operation_intent"]) for case in cases}
+    assert {"generate", "edit"} <= operation_intents
+
+    variant = manifest.to_dict()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    _, selected_roles = _candidate_components_for_variant(variant)
+    selected_role_set = set(selected_roles)
+    omitted_role = next(
+        role
+        for role in ("vae", "vision_encoder", "text_encoder", "tokenizer")
+        if role not in selected_role_set
+    )
+    runner = _candidate_runner(
+        tmp_path,
+        variant,
+        operations={
+            "generate": {"required_roles": [*selected_roles, omitted_role]},
+            "edit": {"required_roles": [*selected_roles, omitted_role]},
+        },
+        additional_roles=(omitted_role,),
+    )
+
+    with pytest.raises(ScreeningConfigurationError, match=omitted_role):
+        runner.create_run(manifest)
+
+
+def test_candidate_validation_allows_unselected_component_not_required_by_operation(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    cases = build_case_definitions(manifest, run_id="run_" + "0" * 32)
+    operation_intents = {str(case["operation_intent"]) for case in cases}
+    assert {"generate", "edit"} <= operation_intents
+    variant = manifest.to_dict()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    _, selected_roles = _candidate_components_for_variant(variant)
+    selected_role_set = set(selected_roles)
+    auxiliary_role = next(
+        role
+        for role in ("tokenizer", "projector", "upscaler", "controlnet", "other")
+        if role not in selected_role_set
+    )
+    runner = _candidate_runner(
+        tmp_path,
+        variant,
+        operations={
+            "generate": {"required_roles": selected_roles},
+            "edit": {"required_roles": selected_roles},
+        },
+        additional_roles=(auxiliary_role,),
+    )
+    runner.create_run(manifest)
+
+
+def test_create_run_unions_mixed_generate_and_edit_requirements(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    cases = build_case_definitions(manifest, run_id="run_" + "0" * 32)
+    operation_intents = {str(case["operation_intent"]) for case in cases}
+    assert {"generate", "edit"} <= operation_intents
+    variant = manifest.to_dict()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    _, selected_roles = _candidate_components_for_variant(variant)
+    selected_role_set = set(selected_roles)
+    edit_only_role = next(
+        role
+        for role in ("vae", "vision_encoder", "text_encoder", "tokenizer")
+        if role not in selected_role_set
+    )
+    runner = _candidate_runner(
+        tmp_path,
+        variant,
+        operations={
+            "generate": {"required_roles": selected_roles},
+            "edit": {"required_roles": [*selected_roles, edit_only_role]},
+        },
+        additional_roles=(edit_only_role,),
+    )
+
+    with pytest.raises(ScreeningConfigurationError, match=edit_only_role):
+        runner.create_run(manifest)
 
 
 def test_unpinned_real_engine_identity_cannot_skip_candidate_validation() -> None:

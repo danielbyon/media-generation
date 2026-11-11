@@ -96,11 +96,16 @@ class ScreeningRunner:
             raise ScreeningConfigurationError(
                 "a new run requires an explicit, pinned execution configuration"
             )
-        _validate_variant_against_candidate(
-            manifest.to_dict()["selected_model_variant"], self.execution_identity
-        )
         run_id = f"run_{uuid.uuid4().hex}"
         cases = build_case_definitions(manifest, run_id=run_id)
+        operation_intents = tuple(
+            case["operation_intent"] for case in cases
+        )
+        _validate_variant_against_candidate(
+            manifest.to_dict()["selected_model_variant"],
+            self.execution_identity,
+            operation_intents=operation_intents,
+        )
         for case in cases:
             case["idempotency_key"] = f"t10:{run_id}:{case['case_id']}"
         fixture_states = self._case_executor.preflight_fixtures(cases)
@@ -140,6 +145,10 @@ class ScreeningRunner:
     ) -> dict[str, object]:
         """Reconcile accepted jobs first, then advance only incomplete cases."""
         run = self.ledger.get_run(run_id)
+        cases = self.ledger.list_cases(run_id)
+        operation_intents = tuple(
+            case["operation_intent"] for case in cases
+        )
         manifest_matches = manifest is None or manifest.fingerprint == run["manifest_sha256"]
         frozen_identity = run["execution_identity"]
         assert isinstance(frozen_identity, dict)
@@ -151,7 +160,9 @@ class ScreeningRunner:
             if identity_matches:
                 try:
                     _validate_variant_against_candidate(
-                        run["selected_model_variant"], self.execution_identity
+                        run["selected_model_variant"],
+                        self.execution_identity,
+                        operation_intents=operation_intents,
                     )
                 except ScreeningConfigurationError:
                     identity_matches = False
@@ -162,7 +173,7 @@ class ScreeningRunner:
             raise ValueError("max_cases must be a nonnegative integer")
 
         processed = 0
-        for case in self.ledger.list_cases(run_id):
+        for case in cases:
             if max_cases is not None and processed >= max_cases:
                 break
             claim = self.ledger.claim_case(

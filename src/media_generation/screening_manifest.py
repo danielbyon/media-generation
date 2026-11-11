@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from ._candidate_contract import COMPONENT_ROLES
 from .adapters import DeterministicCpuAdapter
 from .domain import GenerationRequest
 from .errors import InputValidationError
@@ -623,15 +624,17 @@ def _validate_pairings(cases: list[dict[str, object]]) -> None:
             )
 
 def _validate_variant_against_candidate(
-    selected_variant: object, execution_identity: Mapping[str, object]
+    selected_variant: object,
+    execution_identity: Mapping[str, object],
+    *,
+    operation_intents: tuple[object, ...] = (),
 ) -> None:
-    """Match selected component identity against the frozen T07 candidate.
+    """Match component pins and exercised roles to the frozen T07 candidate.
 
-    Candidate configurations may contain auxiliary components that the selected
-    ModelVariant does not use. Those additional candidate entries are permitted;
-    every selected component must match by ID, role, digest, precision, and
-    quantization. The deterministic CPU adapter is the explicit no-candidate
-    path used by local protocol tests.
+    Every selected component must match by ID, role, digest, precision, and
+    quantization. The variant must include each role required by its frozen case
+    operations. Optional candidate components may remain unselected. The
+    deterministic CPU adapter is the explicit no-candidate path for local tests.
     """
     variant = _mapping(selected_variant, "selected_model_variant")
     configuration = execution_identity.get("adapter_configuration")
@@ -655,6 +658,7 @@ def _validate_variant_against_candidate(
             "pinned candidate configuration does not expose its component fingerprints"
         )
     components_by_id: dict[str, Mapping[str, object]] = {}
+    candidate_ids_by_role: dict[str, set[str]] = {}
     for component in candidate_components:
         if not isinstance(component, Mapping):
             raise ScreeningConfigurationError(
@@ -670,11 +674,18 @@ def _validate_variant_against_candidate(
                 f"pinned candidate configuration repeats component ID {component_id!r}"
             )
         components_by_id[component_id] = component
+        role = component.get("role")
+        if not isinstance(role, str) or role not in COMPONENT_ROLES:
+            raise ScreeningConfigurationError(
+                "pinned candidate component has an invalid role"
+            )
+        candidate_ids_by_role.setdefault(role, set()).add(component_id)
     variant_components = variant.get("components")
     if not isinstance(variant_components, list) or not variant_components:
         raise ScreeningConfigurationError("selected model variant has no component pins")
     identity_fields = ("id", "role", "sha256", "precision", "quantization")
     selected_ids: set[str] = set()
+    selected_ids_by_role: dict[str, set[str]] = {}
     for selected in variant_components:
         if not isinstance(selected, Mapping):
             raise ScreeningConfigurationError(
@@ -690,6 +701,12 @@ def _validate_variant_against_candidate(
                 f"selected ModelVariant repeats component ID {component_id!r}"
             )
         selected_ids.add(component_id)
+        selected_role = selected.get("role")
+        if not isinstance(selected_role, str) or not selected_role:
+            raise ScreeningConfigurationError(
+                "selected ModelVariant component pin has no role"
+            )
+        selected_ids_by_role.setdefault(selected_role, set()).add(component_id)
         candidate = components_by_id.get(component_id)
         if candidate is None or any(
             candidate.get(field) != selected.get(field) for field in identity_fields
@@ -697,6 +714,57 @@ def _validate_variant_against_candidate(
             raise ScreeningConfigurationError(
                 "selected ModelVariant component pins do not match the T07 candidate configuration"
             )
+
+    if not operation_intents:
+        raise ScreeningConfigurationError(
+            "frozen screening case operation intents are required"
+        )
+    operations = configuration.get("operations")
+    if not isinstance(operations, Mapping):
+        raise ScreeningConfigurationError(
+            "pinned candidate configuration does not expose operation required roles"
+        )
+    required_roles_by_operations: set[str] = set()
+    for operation_intent in operation_intents:
+        if not isinstance(operation_intent, str) or not operation_intent:
+            raise ScreeningConfigurationError(
+                "frozen screening case has an invalid operation intent"
+            )
+        operation = operations.get(operation_intent)
+        if not isinstance(operation, Mapping):
+            raise ScreeningConfigurationError(
+                f"pinned candidate configuration does not declare the {operation_intent!r} operation"
+            )
+        operation_roles = operation.get("required_roles")
+        if (
+            not isinstance(operation_roles, list)
+            or not operation_roles
+            or not all(isinstance(role, str) and role for role in operation_roles)
+        ):
+            raise ScreeningConfigurationError(
+                f"pinned candidate {operation_intent!r} operation has invalid required roles"
+            )
+        required_roles_by_operations.update(operation_roles)
+    ambiguous_roles = {
+        role
+        for role in required_roles_by_operations
+        if len(candidate_ids_by_role.get(role, set())) != 1
+    }
+    if ambiguous_roles:
+        raise ScreeningConfigurationError(
+            "pinned candidate configuration has missing or ambiguous required roles: "
+            + ", ".join(sorted(ambiguous_roles))
+        )
+    missing_roles = {
+        role
+        for role in required_roles_by_operations
+        if selected_ids_by_role.get(role) != candidate_ids_by_role[role]
+    }
+    if missing_roles:
+        raise ScreeningConfigurationError(
+            "selected ModelVariant omits required candidate component roles: "
+            + ", ".join(sorted(missing_roles))
+        )
 
 def _case_id(run_id: str, source_case_id: str) -> str:
     return f"case_{_sha256(f'{run_id}:{source_case_id}'.encode('utf-8'))[:32]}"
