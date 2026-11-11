@@ -1,0 +1,198 @@
+{
+  "schema_version": 3,
+  "repo_id": "media-generation",
+  "run_id": "2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11",
+  "status": "blocked",
+  "summary": "T10 candidate-operation correction remains implemented: absent operations stay in the frozen matrix and supplementary ledger and produce explicit unsupported outcomes, while malformed declared operation metadata and missing required components fail closed. TAC-9 deterministic CPU coverage is demonstrated by the 50-test focused screening suite and the passing full PR-head checks. Controlled base/head comparisons, grouped representative tests, and reversed full checks with reset temporary state all passed. Historical 29- and 31-failure local runs and one isolated failure on clean base remain unexplained; the exact historical assertion and stderr were not retained, so no root cause is claimed. A failure was observed once in a historical clean-base run and should be tracked separately; no T10 behavior change is indicated. The result remains blocked because TAC-6, TAC-7, and TAC-11 require live APEX and owner-verified hardware evidence; issue #11 remains open.",
+  "changed_files": [
+    "README.md",
+    "docs/architecture/character-screening.md",
+    ".chatgpt/codex-runs/2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11/RESULT.json",
+    "src/media_generation/cli.py",
+    "src/media_generation/publication.py",
+    "src/media_generation/screening.py",
+    "src/media_generation/screening_execution.py",
+    "src/media_generation/screening_manifest.py",
+    "src/media_generation/screening_report.py",
+    "src/media_generation/screening_runner.py",
+    "src/media_generation/screening_store.py",
+    "src/media_generation/service.py",
+    "src/media_generation/store.py",
+    "tests/test_screening.py",
+    "tests/test_screening_cli.py"
+  ],
+  "connected_changes": [
+    {
+      "path": "README.md",
+      "reason": "Links the character-screening architecture guide from the project entry point."
+    },
+    {
+      "path": "docs/architecture/character-screening.md",
+      "reason": "Documents run recovery, benchmark versus execution counts, read-only artifact integrity inspection, and the unverified APEX qualification boundary."
+    },
+    {
+      "path": ".chatgpt/codex-runs/2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11/RESULT.json",
+      "reason": "Records validation evidence, review limits, matching changed-file metadata, and unresolved APEX evidence status for this run."
+    },
+    {
+      "path": "src/media_generation/cli.py",
+      "reason": "Adds headless run, resume, and report commands; report retrieval succeeds independently of execution completeness and qualification, while run/resume exit status follows matrix execution."
+    },
+    {
+      "path": "src/media_generation/publication.py",
+      "reason": "Adds read-only artifact integrity inspection while preserving the existing persisted integrity observation API."
+    },
+    {
+      "path": "src/media_generation/screening.py",
+      "reason": "Preserves the screening import surface and delegates manifest, orchestration, and reporting behavior to focused modules."
+    },
+    {
+      "path": "src/media_generation/screening_execution.py",
+      "reason": "Advances claimed cases through read-only reconciliation, fixture checks, GenerationService gates, and case-state updates."
+    },
+    {
+      "path": "src/media_generation/screening_manifest.py",
+      "reason": "Validates frozen manifests, expands the 24-case matrix and supplements, checks exact selected-component identity and declared-operation required-role coverage, and permits undeclared operations to remain frozen for explicit unsupported outcomes."
+    },
+    {
+      "path": "src/media_generation/screening_report.py",
+      "reason": "Builds read-only reports that preserve benchmark errors and separate service state, execution completeness, artifact integrity, and APEX qualification."
+    },
+    {
+      "path": "src/media_generation/screening_runner.py",
+      "reason": "Coordinates run creation, durable case claims, resume and heartbeat fencing; preserves the live service-factory interface for the case executor."
+    },
+    {
+      "path": "src/media_generation/screening_store.py",
+      "reason": "Stores frozen benchmark runs and cases in a versioned SQLite ledger with durable per-case claims separate from GenerationService state."
+    },
+    {
+      "path": "src/media_generation/service.py",
+      "reason": "Exposes narrow read-only idempotency lookup and the resolved service database path for recovery and execution identity checks."
+    },
+    {
+      "path": "src/media_generation/store.py",
+      "reason": "Adds a read-only connection mode that does not initialize or create the GenerationService database, alongside persisted-key lookup."
+    },
+    {
+      "path": "tests/test_screening.py",
+      "reason": "Covers candidate identity and required-role validation, malformed declared operations, generate-only case freezing, explicit unsupported outcomes with 24 matrix and 10 supplementary slots, no resubmission after completion, read-only recovery/report inspection, and deterministic CPU matrix execution."
+    },
+    {
+      "path": "tests/test_screening_cli.py",
+      "reason": "Covers screening command parsing and early run ID output after simulated interruption."
+    }
+  ],
+  "commands_run": [
+    "/Users/daniel/Projects/media-generation/.venv/bin/python --version -> Python 3.14.4; /Users/daniel/Projects/media-generation/.venv/bin/python -c 'import sys; print(sys.version)' -> 3.14.4 (v3.14.4:23116f998f6, Apr 7 2026, 09:45:22) [Clang 17.0.0 (clang-1700.6.4.2)].",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py tests/test_screening_cli.py -q --tb=no -> 48 passed in 9.05s.",
+    "Earlier run: PYTHONPATH=src:tests make check PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python -> exit 2; 29 failed, 2132 passed, 5 skipped in 304.37s; 25 failures in test_comfyui_adapter.py and 4 in test_backend_evidence_v3.py; CLI help smoke check not reached.",
+    "git diff --check -> exit 0.",
+    "Earlier /Users/daniel/.cubic/bin/cubic review -> exit 1; one P1 finding disputed after source review. It concerns empty required_roles, but the current pinned T07 engine and ComfyUI operation parsers reject empty role lists and serialize non-empty roles into execution identity. An earlier P2 about repeated required_roles entries was also disputed: repeated roles are deduplicated by the benchmark validator and current T07 parsers reject them. No source change was warranted for either finding.",
+    "Earlier Final /Users/daniel/.cubic/bin/cubic review -> exit 1; one P1 finding disputed. It says deterministic CPU execution bypasses candidate operation-role checks. The bypass requires both the exact DeterministicCpuAdapter ID and its exact fixed configuration, preserving the explicit CPU testing path; real adapters still require pinned candidate and frozen operation validation. No source change was warranted.",
+    "Clean base verification: archive commit 548d289b39882ab20d1ee080e70b490805ad7abc to a temporary tree; run PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_backend_evidence_v3.py::test_comfyui_release_policy_fails_closed_for_untrusted_configuration[missing] -q --tb=no -> 1 failed in 5.94s (exit 1).",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py tests/test_screening_cli.py -q --tb=no -> 50 passed in 9.07s.",
+    "Prior pre-correction full check: PYTHONPATH=src:tests make check PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python > /tmp/media-generation-t10-make-check-final.log 2>&1 -> exit 0; 2163 passed, 5 skipped in 202.16s; CLI --help smoke check completed. This was before the current operation-availability correction.",
+    "/Users/daniel/.cubic/bin/cubic review after malformed-role validation -> completed; no issues found.",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py -k 'generate_only_candidate or freezes_all_cases or omitted_for_an_exercised_operation or malformed_declared_operation' -q --tb=short -> 4 passed, 46 deselected.",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py -q --tb=short -> 50 passed in 5.38s on Python 3.14.4.",
+    "make check -> exit 2 because default /usr/local/bin/python3 has no pytest; no tests ran.",
+    "PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python make check -> exit 2; 31 failed, 2135 passed, 5 skipped in 326.02s. The 31 failures were 27 in tests/test_comfyui_adapter.py and 4 in tests/test_backend_evidence_v3.py; CLI help smoke was not reached.",
+    "Isolated tests/test_backend_evidence_v3.py::test_comfyui_release_policy_fails_closed_for_untrusted_configuration[missing] -> 1 failed in 5.68s; diagnostics recorded a zero child exit code and execution_failed.",
+    "Isolated tests/test_comfyui_adapter.py::test_qwen_profile_v2_operations_complete_through_generation_service[generate-reference] -> first run 1 failed in 5.69s; immediate rerun 1 passed in 8.24s. A separate same-shaped service diagnostic completed successfully. No cause for the differing outcomes was established.",
+    "/Users/daniel/.cubic/bin/cubic review for the current patch -> exit 1 with one P1 claiming absent operation intents should be rejected. This conflicts with issue #11's requirement to freeze unsupported cases and the explicit generate-only regression proving 24 matrix and 10 supplementary slots remain accounted; no source change was made for this disputed finding.",
+    "Diagnostic harness: python3 /private/tmp/media-generation-diagnostic-harness/run.py isolated -> 18/18 representative test-process runs passed on Python 3.14.4: three selected tests, each repeated three times on base 548d289b39882ab20d1ee080e70b490805ad7abc and head 5feaee2a0e7ac9923c307627a33c323cce4bfb5d. Normalized environment digests matched across base/head. All pytest import-origin checks resolved to each local worktree. The ComfyUI and backend-evidence children exited 0 with zero stderr bytes, no exceptions, and no timeout; the deadline test spawned no child and passed each repetition. Logs and structured records are in /private/tmp/media-generation-diagnostic-harness/results/.",
+    "Diagnostic grouped run: python3 /private/tmp/media-generation-diagnostic-harness/run.py group -> 3 passed in one pytest process per tree; the two spawned children per tree exited 0 with empty stderr, no exceptions, and no deadline; both imports were local to the worktree.",
+    "Paired full run: python3 /private/tmp/media-generation-diagnostic-harness/run.py full -> base make check exit 0, 2113 passed and 5 skipped in 212.03s; head exit 0, 2166 passed and 5 skipped in 208.54s. CLI smoke completed on both. The normalized environment digest matched between trees; logs are under results/base-full-make-check-1 and results/head-full-make-check-1.",
+    "Fresh-state reverse-order full run: python3 /private/tmp/media-generation-diagnostic-harness/run_fresh_reverse.py full -> head first, then base, using the same TMPDIR path reset to empty before each run. Head make check exit 0, 2166 passed and 5 skipped in 191.62s; base exit 0, 2113 passed and 5 skipped in 182.94s. CLI smoke completed on both; environment digests and import-origin checks matched. Host: macOS 27.0.1 arm64, 14 CPUs, 24 GiB physical memory, zero zombie processes. Fresh-run load averages before head were 2.41/4.16/5.39; before base 7.47/5.14/5.50. Logs are under results/fresh-head-full-make-check-1 and results/fresh-base-full-make-check-1.",
+    "Historical evidence retained: the clean-base isolated backend-evidence run used --tb=no and reported 1 failed in 5.94s (exit 1), with child exit 0 and execution_failed. That record did not retain assertion text, stderr, or timeout details. Current controlled reruns of that exact test passed three times on each tree. The earlier 29- and 31-failure full runs remain listed above and in tests; their detailed assertion/child diagnostics were not preserved."
+  ],
+  "tests": [
+    "Current focused Python 3.14.4 screening suite: 50 passed in 5.38s. The targeted candidate-operation regressions passed 4 tests with 46 deselected.",
+    "Earlier full make check attempt failed: 31 failed, 2135 passed, and 5 skipped in 326.02s. All failures were in tests/test_comfyui_adapter.py (27) and tests/test_backend_evidence_v3.py (4); the T10 screening tests passed in that run and CLI help smoke was not reached. Later paired full checks passed; this failure is retained as historical evidence.",
+    "A representative ComfyUI adapter test failed on one isolated run and passed on immediate rerun; a separate diagnostic service run also succeeded. A backend evidence test reproduced once with a zero child exit code and execution_failed. The underlying cause remains unresolved and is not attributed to this patch.",
+    "Earlier validation history is preserved: one local full check reported 29 failures (25 ComfyUI adapter, 4 backend evidence), followed by a full check with 2163 passed and 5 skipped. A clean archive of base commit 548d289b39882ab20d1ee080e70b490805ad7abc also reproduced one release-policy failure. The reason for differing outcomes remains unknown.",
+    "Generate-only candidate regressions verify creation of all 24 matrix and 10 supplementary cases, unsupported edit outcomes, exact declared-operation validation, and no repeat submissions after completed work.",
+    "The missing preview/final pairing regression failed before the validator fix and passed afterward; valid paired cases remain accepted.",
+    "Read-only integrity regressions confirm recovery and report inspection do not persist integrity observations and do not recreate a missing GenerationService database.",
+    "The matrix status regression confirms summary counts follow benchmark_status while matrix_execution reflects the persisted service execution outcome.",
+    "Independent source reviews found integrity persistence during report/recovery, omitted facade constants, and stale documentation about integrity persistence. Those findings were corrected and covered by tests or documentation updates. A final read-only source review found no remaining concrete findings in database opening or benchmark-versus-service status reporting.",
+    "The current local Cubic review reported one P1 disputing absent-operation handling. The finding conflicts with the required unsupported-case accounting and the regression evidence; it remains disputed, with no source change made.",
+    "Formal gpt-repo-local Delegation v3 review could not bind this worktree: the approved-root inventory lists the primary checkout but not this worktree, and no root-registration action is exposed. No formal approval is claimed.",
+    "TAC-6, TAC-7, and TAC-11 remain unverified because live APEX execution and owner-verified hardware evidence are unavailable; issue #11 remains open.",
+    "Diagnostic isolated run: 18 total executions across the two exact commits; each representative ComfyUI adapter, backend release-policy, and absolute-deadline node ran three times per tree. All passed. The release-policy and adapter child processes exited 0 with empty stderr; no child timeouts or exceptions were recorded. The deadline node passed six times; it spawned no child.",
+    "Grouped ordering run: the same three nodes passed together in one pytest process on base and head (3 passed each). Both child processes in each run exited 0, wrote zero stderr bytes, and reported no timeout or exception.",
+    "Full differential: base 548d289b39882ab20d1ee080e70b490805ad7abc passed 2113 with 5 skipped; head 5feaee2a0e7ac9923c307627a33c323cce4bfb5d passed 2166 with 5 skipped. Repeating in reverse order with an empty identical TMPDIR for each tree produced the same results. Both full checks exited 0 and completed CLI smoke; imports resolved to the tested checkout.",
+    "Deadline assertion investigated separately: the prior GitHub run reported AssertionError: absolute deadline overran: 0.454s against the test assertion elapsed < 0.35; its rerun passed. The same node passed three isolated repetitions per tree, one grouped run per tree, and both full checks. No deadline increase or retry was introduced; cause remains unconfirmed.",
+    "The smallest historical failure is the single isolated backend-evidence node on a clean base archive described in commands_run. It establishes a base-side failure independent of T10, but the missing --tb traceback and stderr prevent identifying the failed assertion or cause. The failure did not reproduce in current paired reruns. Recommend a separately scoped baseline reliability issue; no T10 correction is supported by this evidence."
+  ],
+  "product_acceptance_criteria": [],
+  "technical_acceptance_criteria": [
+    {
+      "id": "TAC-1",
+      "status": "passed",
+      "evidence": "Manifest validation requires three distinct conditioning styles, four distinct prompt/operation scenarios, and two distinct seeds. Tests confirm 24 unique case identities and request digests with one output request per case."
+    },
+    {
+      "id": "TAC-2",
+      "status": "passed",
+      "evidence": "The versioned benchmark ledger atomically freezes run identity, all case requests, canonical digests, operation intent, and stable keys before service submission. Changed execution identity blocks new admission; the GenerationService schema is unchanged."
+    },
+    {
+      "id": "TAC-3",
+      "status": "passed",
+      "evidence": "A deterministic termination test stops after service acceptance and resumes by the persisted key, verifies the original digest and job/request IDs, and confirms no duplicate job is created, even when current execution configuration is unavailable."
+    },
+    {
+      "id": "TAC-4",
+      "status": "passed",
+      "evidence": "Resume reconciles persisted jobs before checking whether new execution is allowed. SQLite claims fence competing runners, stale claim epochs cannot update cases, and a deliberately new run receives fresh service-generated request and job identities."
+    },
+    {
+      "id": "TAC-5",
+      "status": "passed",
+      "evidence": "New submissions and queued continuations reach GenerationService only after fixture preflight, compatible frozen execution identity, and service-path checks; GenerationService retains current privacy, capability, adapter, admission, and attempt-budget gates. Selected component identity is checked by ID, role, SHA-256, precision, and quantization. Required roles are validated for every operation declared by the candidate; absent operations remain counted for explicit unsupported outcomes."
+    },
+    {
+      "id": "TAC-6",
+      "status": "unverified",
+      "evidence": "The protocol creates separately counted capability, edit, regeneration, chain, composition, and outfit cases and preserves ordered conditioning inputs and chain steps. No live pinned APEX outputs are available to evaluate those supplementary results or chain identity drift."
+    },
+    {
+      "id": "TAC-7",
+      "status": "unverified",
+      "evidence": "Preview and final are separate experimental requests with pairing and creative-origin relations distinct from conditioning inputs. No live APEX pair artifacts are available to inspect composition or identity differences."
+    },
+    {
+      "id": "TAC-8",
+      "status": "passed",
+      "evidence": "Reports preserve all 24 matrix denominator slots and distinguish retrieval, benchmark outcome, reconciled service execution, and artifact integrity. Summary status counts follow benchmark_status, while matrix_execution derives completeness and success from service_execution_status. Read-only artifact checks do not create a missing service database or persist integrity observations. A fully executed deterministic CPU matrix remains separate from unverified APEX execution and qualification."
+    },
+    {
+      "id": "TAC-9",
+      "status": "passed",
+      "evidence": "Demonstrated on Python 3.14.4: the focused deterministic CPU-only screening suite passed 50 tests, and the full PR-head make check passed 2166 tests with 5 skips in both paired runs. Coverage includes manifest and candidate validation, fresh and repeat runs, durable claims/recovery after interruption and lost acknowledgment, duplicate invocation, changed fingerprint blocking, unsupported operations/capabilities, service admission/recovery, and complete report accounting. Representative nodes and the full suite were also compared against base. Historical local failures are preserved in commands_run/tests and remain an unresolved baseline reliability followup; they do not negate the deterministic TAC-9 test coverage demonstrated here."
+    },
+    {
+      "id": "TAC-10",
+      "status": "passed",
+      "evidence": "The architecture guide documents report retrieval status, all 24 denominator slots, separate benchmark and service execution counts, read-only artifact inspection, report CLI success, and the unverified APEX execution and qualification boundary."
+    },
+    {
+      "id": "TAC-11",
+      "status": "unverified",
+      "evidence": "Python 3.14.4 full checks now pass on both base (2113 passed, 5 skipped) and PR head (2166 passed, 5 skipped), including CLI smoke. Earlier local runs reported 29 and 31 failures and remain preserved; their root cause is unknown. Five platform-specific tests were skipped, and no pinned 24-case live APEX run or owner-verified hardware outputs are available. TAC-11 remains unverified pending those live evidence requirements."
+    }
+  ],
+  "scope_extension_required": [],
+  "blockers": [
+    "Historical local full-check instability remains unexplained: prior runs reported 29 and 31 failures, and one isolated backend-evidence test failed once on a clean base archive. Current paired base/head checks and representative reruns pass; the historical failure lacked saved assertion text and stderr. Recommend tracking baseline reliability separately; no T10 fix is supported.",
+    "No live APEX execution or owner-verified hardware outputs were available. TAC-6, TAC-7, and TAC-11 remain unverified; issue #11 must remain open pending those results."
+  ],
+  "followups": [
+    "Repeat and investigate the intermittent ComfyUI adapter and backend evidence failures under a controlled environment; preserve exact run output and do not attribute a cause until reproduced evidence supports it.",
+    "Run the 24-case matrix on the owner-selected APEX configuration using the approved T07 candidate, current admission inputs, and three approved reference fixtures; retain the run report and generated artifacts.",
+    "Inspect supplementary chain and preview/final artifacts from the live run, update the hardware evidence on issue #11, and keep the issue open until that evidence is reviewed.",
+    "Open a separately scoped issue to reproduce and diagnose the historical ComfyUI/backend evidence test instability against base; do not conflate it with T10 or alter timing limits without a confirmed cause."
+  ]
+}

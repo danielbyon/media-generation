@@ -343,6 +343,11 @@ class GenerationService:
         self._heartbeat_seconds = heartbeat_seconds
         self._publication = PublicationManager(self._store, self.output_directory, publication_checkpoint)
 
+    @property
+    def database_path(self) -> Path:
+        """Return the resolved SQLite database used by this service."""
+        return self._store.database_path
+
     def enqueue(
         self,
         idempotency_key: str,
@@ -1570,6 +1575,20 @@ class GenerationService:
     def reconcile(self) -> dict[str, object]:
         """Recover owned publications and report unresolved storage conditions."""
         return self._publication.reconcile()
+
+    @staticmethod
+    def lookup_existing_idempotency_key(
+        database_path: Path, idempotency_key: str
+    ) -> tuple[str, str] | None:
+        """Read an accepted job identity without constructing an adapter.
+
+        Reconciliation must be able to find work accepted under an earlier
+        privacy, capability, or admission snapshot. This method only validates
+        the current store schema and performs the existing idempotency lookup;
+        it never creates a database or admits, recovers, or executes work.
+        """
+        key = _validate_idempotency_key(idempotency_key)
+        return SQLiteStore.find_idempotency_key_readonly(database_path, key)
 
     def get_request(self, request_id: str) -> dict[str, object]:
         """Retrieve one immutable request snapshot by ID."""

@@ -521,13 +521,16 @@ class SQLiteStore:
     operation owns a short-lived connection.
     """
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, read_only: bool = False) -> None:
+        """Open the current schema, with an optional mode that never initializes the file."""
         self.database_path = database_path.expanduser().resolve()
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        if self.database_path.exists() and self.database_path.stat().st_size:
-            self._validate_existing_database()
-        else:
-            self._initialize()
+        self.read_only = read_only
+        if not self.read_only:
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.database_path.exists() and self.database_path.stat().st_size:
+                self._validate_existing_database()
+            else:
+                self._initialize()
 
     @contextmanager
     def _connection(
@@ -540,7 +543,19 @@ class SQLiteStore:
             raise ValueError(
                 "a connection cannot be both a read and a write transaction"
             )
-        connection = sqlite3.connect(str(self.database_path), timeout=30, isolation_level=None)
+        if transaction and self.read_only:
+            raise sqlite3.OperationalError("read-only store cannot open a write transaction")
+        if self.read_only:
+            connection = sqlite3.connect(
+                f"{self.database_path.as_uri()}?mode=ro",
+                timeout=30,
+                isolation_level=None,
+                uri=True,
+            )
+        else:
+            connection = sqlite3.connect(
+                str(self.database_path), timeout=30, isolation_level=None
+            )
         connection.row_factory = sqlite3.Row
         connection.create_function(
             _WRITER_EPOCH_FUNCTION, 0, lambda: _WRITER_EPOCH, deterministic=True
@@ -936,13 +951,42 @@ END"""
         )
 
     def find_idempotency_key(self, idempotency_key: str) -> tuple[str, str] | None:
-        """Return the existing job ID and digest for an idempotency key."""
-        with self._connection() as connection:
+        """Return an idempotency match through a read-only database connection."""
+        connection = sqlite3.connect(
+            f"{self.database_path.as_uri()}?mode=ro",
+            timeout=30,
+            isolation_level=None,
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        try:
             row = connection.execute(
                 "SELECT job_id, request_digest FROM generation_jobs WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
+        finally:
+            connection.close()
         return None if row is None else (str(row["job_id"]), str(row["request_digest"]))
+
+    @classmethod
+    def find_idempotency_key_readonly(
+        cls, database_path: Path, idempotency_key: str
+    ) -> tuple[str, str] | None:
+        """Look up an accepted job without initializing or mutating the database.
+
+        This path is for reconciliation after a caller loses its acknowledgement.
+        A missing database means no job has been accepted. An existing database
+        must pass the same current-schema validation as normal service startup.
+        """
+        path = Path(database_path).expanduser().resolve()
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise RuntimeError("GenerationService database path is not a regular file")
+        store = object.__new__(cls)
+        store.database_path = path
+        store._validate_existing_database()
+        return store.find_idempotency_key(idempotency_key)
 
     def create_queued_execution(
         self,
