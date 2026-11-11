@@ -730,10 +730,12 @@ def _validate_variant_against_candidate(
             raise ScreeningConfigurationError(
                 "frozen screening case has an invalid operation intent"
             )
-        operation = operations.get(operation_intent)
+        if operation_intent not in operations:
+            continue
+        operation = operations[operation_intent]
         if not isinstance(operation, Mapping):
             raise ScreeningConfigurationError(
-                f"pinned candidate configuration does not declare the {operation_intent!r} operation"
+                f"pinned candidate {operation_intent!r} operation metadata is invalid"
             )
         operation_roles = operation.get("required_roles")
         if (

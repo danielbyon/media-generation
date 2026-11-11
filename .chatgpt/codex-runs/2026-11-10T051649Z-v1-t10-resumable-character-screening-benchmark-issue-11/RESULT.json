@@ -3,7 +3,7 @@
   "repo_id": "media-generation",
   "run_id": "2026-11-10T051649Z-v1-t10-resumable-character-screening-benchmark-issue-11",
   "status": "blocked",
-  "summary": "T10 implementation, the focused Python 3.14.4 suite, and the final make check passed. The final full check passed 2163 tests with five native Linux/APEX skips; an earlier run reported failures that did not recur on the final rerun. Live APEX execution and qualification evidence remain unavailable, so this result stays blocked and issue #11 remains open.",
+  "summary": "The T10 candidate-operation correction is implemented: absent operations remain in the frozen matrix and supplementary ledger and are reported unsupported at execution, while malformed declared operation metadata and missing required components still fail closed. The focused Python 3.14.4 screening suite passed 50 tests. The current full make check exited 2 with 31 failures, 2135 passed, and 5 skipped; failures were in ComfyUI adapter and backend evidence tests outside this patch. A representative adapter case failed once and passed on an isolated rerun; the cause remains unresolved. Earlier full-check history also included 29 local failures followed by a 2163-pass run, with no established cause. This result remains blocked: TAC-6, TAC-7, and TAC-11 are unverified pending live APEX evidence, and issue #11 remains open.",
   "changed_files": [
     "README.md",
     "docs/architecture/character-screening.md",
@@ -52,7 +52,7 @@
     },
     {
       "path": "src/media_generation/screening_manifest.py",
-      "reason": "Validates frozen manifests, expands the 24-case matrix and supplements, checks exact candidate component identity and exercised required-role coverage, and requires preview/final pairing."
+      "reason": "Validates frozen manifests, expands the 24-case matrix and supplements, checks exact selected-component identity and declared-operation required-role coverage, and permits undeclared operations to remain frozen for explicit unsupported outcomes."
     },
     {
       "path": "src/media_generation/screening_report.py",
@@ -76,7 +76,7 @@
     },
     {
       "path": "tests/test_screening.py",
-      "reason": "Covers candidate identity, mandatory pairing, read-only recovery/report inspection, missing-database safety, separate benchmark and service states, execution completeness, and the 24-case denominator."
+      "reason": "Covers candidate identity and required-role validation, malformed declared operations, generate-only case freezing, explicit unsupported outcomes with 24 matrix and 10 supplementary slots, no resubmission after completion, read-only recovery/report inspection, and deterministic CPU matrix execution."
     },
     {
       "path": "tests/test_screening_cli.py",
@@ -92,17 +92,27 @@
     "Earlier Final /Users/daniel/.cubic/bin/cubic review -> exit 1; one P1 finding disputed. It says deterministic CPU execution bypasses candidate operation-role checks. The bypass requires both the exact DeterministicCpuAdapter ID and its exact fixed configuration, preserving the explicit CPU testing path; real adapters still require pinned candidate and frozen operation validation. No source change was warranted.",
     "Clean base verification: archive commit 548d289b39882ab20d1ee080e70b490805ad7abc to a temporary tree; run PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_backend_evidence_v3.py::test_comfyui_release_policy_fails_closed_for_untrusted_configuration[missing] -q --tb=no -> 1 failed in 5.94s (exit 1).",
     "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py tests/test_screening_cli.py -q --tb=no -> 50 passed in 9.07s.",
-    "Final rerun: PYTHONPATH=src:tests make check PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python > /tmp/media-generation-t10-make-check-final.log 2>&1 -> exit 0; 2163 passed, 5 skipped in 202.16s; CLI --help smoke check completed. This final run did not reproduce the 29 failures from the earlier full-check run.",
-    "/Users/daniel/.cubic/bin/cubic review after malformed-role validation -> completed; no issues found."
+    "Prior pre-correction full check: PYTHONPATH=src:tests make check PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python > /tmp/media-generation-t10-make-check-final.log 2>&1 -> exit 0; 2163 passed, 5 skipped in 202.16s; CLI --help smoke check completed. This was before the current operation-availability correction.",
+    "/Users/daniel/.cubic/bin/cubic review after malformed-role validation -> completed; no issues found.",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py -k 'generate_only_candidate or freezes_all_cases or omitted_for_an_exercised_operation or malformed_declared_operation' -q --tb=short -> 4 passed, 46 deselected.",
+    "PYTHONPATH=src:tests /Users/daniel/Projects/media-generation/.venv/bin/python -m pytest tests/test_screening.py -q --tb=short -> 50 passed in 5.38s on Python 3.14.4.",
+    "make check -> exit 2 because default /usr/local/bin/python3 has no pytest; no tests ran.",
+    "PYTHON=/Users/daniel/Projects/media-generation/.venv/bin/python make check -> exit 2; 31 failed, 2135 passed, 5 skipped in 326.02s. The 31 failures were 27 in tests/test_comfyui_adapter.py and 4 in tests/test_backend_evidence_v3.py; CLI help smoke was not reached.",
+    "Isolated tests/test_backend_evidence_v3.py::test_comfyui_release_policy_fails_closed_for_untrusted_configuration[missing] -> 1 failed in 5.68s; diagnostics recorded a zero child exit code and execution_failed.",
+    "Isolated tests/test_comfyui_adapter.py::test_qwen_profile_v2_operations_complete_through_generation_service[generate-reference] -> first run 1 failed in 5.69s; immediate rerun 1 passed in 8.24s. A separate same-shaped service diagnostic completed successfully. No cause for the differing outcomes was established.",
+    "/Users/daniel/.cubic/bin/cubic review for the current patch -> exit 1 with one P1 claiming absent operation intents should be rejected. This conflicts with issue #11's requirement to freeze unsupported cases and the explicit generate-only regression proving 24 matrix and 10 supplementary slots remain accounted; no source change was made for this disputed finding."
   ],
   "tests": [
-    "Final focused screening and CLI suite: 50 passed in 9.07s on Python 3.14.4, including the malformed candidate-role regressions.",
-    "Final make check passed: 2163 passed, 5 skipped in 202.16s, and the CLI help smoke check completed. An earlier full-check run reported 29 failures (25 in test_comfyui_adapter.py and 4 in test_backend_evidence_v3.py); one release-policy case also failed in a clean archive of base commit 548d289b39882ab20d1ee080e70b490805ad7abc. The final full-check rerun passed without reproducing those failures; the reason for the differing outcomes was not isolated. Five skips require native Linux/APEX conditions.",
+    "Current focused Python 3.14.4 screening suite: 50 passed in 5.38s. The targeted candidate-operation regressions passed 4 tests with 46 deselected.",
+    "Current full make check did not pass: 31 failed, 2135 passed, and 5 skipped in 326.02s. All failures were in tests/test_comfyui_adapter.py (27) and tests/test_backend_evidence_v3.py (4); the T10 screening tests passed in that run and CLI help smoke was not reached.",
+    "A representative ComfyUI adapter test failed on one isolated run and passed on immediate rerun; a separate diagnostic service run also succeeded. A backend evidence test reproduced once with a zero child exit code and execution_failed. The underlying cause remains unresolved and is not attributed to this patch.",
+    "Earlier validation history is preserved: one local full check reported 29 failures (25 ComfyUI adapter, 4 backend evidence), followed by a full check with 2163 passed and 5 skipped. A clean archive of base commit 548d289b39882ab20d1ee080e70b490805ad7abc also reproduced one release-policy failure. The reason for differing outcomes remains unknown.",
+    "Generate-only candidate regressions verify creation of all 24 matrix and 10 supplementary cases, unsupported edit outcomes, exact declared-operation validation, and no repeat submissions after completed work.",
     "The missing preview/final pairing regression failed before the validator fix and passed afterward; valid paired cases remain accepted.",
     "Read-only integrity regressions confirm recovery and report inspection do not persist integrity observations and do not recreate a missing GenerationService database.",
     "The matrix status regression confirms summary counts follow benchmark_status while matrix_execution reflects the persisted service execution outcome.",
     "Independent source reviews found integrity persistence during report/recovery, omitted facade constants, and stale documentation about integrity persistence. Those findings were corrected and covered by tests or documentation updates. A final read-only source review found no remaining concrete findings in database opening or benchmark-versus-service status reporting.",
-    "Final staged Cubic review completed with no issues found after rejecting malformed candidate component roles. Earlier review observations about empty required-role lists and the exact deterministic CPU test adapter were checked against the supported T07 parser contract and explicit CPU testing path.",
+    "The current local Cubic review reported one P1 disputing absent-operation handling. The finding conflicts with the required unsupported-case accounting and the regression evidence; it remains disputed, with no source change made.",
     "Formal gpt-repo-local Delegation v3 review could not bind this worktree: the approved-root inventory lists the primary checkout but not this worktree, and no root-registration action is exposed. No formal approval is claimed.",
     "TAC-6, TAC-7, and TAC-11 remain unverified because live APEX execution and owner-verified hardware evidence are unavailable; issue #11 remains open."
   ],
@@ -131,7 +141,7 @@
     {
       "id": "TAC-5",
       "status": "passed",
-      "evidence": "New submissions and queued continuations reach GenerationService only after fixture preflight, compatible frozen execution identity, and service-path checks; GenerationService retains current privacy, capability, adapter, admission, and attempt-budget gates. The selected T07 component identity is checked by ID, role, SHA-256, precision, and quantization. Auxiliary candidate components are permitted, while the exact deterministic CPU test configuration is the only candidate-free path."
+      "evidence": "New submissions and queued continuations reach GenerationService only after fixture preflight, compatible frozen execution identity, and service-path checks; GenerationService retains current privacy, capability, adapter, admission, and attempt-budget gates. Selected component identity is checked by ID, role, SHA-256, precision, and quantization. Required roles are validated for every operation declared by the candidate; absent operations remain counted for explicit unsupported outcomes."
     },
     {
       "id": "TAC-6",
@@ -150,8 +160,8 @@
     },
     {
       "id": "TAC-9",
-      "status": "passed",
-      "evidence": "The final Python 3.14.4 focused screening and CLI suite passed 50 tests, covering exact candidate identity, required-role coverage, malformed candidate roles, read-only recovery and reporting, submission accounting, and deterministic CPU matrix execution. The final full make check passed 2163 tests with 5 native Linux/APEX skips; an earlier run reported failures that did not recur on the final rerun."
+      "status": "unverified",
+      "evidence": "The focused Python 3.14.4 screening suite passed 50 tests, including generate-only candidate case freezing, declared-operation validation, unsupported outcomes, and no resubmission after completion. The current full make check exited 2 with 31 failures, 2135 passed, and 5 skipped; failures were confined to tests/test_comfyui_adapter.py and tests/test_backend_evidence_v3.py, and CLI smoke was not reached. A representative adapter test failed once and passed on isolated rerun. Earlier local validation also reported 29 failures followed by a 2163-pass run; the cause of these differing results remains unknown."
     },
     {
       "id": "TAC-10",
@@ -161,14 +171,16 @@
     {
       "id": "TAC-11",
       "status": "unverified",
-      "evidence": "The final Python 3.14.4 focused suite passed 50 tests and the final full make check passed 2163 tests with 5 native Linux/APEX skips. The pinned 24-case live APEX screening with owner hardware outputs was not run, and the native qualification skips remain. TAC-11 remains unverified."
+      "evidence": "The current focused Python 3.14.4 suite passed 50 tests; the current full make check had 31 failures, 2135 passed, and 5 native Linux/APEX skips, with the cause of the unrelated test failures unresolved. No pinned 24-case live APEX screening or owner hardware outputs were provided. TAC-11 remains unverified."
     }
   ],
   "scope_extension_required": [],
   "blockers": [
+    "The current full make check reported 31 failures in existing ComfyUI adapter and backend evidence tests; a representative case was intermittent, and no root cause was established. The CLI smoke phase did not run.",
     "No live APEX execution or owner-verified hardware outputs were available. TAC-6, TAC-7, and TAC-11 remain unverified; issue #11 must remain open pending those results."
   ],
   "followups": [
+    "Repeat and investigate the intermittent ComfyUI adapter and backend evidence failures under a controlled environment; preserve exact run output and do not attribute a cause until reproduced evidence supports it.",
     "Run the 24-case matrix on the owner-selected APEX configuration using the approved T07 candidate, current admission inputs, and three approved reference fixtures; retain the run report and generated artifacts.",
     "Inspect supplementary chain and preview/final artifacts from the live run, update the hardware evidence on issue #11, and keep the issue open until that evidence is reviewed."
   ]

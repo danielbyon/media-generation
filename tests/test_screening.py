@@ -276,12 +276,37 @@ def _pin_distinct_references(
 ) -> None:
     styles = mapping["reference_styles"]
     assert isinstance(styles, list)
+    actual_digests: dict[str, str] = {}
+    artifact_id_remap: dict[str, str] = {}
     for index, style in enumerate(styles):
         assert isinstance(style, dict)
+        original_ids = style["artifact_ids"]
+        assert isinstance(original_ids, list) and len(original_ids) == 1
         artifact_id = _add_reference(service, f"{label}-{index}")
         digest = SQLiteStore(service.database_path).get_artifact(artifact_id).sha256
         style["artifact_ids"] = [artifact_id]
         style["sha256"] = ["b" * 64 if incorrect_digests else digest]
+        actual_digests[artifact_id] = digest
+        artifact_id_remap[str(original_ids[0])] = artifact_id
+    supplementary = mapping["supplementary_cases"]
+    assert isinstance(supplementary, list)
+    for case in supplementary:
+        assert isinstance(case, dict)
+        request = case["request"]
+        assert isinstance(request, dict)
+        conditioning_ids = request["reference_ids"]
+        assert isinstance(conditioning_ids, list)
+        remapped_ids = [artifact_id_remap[str(item)] for item in conditioning_ids]
+        request["reference_ids"] = remapped_ids
+        case["conditioning_sha256"] = [
+            "b" * 64 if incorrect_digests else actual_digests[artifact_id]
+            for artifact_id in remapped_ids
+        ]
+        origin_ids = case.get("creative_origin_artifact_ids")
+        if isinstance(origin_ids, list):
+            case["creative_origin_artifact_ids"] = [
+                artifact_id_remap[str(item)] for item in origin_ids
+            ]
 
 
 def _job_count(database: Path) -> int:
@@ -533,6 +558,47 @@ def test_candidate_validation_requires_frozen_operation_intents() -> None:
         )
 
 
+def test_candidate_validation_rejects_malformed_declared_operation_metadata() -> None:
+    variant = _manifest_mapping()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    candidate_components, _ = _candidate_components_for_variant(variant)
+
+    with pytest.raises(ScreeningConfigurationError, match="invalid required roles"):
+        _validate_variant_against_candidate(
+            variant,
+            _t07_candidate_identity(
+                candidate_components,
+                operations={"generate": {"required_roles": None}},
+            ),
+            operation_intents=("generate", "edit"),
+        )
+
+
+def test_create_run_freezes_all_cases_for_generate_only_candidate(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest()
+    variant = manifest.to_dict()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    _, selected_roles = _candidate_components_for_variant(variant)
+    runner = _candidate_runner(
+        tmp_path,
+        variant,
+        operations={"generate": {"required_roles": selected_roles}},
+    )
+
+    run_id = runner.create_run(manifest)
+    cases = runner.ledger.list_cases(run_id)
+    matrix = [case for case in cases if case["kind"] == "matrix"]
+    supplementary = [case for case in cases if case["kind"] != "matrix"]
+
+    assert len(matrix) == 24
+    assert len(supplementary) == 10
+    assert all(case["status"] == "pending" for case in cases)
+    assert all(case["request_digest"] == case["definition"]["request_digest"] for case in cases)
+    assert all(case["idempotency_key"].startswith(f"t10:{run_id}:") for case in cases)
+
+
 def test_create_run_rejects_component_omitted_for_an_exercised_operation(
     tmp_path: Path,
 ) -> None:
@@ -553,10 +619,7 @@ def test_create_run_rejects_component_omitted_for_an_exercised_operation(
     runner = _candidate_runner(
         tmp_path,
         variant,
-        operations={
-            "generate": {"required_roles": [*selected_roles, omitted_role]},
-            "edit": {"required_roles": [*selected_roles, omitted_role]},
-        },
+        operations={"generate": {"required_roles": [*selected_roles, omitted_role]}},
         additional_roles=(omitted_role,),
     )
 
@@ -620,6 +683,84 @@ def test_create_run_unions_mixed_generate_and_edit_requirements(
 
     with pytest.raises(ScreeningConfigurationError, match=edit_only_role):
         runner.create_run(manifest)
+
+
+def test_generate_only_candidate_accounts_unsupported_cases_without_resubmitting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database = tmp_path / "generation.sqlite3"
+    output = tmp_path / "artifacts"
+    setup = GenerationService(database, output, adapter=DeterministicCpuAdapter())
+    mapping = _manifest_mapping()
+    _pin_distinct_references(setup, mapping, "generate-only")
+    manifest = ScreeningManifest.from_mapping(mapping)
+    variant = manifest.to_dict()["selected_model_variant"]
+    assert isinstance(variant, dict)
+    candidate_components, selected_roles = _candidate_components_for_variant(variant)
+    operations = {"generate": {"required_roles": selected_roles}}
+    adapter = DeterministicCpuAdapter()
+    adapter.configuration.update(
+        {
+            "candidate_id": "t07-approved-candidate-1",
+            "components": candidate_components,
+            "operations": operations,
+        }
+    )
+    identity = {
+        "adapter_id": adapter.adapter_id,
+        "adapter_configuration": adapter.configuration,
+        "service_database": str(database.resolve()),
+        "output_directory": str(output.resolve()),
+    }
+    runner = ScreeningRunner(
+        data_directory=tmp_path / "screening-data",
+        service_database=database,
+        output_directory=output,
+        execution_identity=identity,
+        service_factory=lambda: GenerationService(database, output, adapter=adapter),
+        clock=lambda: 1000.0,
+        lease_seconds=10,
+        heartbeat_interval=None,
+    )
+    submitted_keys: list[str] = []
+    original_submit = GenerationService.submit
+
+    def track_submit(self: GenerationService, idempotency_key: str, *args: object, **kwargs: object):
+        submitted_keys.append(idempotency_key)
+        return original_submit(self, idempotency_key, *args, **kwargs)
+
+    monkeypatch.setattr(GenerationService, "submit", track_submit)
+    run_id = runner.create_run(manifest)
+    frozen_cases = runner.ledger.list_cases(run_id)
+    frozen_identities = [
+        (case["case_id"], case["request_digest"], case["idempotency_key"])
+        for case in frozen_cases
+    ]
+
+    report = runner.resume(run_id)
+    summary = report["summary"]
+    assert summary["matrix_denominator"] == 24
+    assert summary["matrix_accounted"] == 24
+    assert summary["matrix_status_counts"] == {"succeeded": 24}
+    assert summary["supplementary_denominator"] == 10
+    assert summary["supplementary_status_counts"] == {"succeeded": 7, "unsupported": 3}
+    assert {case["error_code"] for case in report["supplementary_cases"] if case["status"] == "unsupported"} == {
+        "unsupported_capability"
+    }
+    assert all(case["status"] == "succeeded" for case in report["matrix_cases"])
+    assert _job_count(database) > 3
+
+    submissions_after_completion = list(submitted_keys)
+    jobs_after_completion = _job_count(database)
+    repeated = runner.resume(run_id)
+
+    assert submitted_keys == submissions_after_completion
+    assert _job_count(database) == jobs_after_completion
+    assert [
+        (case["case_id"], case["request_digest"], case["idempotency_key"])
+        for case in runner.ledger.list_cases(run_id)
+    ] == frozen_identities
+    assert repeated["summary"]["matrix_accounted"] == 24
 
 
 def test_unpinned_real_engine_identity_cannot_skip_candidate_validation() -> None:
