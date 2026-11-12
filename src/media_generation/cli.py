@@ -14,6 +14,7 @@ from .admission import (
     WorkloadDemand,
     load_admission_profile,
     load_workload_demand,
+    parse_workload_demand,
 )
 from .domain import GenerationRequest, ArtifactSource
 from .errors import (
@@ -44,6 +45,7 @@ from .candidate import (
     verify_candidate,
 )
 from .service import GenerationService
+from .batch_execution import GenerationBatchService
 from .screening import (
     ScreeningConfigurationError,
     ScreeningError,
@@ -112,6 +114,79 @@ def _admission_inputs(
         load_admission_profile(options.inventory_report, options.admission_policy),
         load_workload_demand(options.workload_demand),
     )
+
+
+def _add_batch_admission_arguments(command: argparse.ArgumentParser) -> None:
+    """Add the profile and per-slot demand inputs used by batch admission."""
+    command.add_argument(
+        "--inventory-report",
+        type=Path,
+        help="strict T02 inventory report used to derive the capacity profile",
+    )
+    command.add_argument(
+        "--admission-policy",
+        type=Path,
+        help="strict operator policy with explicit headroom for every pool",
+    )
+    command.add_argument(
+        "--workload-demands",
+        type=Path,
+        help=(
+            "versioned JSON mapping each output slot to a strict T04 workload demand"
+        ),
+    )
+
+
+def _batch_admission_inputs(
+    options: argparse.Namespace,
+) -> tuple[AdmissionProfile | None, dict[str, WorkloadDemand] | None]:
+    """Load one profile and an exact output-slot demand map, if supplied."""
+    values = (
+        options.inventory_report,
+        options.admission_policy,
+        options.workload_demands,
+    )
+    if not any(values):
+        return None, None
+    if not all(values):
+        raise InputValidationError(
+            "--inventory-report, --admission-policy, and --workload-demands "
+            "must be provided together"
+        )
+    profile = load_admission_profile(
+        options.inventory_report, options.admission_policy
+    )
+    demands = _load_batch_workload_demands(options.workload_demands)
+    return profile, demands
+
+
+def _load_batch_workload_demands(path: Path) -> dict[str, WorkloadDemand]:
+    """Load a versioned map whose keys are immutable GenerationRequest slots."""
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"), object_pairs_hook=_unique_object_pairs
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise InputValidationError(f"cannot read batch workload demands: {error}") from error
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema",
+        "schema_version",
+        "demands",
+    }:
+        raise InputValidationError("batch workload demands have an invalid shape")
+    if payload.get("schema") != "media-generation.batch-workload-demands":
+        raise InputValidationError("unsupported batch workload demand schema")
+    if type(payload.get("schema_version")) is not int or payload["schema_version"] != 1:
+        raise InputValidationError("unsupported batch workload demand schema_version")
+    raw_demands = payload.get("demands")
+    if not isinstance(raw_demands, dict) or not raw_demands:
+        raise InputValidationError("batch workload demands must be a non-empty object")
+    parsed: dict[str, WorkloadDemand] = {}
+    for output_slot, demand in raw_demands.items():
+        if not isinstance(output_slot, str) or not output_slot:
+            raise InputValidationError("batch demand keys must be output-slot strings")
+        parsed[output_slot] = parse_workload_demand(demand)
+    return parsed
 
 
 def _add_engine_arguments(
@@ -294,6 +369,38 @@ def build_parser() -> argparse.ArgumentParser:
     reconcile.add_argument("--db", required=True, type=Path)
     reconcile.add_argument("--output-dir", required=True, type=Path)
 
+    batch = commands.add_parser(
+        "batch", help="run, resume, or report a durable sequential generation batch"
+    )
+    batch_commands = batch.add_subparsers(dest="batch_command", required=True)
+    batch_run = batch_commands.add_parser("run", help="persist and execute a new batch")
+    batch_run.add_argument("--db", required=True, type=Path)
+    batch_run.add_argument("--output-dir", required=True, type=Path)
+    batch_run.add_argument("--batch-key", required=True)
+    batch_run.add_argument(
+        "--requests-json",
+        required=True,
+        help="JSON array of engine-neutral requests; use - to read from standard input",
+    )
+    batch_run.add_argument("--max-attempts", type=int, default=1)
+    _add_batch_admission_arguments(batch_run)
+    _add_engine_arguments(batch_run)
+
+    batch_resume = batch_commands.add_parser(
+        "resume", help="resume an existing batch with its pinned execution evidence"
+    )
+    batch_resume.add_argument("--db", required=True, type=Path)
+    batch_resume.add_argument("--output-dir", required=True, type=Path)
+    batch_resume.add_argument("--batch-id", required=True)
+    _add_batch_admission_arguments(batch_resume)
+    _add_engine_arguments(batch_resume)
+
+    batch_report = batch_commands.add_parser(
+        "report", help="read-only execution, publication, and artifact-integrity report"
+    )
+    batch_report.add_argument("--db", required=True, type=Path)
+    batch_report.add_argument("--batch-id", required=True)
+
     screen = commands.add_parser(
         "screen", help="run, resume, or report a versioned character-screening benchmark"
     )
@@ -390,6 +497,40 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return _run_inventory(options)
         if options.command == "screen":
             return _run_screen(options)
+        if options.command == "batch":
+            if options.batch_command == "report":
+                report = GenerationBatchService.report_database(
+                    options.db, options.batch_id
+                )
+            else:
+                if options.batch_command == "run":
+                    requests = _parse_batch_requests(options.requests_json)
+                else:
+                    requests = None
+                profile, demands = _batch_admission_inputs(options)
+                adapter = _engine_adapter(options, options.output_dir)
+                service = GenerationService(
+                    options.db,
+                    options.output_dir,
+                    adapter=adapter,
+                    admission_profile=profile,
+                )
+                batches = GenerationBatchService(service)
+                if options.batch_command == "run":
+                    assert requests is not None
+                    report = batches.submit(
+                        options.batch_key,
+                        requests,
+                        workload_demands=demands,
+                        max_attempts=options.max_attempts,
+                    )
+                else:
+                    report = batches.resume(
+                        options.batch_id,
+                        workload_demands=demands,
+                    )
+            _write_json(report, sys.stdout)
+            return int(report.get("report_state") != "complete")
         if options.command == "submit":
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
@@ -794,6 +935,23 @@ def _parse_request(source: str) -> GenerationRequest:
         return GenerationRequest(**payload)
     except TypeError as error:
         raise InputValidationError(f"invalid request fields: {error}") from error
+
+
+def _parse_batch_requests(source: str) -> tuple[GenerationRequest, ...]:
+    """Parse a strict JSON array and validate each engine-neutral request."""
+    raw = sys.stdin.read() if source == "-" else source
+    try:
+        payload = json.loads(raw, object_pairs_hook=_unique_object_pairs)
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise InputValidationError(f"invalid batch requests JSON: {error}") from error
+    if not isinstance(payload, list) or not payload:
+        raise InputValidationError("batch requests JSON must be a non-empty array")
+    requests: list[GenerationRequest] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise InputValidationError("each batch request must be a JSON object")
+        requests.append(_parse_request(json.dumps(item, ensure_ascii=False)))
+    return tuple(requests)
 
 
 def _unique_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:

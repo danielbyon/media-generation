@@ -15,13 +15,13 @@ relative filename, observed source identity and timestamps, and import time.
 The source bytes are copied unchanged, including metadata and orientation.
 Later edits to the source file cannot change the stored artifact.
 
-The current schema is `user_version = 6`. A new database creates artifact,
-lineage, publication, execution, backend-evidence, privacy, and admission
-structures directly in one transaction. An existing database reopens through a
-read-only connection and must match the complete current schema exactly. Older,
-newer, partial, malformed-current, and nonempty unversioned databases are
-rejected without mutation. There is no migration, backfill, historical
-publication repair, or old-job compatibility path.
+The current schema is `user_version = 7`. A new database creates artifact,
+lineage, publication, execution, backend-evidence, privacy, admission, and
+batch-coordination structures directly in one transaction. An existing
+database reopens through a read-only connection and must match the complete
+current schema exactly. Older, newer, partial, malformed-current, and nonempty
+unversioned databases are rejected without mutation. There is no migration,
+backfill, historical publication repair, or old-job compatibility path.
 
 Every current generation job has an `execution_jobs` sidecar with non-null
 privacy-compliance evidence and exactly one `execution_admissions` row. The
@@ -33,11 +33,11 @@ incompatible. A `not_required` admission is accepted only for the exact bundled
 The store also creates immutable-artifact and writer-epoch triggers. Every
 connection registers the connection-local
 `media_generation_writer_epoch()` function. `BEFORE INSERT/UPDATE` guards on
-current mutation tables require epoch 5. A client that lacks the function, or
+current mutation tables require epoch 7. A client that lacks the function, or
 that reports a different epoch, aborts on its first guarded mutation.
 Validation compares every table, index, trigger definition, singleton resource
-row, execution sidecar, admission row, and exemption. Unknown objects and
-divergent same-name definitions fail closed.
+row, execution sidecar, admission row, batch table, and batch slot. Unknown
+objects and divergent same-name definitions fail closed.
 
 The writer guard protects SQLite writes after a compatible database has been
 opened. It is not a process supervisor or authentication boundary. Operators
@@ -316,6 +316,60 @@ use the protocol and leave the private cleanup namespace untouched. A privileged
 or same-account process can still modify files or the database outside the
 protocol. Descriptor checks and later integrity verification detect observable
 changes, but do not protect against an adversary controlling the storage host.
+
+## 7. Durable batch coordination
+
+`GenerationBatchService` stores a batch manifest and ordered slot rows in the
+same schema-v7 database as T04. It commits each slot's request, stable slot ID,
+T04 idempotency key, attempt budget, and per-slot admission profile and demand
+before admitting a GenerationJob. The T04 service remains the only component
+that admits, executes, retries, recovers, or publishes a single output.
+
+Batch slots run in ordinal order. On resume, a slot first resolves its service
+job by the persisted idempotency key. It reuses that job through T04
+`enqueue`, which checks the frozen request, adapter, destination, privacy,
+admission, and attempt budget. It does not create another job when one is
+already accepted. A queued job with no attempts uses T04 `submit` for its first
+attempt. A queued job with prior attempts can continue only when its history,
+termination proof, and remaining budget establish a safe retry. When T04 still
+reports retry eligibility, the coordinator calls T04 `retry` before `submit`.
+When T04 has already moved a failed job to `queued`, cleared its retry flag, and
+restored its admission decision to `queued`, that persisted transition records
+the retry authorization; after a crash at this handoff, the coordinator calls
+`submit` on the same job. A queued retry with no matching T04 authorization is
+held for attention.
+
+The batch claim has its own owner and epoch. Expiry permits another coordinator
+to claim the batch; it says nothing about the service attempt. A running job
+remains subject to T04's resource lock, process evidence, and publication fence.
+Resume observes the job and calls T04 `recover` only when the service
+reservation matches both that job and its current attempt. A busy resource or
+unresolved state leaves the slot for observation or attention instead of
+starting another attempt.
+
+The batch manifest pins the adapter configuration, privacy evidence, and
+resolved output directory. Resume verifies those values and each slot's
+admission inputs before it touches a pending service job. Accepted T04 jobs
+keep their own persisted configuration and admission row; a changed current
+profile, demand, adapter, or destination causes batch resume to refuse.
+
+`batch report` opens the database through read-only schema validation and uses
+non-persisting integrity inspection. It reports coordinator state, execution
+status, publication state, artifact integrity, and lineage separately. It does
+not recover jobs or write integrity observations. If T04 says `succeeded` but
+the committed publication, artifact identity, lineage, or current bytes do not
+agree, the report marks the slot as requiring attention while retaining the
+historical T04 success.
+
+A failed slot with verified retry eligibility, safe attempt history, and
+remaining budget keeps the batch coordinator running. The report exposes this
+state as `retry_pending`, including when later slots have already completed.
+
+Schema-v6 databases are rejected without mutation. There is no batch-table
+migration. The focused tests cover first-attempt and already-authorized queued
+recovery, retry budgets, missing or changed heavyweight admission evidence,
+lost acknowledgements, concurrent coordinators, expired claims, partial
+success, publication faults, and read-only integrity discrepancies.
 
 Workers coordinate through one SQLite database and one local filesystem. This
 implementation has no distributed scheduling, HTTP service, model download,

@@ -95,7 +95,7 @@ claim.
 
 ## Database contract
 
-The current persistent schema is version 6. Opening an empty database creates
+The current persistent schema is version 7. Opening an empty database creates
 that schema atomically. Opening an existing database uses a read-only connection
 and validates the exact version, tables, indexes, triggers, singleton resource
 row, execution/admission relationships, and current privacy records.

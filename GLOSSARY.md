@@ -35,3 +35,23 @@ _Avoid_: accepted preset, product SLO as synonyms.
 **Preview/final acceptance envelope**:
 The owner's selected useful dimensions/aspects, acceptable end-to-end latency, and visual quality trade-offs for preview and final output. Under the approved measurement-first process, its values are selected after measured finalist review.
 _Avoid_: weighted score, fastest configuration as substitutes for acceptance.
+
+**Generation batch**:
+An immutable ordered collection of generation requests coordinated in one SQLite database. Each request runs through the existing single-output `GenerationService` and keeps that service's admission, execution, resource, and publication records.
+_Avoid_: job queue, distributed scheduler, or multi-output GenerationJob as substitutes.
+
+**Batch slot**:
+A durable identity for one request in a generation batch. It pins the request, ordinal, idempotency key, attempt budget, and applicable admission evidence to the matching T04 GenerationJob.
+_Avoid_: output filename as a substitute for slot identity.
+
+**Batch coordinator claim**:
+An owner and fencing epoch that permit one coordinator to update a batch at a time. Claim expiry permits another coordinator to take over; the GenerationJob's resource and attempt evidence still determine whether execution can continue.
+_Avoid_: proof of process termination or service-attempt completion.
+
+**Publication state**:
+The T04 journal's recorded progress toward committing an artifact and its lineage in SQLite.
+_Avoid_: adapter success or the presence of a file as proof of committed publication.
+
+**Artifact integrity**:
+A read-time check that current artifact bytes and their publication location match immutable metadata. Batch reports run this check without storing an integrity observation.
+_Avoid_: execution status or historical success as a current file check.

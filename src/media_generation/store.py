@@ -75,9 +75,9 @@ def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
             "persisted ComfyUI adapter configuration has no workflow approval pin"
         )
     return configuration["workflow_approval"]
-_WRITER_EPOCH = 6
+_WRITER_EPOCH = 7
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_CURRENT_SCHEMA_VERSION = 6
+_CURRENT_SCHEMA_VERSION = 7
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -94,6 +94,10 @@ _WRITER_GUARDS = (
     ("execution_admissions", "UPDATE"),
     ("backend_executions", "INSERT"),
     ("backend_executions", "UPDATE"),
+("generation_batches", "INSERT"),
+("generation_batches", "UPDATE"),
+("generation_batch_slots", "INSERT"),
+("generation_batch_slots", "UPDATE"),
 )
 
 
@@ -344,8 +348,96 @@ _ARTIFACT_INTEGRITY_DDL = """CREATE TABLE artifact_integrity (
     detail TEXT
 )"""
 
+_GENERATION_BATCHES_DDL = """CREATE TABLE generation_batches (
+    batch_id TEXT PRIMARY KEY,
+    batch_key TEXT NOT NULL UNIQUE,
+    manifest_json TEXT NOT NULL,
+    manifest_digest TEXT NOT NULL CHECK (length(manifest_digest) = 64),
+    execution_identity_json TEXT NOT NULL,
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+    coordinator_state TEXT NOT NULL CHECK (coordinator_state IN (
+        'planned','running','complete','partial','failed','attention_required')),
+    claim_owner TEXT,
+    claim_epoch INTEGER NOT NULL DEFAULT 0 CHECK (claim_epoch >= 0),
+    claim_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK ((claim_owner IS NULL AND claim_expires_at IS NULL)
+        OR (claim_owner IS NOT NULL AND claim_expires_at IS NOT NULL))
+)"""
+
+_GENERATION_BATCH_SLOTS_DDL = """CREATE TABLE generation_batch_slots (
+    slot_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL REFERENCES generation_batches(batch_id),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    output_slot TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    admission_profile_json TEXT,
+    workload_demand_json TEXT,
+    max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
+    coordinator_state TEXT NOT NULL CHECK (coordinator_state IN (
+        'planned','accepted','succeeded','failed','canceled','attention_required')),
+    service_job_id TEXT UNIQUE REFERENCES generation_jobs(job_id),
+    service_request_id TEXT REFERENCES generation_requests(request_id),
+    output_slot_id TEXT REFERENCES generation_jobs(output_slot_id),
+    artifact_id TEXT REFERENCES generation_artifacts(artifact_id),
+    detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (batch_id, ordinal),
+    CHECK ((admission_profile_json IS NULL AND workload_demand_json IS NULL)
+        OR (admission_profile_json IS NOT NULL AND workload_demand_json IS NOT NULL))
+)"""
+
 _GENERATION_ARTIFACTS_JOB_INDEX_DDL = """CREATE INDEX generation_artifacts_job_idx
     ON generation_artifacts(job_id)"""
+
+_GENERATION_BATCH_SLOTS_ORDER_INDEX_DDL = """CREATE INDEX generation_batch_slots_order_idx
+    ON generation_batch_slots(batch_id, ordinal)"""
+
+_GENERATION_BATCHES_IDENTITY_IMMUTABLE_DDL = """CREATE TRIGGER generation_batches_identity_immutable
+BEFORE UPDATE ON generation_batches
+BEGIN
+    SELECT RAISE(ABORT, 'generation batch identity is immutable')
+    WHERE NEW.batch_id IS NOT OLD.batch_id
+    OR NEW.batch_key IS NOT OLD.batch_key
+    OR NEW.manifest_json IS NOT OLD.manifest_json
+    OR NEW.manifest_digest IS NOT OLD.manifest_digest
+    OR NEW.execution_identity_json IS NOT OLD.execution_identity_json
+    OR NEW.max_attempts IS NOT OLD.max_attempts
+    OR NEW.created_at IS NOT OLD.created_at;
+END"""
+
+_GENERATION_BATCHES_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER generation_batches_immutable_delete
+BEFORE DELETE ON generation_batches
+BEGIN
+    SELECT RAISE(ABORT, 'generation batches are immutable');
+END"""
+
+_GENERATION_BATCH_SLOTS_IDENTITY_IMMUTABLE_DDL = """CREATE TRIGGER generation_batch_slots_identity_immutable
+BEFORE UPDATE ON generation_batch_slots
+BEGIN
+    SELECT RAISE(ABORT, 'generation batch slot identity is immutable')
+    WHERE NEW.slot_id IS NOT OLD.slot_id
+    OR NEW.batch_id IS NOT OLD.batch_id
+    OR NEW.ordinal IS NOT OLD.ordinal
+    OR NEW.output_slot IS NOT OLD.output_slot
+    OR NEW.request_json IS NOT OLD.request_json
+    OR NEW.request_digest IS NOT OLD.request_digest
+    OR NEW.idempotency_key IS NOT OLD.idempotency_key
+    OR NEW.admission_profile_json IS NOT OLD.admission_profile_json
+    OR NEW.workload_demand_json IS NOT OLD.workload_demand_json
+    OR NEW.max_attempts IS NOT OLD.max_attempts
+    OR NEW.created_at IS NOT OLD.created_at;
+END"""
+
+_GENERATION_BATCH_SLOTS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER generation_batch_slots_immutable_delete
+BEFORE DELETE ON generation_batch_slots
+BEGIN
+    SELECT RAISE(ABORT, 'generation batch slots are immutable');
+END"""
 
 _GENERATION_REQUESTS_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER generation_requests_immutable_update
 BEFORE UPDATE ON generation_requests
@@ -426,6 +518,8 @@ _CURRENT_TABLE_DDL: dict[str, str] = {
     "artifact_edges": _ARTIFACT_EDGES_DDL,
     "artifact_publications": _ARTIFACT_PUBLICATIONS_DDL,
     "artifact_integrity": _ARTIFACT_INTEGRITY_DDL,
+    "generation_batches": _GENERATION_BATCHES_DDL,
+    "generation_batch_slots": _GENERATION_BATCH_SLOTS_DDL,
     **_EXECUTION_TABLE_DDL,
 }
 
@@ -433,6 +527,7 @@ _CURRENT_TABLES = frozenset(_CURRENT_TABLE_DDL)
 
 _CURRENT_INDEX_DDL: dict[str, str] = {
     "generation_artifacts_job_idx": _GENERATION_ARTIFACTS_JOB_INDEX_DDL,
+    "generation_batch_slots_order_idx": _GENERATION_BATCH_SLOTS_ORDER_INDEX_DDL,
     "execution_jobs_queued_idx": _EXECUTION_JOBS_QUEUED_INDEX_DDL,
     "execution_attempts_running_idx": _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
     "execution_admissions_dispatch_idx": _EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL,
@@ -459,6 +554,18 @@ _STATIC_TRIGGER_DDL: dict[str, str] = {
     "backend_executions_stage_insert": _BACKEND_EXECUTIONS_STAGE_INSERT_DDL,
     "backend_executions_stage_transition": _BACKEND_EXECUTIONS_STAGE_TRANSITION_DDL,
     "backend_executions_immutable_delete": _BACKEND_EXECUTIONS_IMMUTABLE_DELETE_DDL,
+    "generation_batches_identity_immutable": (
+        _GENERATION_BATCHES_IDENTITY_IMMUTABLE_DDL
+    ),
+    "generation_batches_immutable_delete": (
+        _GENERATION_BATCHES_IMMUTABLE_DELETE_DDL
+    ),
+    "generation_batch_slots_identity_immutable": (
+        _GENERATION_BATCH_SLOTS_IDENTITY_IMMUTABLE_DDL
+    ),
+    "generation_batch_slots_immutable_delete": (
+        _GENERATION_BATCH_SLOTS_IMMUTABLE_DELETE_DDL
+    ),
 }
 
 
@@ -525,7 +632,9 @@ class SQLiteStore:
         """Open the current schema, with an optional mode that never initializes the file."""
         self.database_path = database_path.expanduser().resolve()
         self.read_only = read_only
-        if not self.read_only:
+        if self.read_only:
+            self._validate_existing_database()
+        else:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
             if self.database_path.exists() and self.database_path.stat().st_size:
                 self._validate_existing_database()
@@ -987,6 +1096,245 @@ END"""
         store.database_path = path
         store._validate_existing_database()
         return store.find_idempotency_key(idempotency_key)
+
+    def persist_generation_batch(
+        self,
+        *,
+        batch_id: str,
+        batch_key: str,
+        manifest_json: str,
+        manifest_digest: str,
+        execution_identity_json: str,
+        max_attempts: int,
+        slots: list[dict[str, object]],
+        timestamp: str,
+    ) -> tuple[str, bool]:
+        """Persist immutable batch intent before any T04 job is admitted."""
+        with self._connection(transaction=True) as connection:
+            existing = connection.execute(
+                "SELECT batch_id, manifest_json, manifest_digest, "
+                "execution_identity_json, max_attempts "
+                "FROM generation_batches WHERE batch_key = ?",
+                (batch_key,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    str(existing["manifest_json"]) != manifest_json
+                    or str(existing["manifest_digest"]) != manifest_digest
+                    or str(existing["execution_identity_json"])
+                    != execution_identity_json
+                    or int(existing["max_attempts"]) != max_attempts
+                ):
+                    raise IdempotencyConflictError(
+                        "batch key already bound to different immutable intent"
+                    )
+                persisted_count = int(
+                    connection.execute(
+                        "SELECT count(*) FROM generation_batch_slots WHERE batch_id = ?",
+                        (str(existing["batch_id"]),),
+                    ).fetchone()[0]
+                )
+                if persisted_count != len(slots):
+                    raise RuntimeError("persisted batch slot manifest is inconsistent")
+                return str(existing["batch_id"]), False
+
+            connection.execute(
+                """INSERT INTO generation_batches (
+                    batch_id, batch_key, manifest_json, manifest_digest,
+                    execution_identity_json, max_attempts, coordinator_state,
+                    claim_owner, claim_epoch, claim_expires_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'planned', NULL, 0, NULL, ?, ?)""",
+                (
+                    batch_id,
+                    batch_key,
+                    manifest_json,
+                    manifest_digest,
+                    execution_identity_json,
+                    max_attempts,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.executemany(
+                """INSERT INTO generation_batch_slots (
+                    slot_id, batch_id, ordinal, output_slot, request_json,
+                    request_digest, idempotency_key, admission_profile_json,
+                    workload_demand_json, max_attempts, coordinator_state,
+                    service_job_id, service_request_id, output_slot_id, artifact_id,
+                    detail, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'planned', NULL, NULL,
+                          NULL, NULL, NULL, ?, ?)""",
+                [
+                    (
+                        str(slot["slot_id"]),
+                        batch_id,
+                        int(slot["ordinal"]),
+                        str(slot["output_slot"]),
+                        str(slot["request_json"]),
+                        str(slot["request_digest"]),
+                        str(slot["idempotency_key"]),
+                        slot.get("admission_profile_json"),
+                        slot.get("workload_demand_json"),
+                        max_attempts,
+                        timestamp,
+                        timestamp,
+                    )
+                    for slot in slots
+                ],
+            )
+        return batch_id, True
+
+    def get_generation_batch(self, identifier: str) -> dict[str, object]:
+        """Read one persisted batch by stable ID or idempotency key."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM generation_batches "
+                "WHERE batch_id = ? OR batch_key = ?",
+                (identifier, identifier),
+            ).fetchone()
+        if row is None:
+            raise RecordNotFoundError(f"batch not found: {identifier}")
+        return dict(row)
+
+    def get_generation_batch_slots(self, batch_id: str) -> list[dict[str, object]]:
+        """Read batch slots in their immutable manifest order."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM generation_batch_slots "
+                "WHERE batch_id = ? ORDER BY ordinal",
+                (batch_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_generation_batch(
+        self, batch_id: str, owner: str, now: str, expires_at: str
+    ) -> dict[str, object] | None:
+        """Atomically take an available coordinator lease with a new epoch."""
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                "SELECT coordinator_state, claim_owner, claim_expires_at, claim_epoch "
+                "FROM generation_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"batch not found: {batch_id}")
+            if row["coordinator_state"] == "complete":
+                return None
+            if (
+                row["claim_owner"] is not None
+                and str(row["claim_owner"]) != owner
+                and row["claim_expires_at"] is not None
+                and str(row["claim_expires_at"]) > now
+            ):
+                return None
+            connection.execute(
+                """UPDATE generation_batches
+                   SET claim_owner = ?, claim_epoch = claim_epoch + 1,
+                       claim_expires_at = ?, coordinator_state = 'running',
+                       updated_at = ? WHERE batch_id = ?""",
+                (owner, expires_at, now, batch_id),
+            )
+            claimed = connection.execute(
+                "SELECT * FROM generation_batches WHERE batch_id = ?", (batch_id,)
+            ).fetchone()
+        return dict(claimed)
+
+    def renew_generation_batch_claim(
+        self,
+        batch_id: str,
+        owner: str,
+        epoch: int,
+        now: str,
+        expires_at: str,
+    ) -> bool:
+        """Extend only a live coordinator claim with its current fencing epoch."""
+        with self._connection(transaction=True) as connection:
+            cursor = connection.execute(
+                """UPDATE generation_batches SET claim_expires_at = ?, updated_at = ?
+                   WHERE batch_id = ? AND claim_owner = ? AND claim_epoch = ?
+                   AND claim_expires_at > ?""",
+                (expires_at, now, batch_id, owner, epoch, now),
+            )
+        return cursor.rowcount == 1
+
+    def checkpoint_generation_batch_slot(
+        self,
+        *,
+        batch_id: str,
+        slot_id: str,
+        owner: str,
+        epoch: int,
+        now: str,
+        coordinator_state: str,
+        service_job_id: str | None = None,
+        service_request_id: str | None = None,
+        output_slot_id: str | None = None,
+        artifact_id: str | None = None,
+        detail: str | None = None,
+    ) -> bool:
+        """Checkpoint observed T04 identities only under a live batch claim."""
+        with self._connection(transaction=True) as connection:
+            claim = connection.execute(
+                """SELECT 1 FROM generation_batches
+                   WHERE batch_id = ? AND claim_owner = ? AND claim_epoch = ?
+                   AND claim_expires_at > ?""",
+                (batch_id, owner, epoch, now),
+            ).fetchone()
+            if claim is None:
+                return False
+            cursor = connection.execute(
+                """UPDATE generation_batch_slots
+                   SET coordinator_state = ?,
+                       service_job_id = COALESCE(?, service_job_id),
+                       service_request_id = COALESCE(?, service_request_id),
+                       output_slot_id = COALESCE(?, output_slot_id),
+                       artifact_id = COALESCE(?, artifact_id),
+                       detail = ?, updated_at = ?
+                   WHERE batch_id = ? AND slot_id = ?""",
+                (
+                    coordinator_state,
+                    service_job_id,
+                    service_request_id,
+                    output_slot_id,
+                    artifact_id,
+                    detail,
+                    now,
+                    batch_id,
+                    slot_id,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def set_generation_batch_state(
+        self,
+        batch_id: str,
+        owner: str,
+        epoch: int,
+        now: str,
+        coordinator_state: str,
+    ) -> bool:
+        """Set the coordinator summary under its current live claim."""
+        with self._connection(transaction=True) as connection:
+            cursor = connection.execute(
+                """UPDATE generation_batches SET coordinator_state = ?, updated_at = ?
+                   WHERE batch_id = ? AND claim_owner = ? AND claim_epoch = ?
+                   AND claim_expires_at > ?""",
+                (coordinator_state, now, batch_id, owner, epoch, now),
+            )
+        return cursor.rowcount == 1
+
+    def release_generation_batch_claim(
+        self, batch_id: str, owner: str, epoch: int, now: str
+    ) -> bool:
+        """Release only the lease still owned by this coordinator epoch."""
+        with self._connection(transaction=True) as connection:
+            cursor = connection.execute(
+                """UPDATE generation_batches
+                   SET claim_owner = NULL, claim_expires_at = NULL, updated_at = ?
+                   WHERE batch_id = ? AND claim_owner = ? AND claim_epoch = ?""",
+                (now, batch_id, owner, epoch),
+            )
+        return cursor.rowcount == 1
 
     def create_queued_execution(
         self,
