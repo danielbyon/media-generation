@@ -178,7 +178,7 @@ for the profile contract, redaction rules, and integration responsibilities.
 
 ## Current database schema
 
-This release supports SQLite schema version 6 only. Opening a new database
+This release supports SQLite schema version 7 only. Opening a new database
 creates every table, index, trigger, singleton resource row, and the schema
 version marker in one transaction. Opening an existing database validates its
 complete structure and required admission evidence through a read-only
@@ -352,6 +352,66 @@ publications, cleans only proven private staging, and reports unknown files or
 missing/corrupt media. It never deletes a published image. `artifact` remains a
 historical metadata view; use `integrity` for a current content check. Published
 content is verified before new reference use.
+
+## Run a durable generation batch
+
+`batch run` stores the complete request manifest and one stable slot identity
+per output before it asks T04 to admit any job. Slots run in order through the
+existing single-output service:
+
+```sh
+media-generation batch run --db ./studio.sqlite3 --output-dir ./artifacts \
+  --batch-key campaign-001 --max-attempts 2 \
+  --requests-json '[{"prompt":"A copper fox","seed":731,"width":64,"height":64,"output_slot":"hero"},{"prompt":"A blue heron","seed":732,"width":64,"height":64,"output_slot":"banner"}]'
+
+media-generation batch resume --db ./studio.sqlite3 --output-dir ./artifacts \
+  --batch-id <batch-id>
+
+media-generation batch report --db ./studio.sqlite3 --batch-id <batch-id>
+```
+
+The batch key binds the request order, attempt budget, adapter configuration,
+privacy evidence, output directory, and any admission profile and slot demands.
+Resume with the same values. For heavyweight adapters, pass
+`--inventory-report`, `--admission-policy`, and `--workload-demands` to both
+`run` and `resume`. The demand file is versioned JSON with schema
+`media-generation.batch-workload-demands`; its `demands` object maps each
+request's `output_slot` to one strict T04 workload-demand document. T04 still
+decides admission for every service job. Missing or changed evidence stops
+resumption before another attempt starts.
+
+The report keeps four results separate: batch coordinator state, T04 execution
+status, publication state, and current artifact integrity. It also checks the
+artifact's job, attempt, output-slot, and lineage identities. An execution that
+remains `succeeded` while publication, lineage, or file evidence is missing or
+inconsistent is reported as requiring attention. `batch report` is read-only:
+it does not recover jobs or persist integrity observations.
+
+For a queued job with prior attempts, resume checks the verified attempt
+history, termination evidence, admission state, retry flag, and remaining
+budget. It uses T04 `retry` when that operation still needs to authorize the
+retry. If T04 already changed a failed job to `queued` and restored its
+admission decision, resume dispatches that same job with `submit` after a
+restart at the handoff.
+
+A failed slot with verified retry authority and budget remaining keeps the
+batch coordinator in `running`; its report sets `retry_pending` even when
+later slots have completed.
+
+Reports include the authoritative T04 attempt history for each accepted job:
+attempt ID and number, status, safe failure class, and termination proof. The
+report omits raw failure messages and execution-owner details. T04 remains the
+source of the attempt history.
+
+`batch run` with a previously used key finds the existing batch. It can
+continue a slot with no T04 attempt. Call `batch resume` to authorize or
+dispatch a retry. Coordinator claims renew during synchronous T04 work. An
+expired claim lets another coordinator take over while the T04 attempt may
+still be running. A coordinator that loses its claim stops further dispatches.
+Resume observes the service job and lets `GenerationService.recover()` make any
+required attempt or publication decision. T04 retains ownership of active
+attempts until its reservation matches the job and current attempt and its
+termination evidence permits a transition.
 
 See [publication and recovery](docs/architecture/artifact-publication.md) for
 ordering, current-schema initialization, source authority, graph roles, and

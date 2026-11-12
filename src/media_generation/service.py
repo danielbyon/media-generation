@@ -348,6 +348,25 @@ class GenerationService:
         """Return the resolved SQLite database used by this service."""
         return self._store.database_path
 
+    @property
+    def admission_profile(self) -> AdmissionProfile | None:
+        """Return the validated capacity profile selected for new jobs."""
+        return self._admission_profile
+
+    @property
+    def execution_identity(self) -> dict[str, object]:
+        """Return the exact current adapter, privacy, and output-root identity."""
+        configuration, configuration_json, _, privacy_json = (
+            self._current_privacy_snapshot()
+        )
+        return {
+            "adapter_id": self.adapter.adapter_id,
+            "adapter_configuration": configuration,
+            "adapter_configuration_json": configuration_json,
+            "privacy_compliance": json.loads(privacy_json),
+            "output_directory": str(self.output_directory),
+        }
+
     def enqueue(
         self,
         idempotency_key: str,
@@ -1567,6 +1586,10 @@ class GenerationService:
     def get_integrity(self, artifact_id: str) -> dict[str, object]:
         """Verify current stored bytes while preserving immutable metadata."""
         return self._publication.integrity(artifact_id)
+
+    def inspect_integrity(self, artifact_id: str) -> dict[str, object]:
+        """Verify current artifact bytes without recording an observation."""
+        return self._publication.inspect_integrity(artifact_id)
 
     def get_lineage(self, artifact_id: str) -> dict[str, object]:
         """Inspect ordered parents and children of a logical artifact."""

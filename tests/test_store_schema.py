@@ -227,6 +227,40 @@ def test_current_schema_reopens_and_preserves_queued_data(tmp_path: Path) -> Non
     assert reopened.inspect_admission(queued.job_id).admission.decision == "not_required"
 
 
+def test_schema_v7_contains_batch_tables_and_writer_guards(tmp_path: Path) -> None:
+    database = tmp_path / "studio.sqlite3"
+    SQLiteStore(database)
+
+    objects = _objects(database)
+    assert _CURRENT_SCHEMA_VERSION == 7
+    assert {"generation_batches", "generation_batch_slots"} <= objects["table"]
+    batch_guards = {
+        SQLiteStore._writer_guard_sql(table, operation)[0]
+        for table, operation in _WRITER_GUARDS
+        if table in {"generation_batches", "generation_batch_slots"}
+    }
+    assert batch_guards
+    assert batch_guards <= objects["trigger"]
+
+
+def test_schema_v6_database_is_rejected_without_mutation(tmp_path: Path) -> None:
+    database = tmp_path / "schema-v6.sqlite3"
+    SQLiteStore(database)
+    with sqlite3.connect(database) as connection:
+        triggers = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND (name LIKE '%generation_batch%')"
+        ).fetchall()
+        for (name,) in triggers:
+            connection.execute(f'DROP TRIGGER "{name}"')
+        connection.execute("DROP INDEX generation_batch_slots_order_idx")
+        connection.execute("DROP TABLE generation_batch_slots")
+        connection.execute("DROP TABLE generation_batches")
+        connection.execute("PRAGMA user_version = 6")
+
+    _assert_rejected_without_mutation(database, "unsupported database schema version 6")
+
+
 @pytest.mark.parametrize("version", (_CURRENT_SCHEMA_VERSION - 1, _CURRENT_SCHEMA_VERSION + 1))
 def test_unsupported_schema_version_is_rejected_without_mutation(
     tmp_path: Path, version: int,
