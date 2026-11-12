@@ -1590,4 +1590,3 @@ class GenerationBatchService:
             "requires_attention": issue is not None,
             "issue": issue,
         }
-
