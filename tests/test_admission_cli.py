@@ -251,12 +251,15 @@ def test_adapter_failure_details_are_redacted_from_admission_and_cli(
     )
     services: list[GenerationService] = []
 
-    def service_factory(database, output_dir, *, admission_profile=None):
+    def service_factory(
+        database, output_dir, *, admission_profile=None, attempt_runner=None
+    ):
         service = GenerationService(
             database,
             output_dir,
             adapter=SecretFailure(),
             admission_profile=admission_profile,
+            attempt_runner=attempt_runner,
         )
         services.append(service)
         return service

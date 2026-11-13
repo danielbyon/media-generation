@@ -227,13 +227,14 @@ def test_current_schema_reopens_and_preserves_queued_data(tmp_path: Path) -> Non
     assert reopened.inspect_admission(queued.job_id).admission.decision == "not_required"
 
 
-def test_schema_v7_contains_batch_tables_and_writer_guards(tmp_path: Path) -> None:
+def test_schema_v8_contains_containment_and_cancellation_tables(tmp_path: Path) -> None:
     database = tmp_path / "studio.sqlite3"
     SQLiteStore(database)
 
     objects = _objects(database)
-    assert _CURRENT_SCHEMA_VERSION == 7
+    assert _CURRENT_SCHEMA_VERSION == 8
     assert {"generation_batches", "generation_batch_slots"} <= objects["table"]
+    assert {"execution_containment", "execution_cancellations"} <= objects["table"]
     batch_guards = {
         SQLiteStore._writer_guard_sql(table, operation)[0]
         for table, operation in _WRITER_GUARDS

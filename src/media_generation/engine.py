@@ -202,6 +202,7 @@ class ResolvedExecution:
     resolved_record: Mapping[str, object]
     width: int
     height: int
+    owns_scratch: bool = True
 
 
 def _invalid(detail: str) -> None:
@@ -1020,7 +1021,12 @@ class StableDiffusionCppAdapter:
 
         return _static_configuration(self._candidate)
 
-    def resolve_execution(self, plan: GenerationPlan) -> ResolvedExecution:
+    def resolve_execution(
+        self,
+        plan: GenerationPlan,
+        *,
+        scratch_directory: Path | None = None,
+    ) -> ResolvedExecution:
         """Re-evaluate the candidate and return one immutable pre-dispatch plan.
 
         Every pinned declaration, recipe, component, and trusted evidence file is
@@ -1069,7 +1075,28 @@ class StableDiffusionCppAdapter:
         runtime = capture_runtime_fingerprint()
         _validate_runtime(runtime)
 
-        scratch = _create_scratch(self._output_directory)
+        owns_scratch = scratch_directory is None
+        scratch = (
+            _create_scratch(self._output_directory)
+            if owns_scratch
+            else Path(scratch_directory).absolute()
+        )
+        scratch_parent = scratch.parent
+        scratch_available = (
+            scratch.is_dir()
+            if scratch.exists()
+            else scratch_parent.is_dir() and not scratch_parent.is_symlink()
+        )
+        if not owns_scratch and (
+            not scratch_available
+            or scratch.is_symlink()
+            or scratch.is_relative_to(self._output_directory)
+            or _git_worktree_root(scratch)
+        ):
+            raise BackendPreparationError(
+                "runtime_evidence_incomplete",
+                "broker scratch path is unavailable or outside its private root",
+            )
         try:
             output_path = scratch / OUTPUT_BASENAME
             argv, components = _build_invocation(
@@ -1138,6 +1165,7 @@ class StableDiffusionCppAdapter:
                 resolved_record=record,
                 width=plan.width,
                 height=plan.height,
+                owns_scratch=owns_scratch,
             )
             with self._resolved_lock:
                 if plan.attempt_id in self._resolved:
@@ -1148,7 +1176,8 @@ class StableDiffusionCppAdapter:
                 self._resolved[plan.attempt_id] = resolved
             return resolved
         except BaseException:
-            shutil.rmtree(scratch, ignore_errors=True)
+            if owns_scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
             raise
 
     def execute(
@@ -1204,7 +1233,11 @@ class StableDiffusionCppAdapter:
             self._remove_scratch(resolved.scratch_directory)
 
     def _stream_execution(
-        self, resolved: ResolvedExecution, staged: BinaryIO
+        self,
+        resolved: ResolvedExecution,
+        staged: BinaryIO,
+        *,
+        source: BinaryIO | None = None,
     ) -> ImageMetadata:
         """Validate the scratch image and stream it into the publisher's stream.
 
@@ -1215,13 +1248,10 @@ class StableDiffusionCppAdapter:
         """
         output_path = Path(resolved.output_path)
         try:
-            with open_regular(output_path) as source:
-                info = validate_image(source)
-                if (info.width, info.height) != (resolved.width, resolved.height):
-                    raise GenerationError(
-                        "declared engine wrote an image with unexpected dimensions"
-                    )
-                copy_source(source, staged)
+            if source is None:
+                with open_regular(output_path) as opened:
+                    return self._validate_and_copy(resolved, opened, staged)
+            return self._validate_and_copy(resolved, source, staged)
         except FileNotFoundError as error:
             raise GenerationError(
                 "declared engine did not write its declared output file"
@@ -1230,7 +1260,40 @@ class StableDiffusionCppAdapter:
             raise GenerationError(
                 "declared engine output failed image validation"
             ) from error
+
+    @staticmethod
+    def _validate_and_copy(
+        resolved: ResolvedExecution,
+        source: BinaryIO,
+        staged: BinaryIO,
+    ) -> ImageMetadata:
+        """Validate one pinned regular output and copy it to the existing stage."""
+        source.seek(0)
+        info = validate_image(source)
+        if (info.width, info.height) != (resolved.width, resolved.height):
+            raise GenerationError(
+                "declared engine wrote an image with unexpected dimensions"
+            )
+        source.seek(0)
+        copy_source(source, staged)
         return ImageMetadata(info.media_type, info.image_format, info.width, info.height)
+
+    def stream_systemd_execution(
+        self,
+        resolved: ResolvedExecution,
+        staged: BinaryIO,
+        source: BinaryIO,
+    ) -> ImageMetadata:
+        """Validate broker-pinned output after whole-cgroup termination proof."""
+        with self._resolved_lock:
+            pending = self._resolved.pop(resolved.attempt_id, None)
+        if pending is not resolved:
+            raise GenerationError("broker output does not match the resolved attempt")
+        try:
+            return self._stream_execution(resolved, staged, source=source)
+        finally:
+            if resolved.owns_scratch:
+                self._remove_scratch(resolved.scratch_directory)
 
     def cleanup_execution(self, resolved: ResolvedExecution) -> None:
         """Remove scratch after an aborted publication or an adapter-side failure.
@@ -1243,7 +1306,8 @@ class StableDiffusionCppAdapter:
             pending = self._resolved.get(resolved.attempt_id)
             if pending is resolved:
                 self._resolved.pop(resolved.attempt_id, None)
-        self._remove_scratch(resolved.scratch_directory)
+        if resolved.owns_scratch:
+            self._remove_scratch(resolved.scratch_directory)
 
     @staticmethod
     def _remove_scratch(directory: Path) -> None:

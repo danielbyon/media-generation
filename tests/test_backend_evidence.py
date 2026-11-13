@@ -52,13 +52,16 @@ def synthetic_rocm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _service(tmp_path: Path, bundle, *, adapter=None) -> GenerationService:
+def _service(
+    tmp_path: Path, bundle, *, adapter=None, attempt_runner=None
+) -> GenerationService:
     output = tmp_path / "images"
     return GenerationService(
         tmp_path / "studio.sqlite3",
         output,
         adapter=adapter or _adapter(bundle, output),
         admission_profile=heavy_admission_profile(),
+        attempt_runner=attempt_runner,
     )
 
 

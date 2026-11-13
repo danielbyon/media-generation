@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -47,6 +48,19 @@ from .errors import (
     UnknownReferenceError,
 )
 from .privacy import COMFYUI_ADAPTER_ID, is_privacy_compliance_record
+from .systemd_evidence import SystemdEvidenceLedger
+from .systemd_attempts import (
+    SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
+    AttemptUnitIdentity,
+    CgroupTerminationEvidence,
+    identity_digest,
+)
+
+
+def _require_systemd_broker_process() -> None:
+    """Keep host termination facts writable only by the privileged broker."""
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("systemd containment evidence is broker-owned")
 
 _RESOLVED_OUTPUT_DIRECTORY_KEY = "_resolved_output_directory"
 _MALFORMED_STORED_PRIVACY_EVIDENCE = "stored privacy-compliance evidence is malformed"
@@ -77,7 +91,7 @@ def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
     return configuration["workflow_approval"]
 _WRITER_EPOCH = 7
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_CURRENT_SCHEMA_VERSION = 7
+_CURRENT_SCHEMA_VERSION = 8
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -94,6 +108,10 @@ _WRITER_GUARDS = (
     ("execution_admissions", "UPDATE"),
     ("backend_executions", "INSERT"),
     ("backend_executions", "UPDATE"),
+    ("execution_containment", "INSERT"),
+    ("execution_containment", "UPDATE"),
+    ("execution_cancellations", "INSERT"),
+    ("execution_cancellations", "UPDATE"),
 ("generation_batches", "INSERT"),
 ("generation_batches", "UPDATE"),
 ("generation_batch_slots", "INSERT"),
@@ -160,6 +178,78 @@ _BACKEND_EXECUTIONS_DDL = """CREATE TABLE backend_executions (
         OR (state = 'observed' AND launch_json IS NOT NULL AND launch_at IS NOT NULL
             AND observed_json IS NOT NULL AND observed_at IS NOT NULL))
 )"""
+
+_EXECUTION_CONTAINMENT_DDL = """CREATE TABLE execution_containment (
+    attempt_id TEXT PRIMARY KEY REFERENCES execution_attempts(attempt_id),
+    job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
+    identity_json TEXT NOT NULL,
+    identity_digest TEXT NOT NULL CHECK (length(identity_digest) = 64),
+    termination_json TEXT,
+    termination_at TEXT,
+    created_at TEXT NOT NULL,
+    CHECK ((termination_json IS NULL AND termination_at IS NULL)
+        OR (termination_json IS NOT NULL AND termination_at IS NOT NULL))
+)"""
+
+_EXECUTION_CANCELLATIONS_DDL = """CREATE TABLE execution_cancellations (
+    cancellation_id INTEGER PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
+    attempt_id TEXT REFERENCES execution_attempts(attempt_id),
+    claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+    state TEXT NOT NULL CHECK (state IN ('requested','acknowledged','too_late')),
+    requested_at TEXT,
+    acknowledged_at TEXT,
+    too_late_at TEXT,
+    CHECK ((state = 'requested' AND requested_at IS NOT NULL
+                AND acknowledged_at IS NULL AND too_late_at IS NULL)
+        OR (state = 'acknowledged' AND acknowledged_at IS NOT NULL
+                AND too_late_at IS NULL)
+        OR (state = 'too_late' AND too_late_at IS NOT NULL
+                AND acknowledged_at IS NULL)),
+    UNIQUE (job_id, claim_epoch)
+)"""
+
+_EXECUTION_CONTAINMENT_STAGE_TRANSITION_DDL = """CREATE TRIGGER execution_containment_stage_transition
+BEFORE UPDATE ON execution_containment
+BEGIN
+    SELECT RAISE(ABORT, 'containment identity is immutable')
+    WHERE NEW.attempt_id IS NOT OLD.attempt_id
+       OR NEW.job_id IS NOT OLD.job_id
+       OR NEW.identity_json IS NOT OLD.identity_json
+       OR NEW.identity_digest IS NOT OLD.identity_digest
+       OR NEW.created_at IS NOT OLD.created_at;
+    SELECT RAISE(ABORT, 'containment termination evidence is immutable')
+    WHERE OLD.termination_json IS NOT NULL
+       OR NEW.termination_json IS NULL
+       OR NEW.termination_at IS NULL;
+END"""
+
+_EXECUTION_CONTAINMENT_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER execution_containment_immutable_delete
+BEFORE DELETE ON execution_containment
+BEGIN
+    SELECT RAISE(ABORT, 'containment evidence is immutable');
+END"""
+
+_EXECUTION_CANCELLATIONS_TRANSITION_DDL = """CREATE TRIGGER execution_cancellations_transition
+BEFORE UPDATE ON execution_cancellations
+BEGIN
+    SELECT RAISE(ABORT, 'cancellation identity is immutable')
+    WHERE NEW.cancellation_id IS NOT OLD.cancellation_id
+       OR NEW.job_id IS NOT OLD.job_id
+       OR NEW.attempt_id IS NOT OLD.attempt_id
+       OR NEW.claim_epoch IS NOT OLD.claim_epoch
+       OR NEW.requested_at IS NOT OLD.requested_at;
+    SELECT RAISE(ABORT, 'cancellation transition is invalid')
+    WHERE NOT (OLD.state = 'requested' AND NEW.state = 'acknowledged'
+        AND OLD.acknowledged_at IS NULL AND NEW.acknowledged_at IS NOT NULL
+        AND NEW.too_late_at IS NULL);
+END"""
+
+_EXECUTION_CANCELLATIONS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER execution_cancellations_immutable_delete
+BEFORE DELETE ON execution_cancellations
+BEGIN
+    SELECT RAISE(ABORT, 'cancellation evidence is immutable');
+END"""
 
 _BACKEND_EXECUTIONS_STAGE_INSERT_DDL = """CREATE TRIGGER backend_executions_stage_insert
 BEFORE INSERT ON backend_executions
@@ -507,6 +597,8 @@ _EXECUTION_TABLE_DDL: dict[str, str] = {
     "artifact_publication_authority": _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
     "execution_admissions": _EXECUTION_ADMISSIONS_DDL,
     "backend_executions": _BACKEND_EXECUTIONS_DDL,
+    "execution_containment": _EXECUTION_CONTAINMENT_DDL,
+    "execution_cancellations": _EXECUTION_CANCELLATIONS_DDL,
 }
 
 
@@ -554,6 +646,18 @@ _STATIC_TRIGGER_DDL: dict[str, str] = {
     "backend_executions_stage_insert": _BACKEND_EXECUTIONS_STAGE_INSERT_DDL,
     "backend_executions_stage_transition": _BACKEND_EXECUTIONS_STAGE_TRANSITION_DDL,
     "backend_executions_immutable_delete": _BACKEND_EXECUTIONS_IMMUTABLE_DELETE_DDL,
+    "execution_containment_stage_transition": (
+        _EXECUTION_CONTAINMENT_STAGE_TRANSITION_DDL
+    ),
+    "execution_containment_immutable_delete": (
+        _EXECUTION_CONTAINMENT_IMMUTABLE_DELETE_DDL
+    ),
+    "execution_cancellations_transition": (
+        _EXECUTION_CANCELLATIONS_TRANSITION_DDL
+    ),
+    "execution_cancellations_immutable_delete": (
+        _EXECUTION_CANCELLATIONS_IMMUTABLE_DELETE_DDL
+    ),
     "generation_batches_identity_immutable": (
         _GENERATION_BATCHES_IDENTITY_IMMUTABLE_DDL
     ),
@@ -631,6 +735,9 @@ class SQLiteStore:
     def __init__(self, database_path: Path, *, read_only: bool = False) -> None:
         """Open the current schema, with an optional mode that never initializes the file."""
         self.database_path = database_path.expanduser().resolve()
+        self._systemd_evidence_ledger = SystemdEvidenceLedger(
+            SystemdEvidenceLedger.path_for(self.database_path)
+        )
         self.read_only = read_only
         if self.read_only:
             self._validate_existing_database()
@@ -640,6 +747,10 @@ class SQLiteStore:
                 self._validate_existing_database()
             else:
                 self._initialize()
+
+    def initialize_systemd_evidence_ledger(self, *, worker_gid: int) -> None:
+        """Create the root-owned ledger with read access for the worker group."""
+        self._systemd_evidence_ledger.initialize(worker_gid=worker_gid)
 
     @contextmanager
     def _connection(
@@ -1820,12 +1931,266 @@ END"""
                 lease_expires_at=lease_expires_at,
             )
 
+    def bind_attempt_containment(
+        self, identity: AttemptUnitIdentity, *, timestamp: str
+    ) -> None:
+        """Pin one systemd invocation before the runner receives execute authority.
+
+        The identity is written only while the attempt's claim and exact
+        resolved invocation are current. A later cancellation fence does not
+        erase it; that immutable identity is the only target accepted by the
+        termination-only writer.
+        """
+        _require_systemd_broker_process()
+        if not isinstance(identity, AttemptUnitIdentity):
+            raise TypeError("identity must be an AttemptUnitIdentity")
+        identity_json = backend_canonical_json(identity.to_mapping())
+        identity_hash = identity_digest(identity)
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                """SELECT attempts.owner_id, attempts.claim_epoch,
+                          attempts.containment_contract, attempts.process_contained,
+                          jobs.status AS job_status, jobs.fence_epoch,
+                          jobs.current_attempt_id, backend.resolved_digest,
+                          backend.state AS backend_state
+                   FROM execution_attempts AS attempts
+                   JOIN execution_jobs AS jobs ON jobs.job_id = attempts.job_id
+                   JOIN backend_executions AS backend
+                     ON backend.attempt_id = attempts.attempt_id
+                   WHERE attempts.job_id = ? AND attempts.attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["job_status"] != "running"
+                or row["current_attempt_id"] != identity.attempt_id
+                or row["owner_id"] != identity.owner_id
+                or row["claim_epoch"] != identity.claim_epoch
+                or row["fence_epoch"] != identity.claim_epoch
+                or row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                or row["process_contained"] != 1
+                or row["resolved_digest"] != identity.resolved_digest
+                or row["backend_state"] != "resolved"
+            ):
+                raise BackendEvidenceError(
+                    "systemd containment identity does not match the active resolved attempt"
+                )
+            prior = connection.execute(
+                "SELECT identity_json, identity_digest FROM execution_containment "
+                "WHERE job_id = ? AND attempt_id = ?",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    prior["identity_json"] != identity_json
+                    or prior["identity_digest"] != identity_hash
+                ):
+                    raise BackendEvidenceError(
+                        "attempt is already bound to another systemd invocation"
+                    )
+                self._systemd_evidence_ledger.bind_identity(identity)
+                return
+            self._systemd_evidence_ledger.bind_identity(identity)
+            connection.execute(
+                """INSERT INTO execution_containment
+                   (attempt_id,job_id,identity_json,identity_digest,
+                    termination_json,termination_at,created_at)
+                   VALUES (?,?,?, ?,NULL,NULL,?)""",
+                (
+                    identity.attempt_id,
+                    identity.job_id,
+                    identity_json,
+                    identity_hash,
+                    timestamp,
+                ),
+            )
+
+    def attempt_containment_identity(
+        self, job_id: str, attempt_id: str
+    ) -> AttemptUnitIdentity | None:
+        """Return the validated immutable service identity, if it was bound."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT identity_json, identity_digest, resolved_digest
+                   FROM execution_containment
+                   JOIN backend_executions USING (attempt_id)
+                   WHERE execution_containment.job_id = ?
+                     AND execution_containment.attempt_id = ?""",
+                (job_id, attempt_id),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            identity = AttemptUnitIdentity.from_mapping(
+                json.loads(str(row["identity_json"]))
+            )
+            if (
+                identity_digest(identity) != row["identity_digest"]
+                or identity.resolved_digest != row["resolved_digest"]
+                or identity.job_id != job_id
+                or identity.attempt_id != attempt_id
+            ):
+                raise ValueError("stored identity digest or attempt binding changed")
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BackendEvidenceError(
+                "stored systemd attempt identity is malformed"
+            ) from error
+        ledger_identity = self._systemd_evidence_ledger.read_identity(
+            job_id, attempt_id
+        )
+        if ledger_identity is None:
+            return None
+        if ledger_identity != identity:
+            raise BackendEvidenceError(
+                "stored systemd identity differs from the root evidence ledger"
+            )
+        return identity
+
+    def attempt_recovery_cleanup_authorized(
+        self, identity: AttemptUnitIdentity
+    ) -> bool:
+        """Require a durable publication fence before recovery removes scratch."""
+        if not isinstance(identity, AttemptUnitIdentity):
+            raise TypeError("identity must be an AttemptUnitIdentity")
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT jobs.status AS job_status, jobs.current_attempt_id,
+                          jobs.fence_epoch, attempts.claim_epoch,
+                          attempts.status AS attempt_status,
+                          resource.state AS resource_state,
+                          resource.job_id AS resource_job_id,
+                          resource.attempt_id AS resource_attempt_id
+                   FROM execution_jobs AS jobs
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = jobs.current_attempt_id
+                   JOIN execution_resource AS resource ON resource.id = 1
+                   JOIN execution_containment AS containment
+                     ON containment.attempt_id = attempts.attempt_id
+                   WHERE jobs.job_id = ? AND attempts.attempt_id = ?
+                     AND containment.identity_digest = ?""",
+                (
+                    identity.job_id,
+                    identity.attempt_id,
+                    identity_digest(identity),
+                ),
+            ).fetchone()
+            if row is None or row["current_attempt_id"] != identity.attempt_id:
+                return False
+            if row["resource_job_id"] != identity.job_id or row["resource_attempt_id"] != identity.attempt_id:
+                return False
+            if row["resource_state"] not in {"claimed", "quarantined"}:
+                return False
+            if connection.execute(
+                """SELECT 1 FROM artifact_publications WHERE job_id = ?
+                   AND state IN ('ready','committed')""",
+                (identity.job_id,),
+            ).fetchone() is not None:
+                return False
+            fenced_worker = (
+                row["job_status"] in {"running", "canceled"}
+                and row["attempt_status"] == "running"
+                and row["fence_epoch"] == row["claim_epoch"] + 1
+            )
+            terminal_attempt = (
+                row["attempt_status"] in {"failed", "canceled"}
+                and row["resource_state"] == "quarantined"
+            )
+            return bool(fenced_worker or terminal_attempt)
+
+    def record_attempt_termination_evidence(
+        self,
+        identity: AttemptUnitIdentity,
+        evidence: CgroupTerminationEvidence,
+        *,
+        timestamp: str,
+    ) -> None:
+        """Persist exact cgroup-empty proof without restoring fenced authority.
+
+        This writer validates only the immutable attempt and unit identity. It
+        cannot record engine launch/exit, extend a lease, or create
+        publication authority. Identical retries are idempotent.
+        """
+        _require_systemd_broker_process()
+        if not isinstance(identity, AttemptUnitIdentity):
+            raise TypeError("identity must be an AttemptUnitIdentity")
+        if not isinstance(evidence, CgroupTerminationEvidence):
+            raise TypeError("evidence must be CgroupTerminationEvidence")
+        if evidence.identity != identity:
+            raise BackendEvidenceError(
+                "cgroup termination evidence names a different unit invocation"
+            )
+        identity_json = backend_canonical_json(identity.to_mapping())
+        proof_json = backend_canonical_json(evidence.to_mapping())
+        identity_hash = identity_digest(identity)
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                """SELECT containment.identity_json, containment.identity_digest,
+                          containment.termination_json, attempts.containment_contract,
+                          jobs.current_attempt_id, backend.resolved_digest
+                   FROM execution_containment AS containment
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = containment.attempt_id
+                   JOIN execution_jobs AS jobs ON jobs.job_id = containment.job_id
+                   JOIN backend_executions AS backend
+                     ON backend.attempt_id = containment.attempt_id
+                   WHERE containment.job_id = ? AND containment.attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["current_attempt_id"] != identity.attempt_id
+                or row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                or row["identity_json"] != identity_json
+                or row["identity_digest"] != identity_hash
+                or row["resolved_digest"] != identity.resolved_digest
+            ):
+                raise BackendEvidenceError(
+                    "termination evidence does not match the current attempt containment identity"
+                )
+            if (
+                row["termination_json"] is not None
+                and row["termination_json"] != proof_json
+            ):
+                raise BackendEvidenceError(
+                    "attempt already has different cgroup termination evidence"
+                )
+            self._systemd_evidence_ledger.record_termination(
+                identity, evidence, timestamp=timestamp
+            )
+            if row["termination_json"] is not None:
+                return
+            connection.execute(
+                """UPDATE execution_containment
+                   SET termination_json = ?, termination_at = ?
+                   WHERE job_id = ? AND attempt_id = ?
+                     AND termination_json IS NULL""",
+                (proof_json, timestamp, identity.job_id, identity.attempt_id),
+            )
+            cancellation = connection.execute(
+                """SELECT state, attempt_id FROM execution_cancellations
+                   WHERE job_id = ? AND claim_epoch = ?""",
+                (identity.job_id, identity.claim_epoch),
+            ).fetchone()
+            if (
+                cancellation is not None
+                and cancellation["state"] == "requested"
+                and cancellation["attempt_id"] == identity.attempt_id
+            ):
+                connection.execute(
+                    """UPDATE execution_cancellations
+                       SET state = 'acknowledged', acknowledged_at = ?
+                       WHERE job_id = ? AND claim_epoch = ? AND state = 'requested'""",
+                    (timestamp, identity.job_id, identity.claim_epoch),
+                )
+
     def cancel_execution(self, job_id: str, timestamp: str) -> str:
-        """Durably fence a queued or running execution and report its outcome."""
+        """Fence publication and durably record the cancellation lifecycle."""
         with self._connection(transaction=True) as connection:
             row = connection.execute(
                 """SELECT execution.status AS execution_status,
                           execution.current_attempt_id,
+                          execution.fence_epoch,
+                          attempts.claim_epoch AS attempt_claim_epoch,
                           resource.state AS resource_state,
                           attempts.status AS attempt_status
                    FROM execution_jobs AS execution
@@ -1837,15 +2202,43 @@ END"""
             ).fetchone()
             if row is None:
                 raise RecordNotFoundError(f"job not found: {job_id}")
-            if row["execution_status"] in {"succeeded"}:
-                return "too_late"
             if row["execution_status"] == "canceled":
-                if (
-                    row["resource_state"] == "claimed"
-                    and row["attempt_status"] == "running"
-                ):
-                    return "accepted"
-                return "acknowledged"
+                prior_cancellation = connection.execute(
+                    """SELECT state FROM execution_cancellations
+                       WHERE job_id = ? AND attempt_id IS ?
+                       ORDER BY claim_epoch DESC LIMIT 1""",
+                    (job_id, row["current_attempt_id"]),
+                ).fetchone()
+                if prior_cancellation is not None:
+                    return str(prior_cancellation["state"])
+            cancellation_epoch = (
+                int(row["fence_epoch"]) + 1
+                if row["execution_status"] == "queued"
+                or (
+                    row["execution_status"] == "canceled"
+                    and not (
+                        row["resource_state"] == "claimed"
+                        and row["attempt_status"] == "running"
+                    )
+                )
+                or row["attempt_claim_epoch"] is None
+                else int(row["attempt_claim_epoch"])
+            )
+            prior = connection.execute(
+                """SELECT state FROM execution_cancellations
+                   WHERE job_id = ? AND claim_epoch = ?""",
+                (job_id, cancellation_epoch),
+            ).fetchone()
+            if prior is not None:
+                return str(prior["state"])
+            if row["execution_status"] in {"succeeded"}:
+                connection.execute(
+                    """INSERT INTO execution_cancellations
+                       (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                       VALUES (?,?,?,'too_late',NULL,NULL,?)""",
+                    (job_id, row["current_attempt_id"], cancellation_epoch, timestamp),
+                )
+                return "too_late"
             if row["execution_status"] == "queued":
                 connection.execute(
                     """UPDATE execution_jobs
@@ -1859,6 +2252,12 @@ END"""
                     (timestamp, job_id),
                 )
                 AdmissionPersistence.cancel_before_dispatch(connection, job_id, timestamp)
+                connection.execute(
+                    """INSERT INTO execution_cancellations
+                       (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                       VALUES (?,NULL,?,'acknowledged',?,?,NULL)""",
+                    (job_id, cancellation_epoch, timestamp, timestamp),
+                )
                 return "acknowledged"
             if row["execution_status"] == "running":
                 connection.execute(
@@ -1873,8 +2272,63 @@ END"""
                     "UPDATE generation_jobs SET status = 'failed', updated_at = ? WHERE job_id = ?",
                     (timestamp, job_id),
                 )
-                return "accepted"
+                connection.execute(
+                    """INSERT INTO execution_cancellations
+                       (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                       VALUES (?,?,?,'requested',?,NULL,NULL)""",
+                    (job_id, row["current_attempt_id"], cancellation_epoch, timestamp),
+                )
+                return "requested"
+            connection.execute(
+                """INSERT INTO execution_cancellations
+                   (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                   VALUES (?,?,?,'too_late',NULL,NULL,?)""",
+                (job_id, row["current_attempt_id"], cancellation_epoch, timestamp),
+            )
             return "too_late"
+
+    def acknowledge_execution_cancellation(
+        self, job_id: str, attempt_id: str, *, timestamp: str
+    ) -> bool:
+        """Acknowledge a fenced cancellation only after validated termination."""
+        with self._connection(transaction=True) as connection:
+            attempt = connection.execute(
+                "SELECT claim_epoch FROM execution_attempts WHERE job_id = ? AND attempt_id = ?",
+                (job_id, attempt_id),
+            ).fetchone()
+            if attempt is None:
+                return False
+            row = connection.execute(
+                """SELECT cancellations.state, cancellations.attempt_id,
+                          cancellations.claim_epoch,
+                          jobs.status AS job_status, jobs.current_attempt_id,
+                          attempts.claim_epoch AS attempt_claim_epoch
+                   FROM execution_cancellations AS cancellations
+                   JOIN execution_jobs AS jobs ON jobs.job_id = cancellations.job_id
+                   LEFT JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = cancellations.attempt_id
+                   WHERE cancellations.job_id = ? AND cancellations.attempt_id = ?
+                     AND cancellations.claim_epoch = ?""",
+                (job_id, attempt_id, attempt["claim_epoch"]),
+            ).fetchone()
+            if (
+                row is None
+                or row["state"] == "acknowledged"
+                or row["state"] != "requested"
+                or row["attempt_id"] != attempt_id
+                or row["claim_epoch"] != row["attempt_claim_epoch"]
+                or row["current_attempt_id"] != attempt_id
+                or row["job_status"] != "canceled"
+                or not self._attempt_termination_proven(connection, job_id, attempt_id)
+            ):
+                return bool(row is not None and row["state"] == "acknowledged")
+            updated = connection.execute(
+                """UPDATE execution_cancellations
+                   SET state = 'acknowledged', acknowledged_at = ?
+                   WHERE job_id = ? AND claim_epoch = ? AND state = 'requested'""",
+                (timestamp, job_id, row["claim_epoch"]),
+            )
+            return updated.rowcount == 1
 
     def retry_execution(self, job_id: str, timestamp: str) -> bool:
         """Acknowledge an eligible bounded retry, requeueing it only if needed."""
@@ -1967,6 +2421,42 @@ END"""
         """Read whether a claim is still the job's current publication authority."""
         with self._connection() as connection:
             return self._attempt_authorized(connection, job_id, attempt_id, owner_id, claim_epoch)
+
+    def fence_attempt_for_recovery(
+        self, job_id: str, attempt_id: str, *, timestamp: str
+    ) -> dict[str, object] | None:
+        """Revoke a lost worker's publication authority without guessing termination."""
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                """SELECT jobs.status, jobs.current_attempt_id, jobs.fence_epoch,
+                          attempts.owner_id, attempts.claim_epoch, attempts.status AS attempt_status,
+                          resource.state AS resource_state, resource.attempt_id AS resource_attempt
+                   FROM execution_jobs AS jobs
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = jobs.current_attempt_id
+                   JOIN execution_resource AS resource ON resource.id = 1
+                   WHERE jobs.job_id = ? AND attempts.attempt_id = ?""",
+                (job_id, attempt_id),
+            ).fetchone()
+            if row is None or row["resource_attempt"] != attempt_id:
+                return None
+            if row["status"] == "running" and row["attempt_status"] == "running":
+                if row["fence_epoch"] == row["claim_epoch"]:
+                    connection.execute(
+                        """UPDATE execution_jobs
+                           SET fence_epoch = fence_epoch + 1, retry_eligible = 0,
+                               failure_message = 'worker loss fenced publication',
+                               updated_at = ?
+                           WHERE job_id = ? AND status = 'running'
+                             AND current_attempt_id = ? AND fence_epoch = ?""",
+                        (
+                            timestamp,
+                            job_id,
+                            attempt_id,
+                            row["claim_epoch"],
+                        ),
+                    )
+            return dict(row)
 
     @staticmethod
     def _attempt_authorized(
@@ -2151,8 +2641,70 @@ END"""
             raise BackendEvidenceError("observed backend execution evidence is missing")
         return observation_proves_reaped_child(observed)
 
+    def _attempt_cgroup_termination_evidence(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Validate the persisted whole-cgroup proof independently of engine exit."""
+        row = connection.execute(
+            """SELECT containment.identity_json, containment.identity_digest,
+                      containment.termination_json, attempts.containment_contract,
+                      jobs.current_attempt_id, backend.resolved_digest
+               FROM execution_containment AS containment
+               JOIN execution_attempts AS attempts
+                 ON attempts.attempt_id = containment.attempt_id
+               JOIN execution_jobs AS jobs ON jobs.job_id = containment.job_id
+               JOIN backend_executions AS backend
+                 ON backend.attempt_id = containment.attempt_id
+               WHERE containment.job_id = ? AND containment.attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+        if row is None:
+            return False
+        if (
+            row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+            or row["current_attempt_id"] != attempt_id
+        ):
+            return False
+        try:
+            identity_mapping = json.loads(str(row["identity_json"]))
+            identity = AttemptUnitIdentity.from_mapping(identity_mapping)
+            if (
+                identity.job_id != job_id
+                or identity.attempt_id != attempt_id
+                or identity.resolved_digest != row["resolved_digest"]
+                or identity_digest(identity) != row["identity_digest"]
+            ):
+                raise ValueError("stored containment identity does not match its attempt")
+            proof_json = row["termination_json"]
+            ledger_identity = self._systemd_evidence_ledger.read_identity(
+                job_id, attempt_id
+            )
+            if ledger_identity is None:
+                return False
+            if ledger_identity != identity:
+                raise ValueError("root evidence ledger names another invocation")
+            ledger_proof = self._systemd_evidence_ledger.read_termination(identity)
+            if ledger_proof is None:
+                return False
+            if proof_json is not None:
+                database_proof = CgroupTerminationEvidence.from_mapping(
+                    json.loads(str(proof_json))
+                )
+                if database_proof != ledger_proof:
+                    raise ValueError(
+                        "job database cgroup proof differs from root ledger"
+                    )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BackendEvidenceError(
+                "stored systemd containment evidence is malformed"
+            ) from error
+        return True
+
     def termination_evidence_proven(self, job_id: str, attempt_id: str) -> bool:
-        """Read whether this attempt has durable, validated reaped-child proof."""
+        """Read whether the exact engine child has a durable exit observation."""
         with self._connection() as connection:
             return self._attempt_termination_evidence(connection, job_id, attempt_id)
 
@@ -2169,29 +2721,101 @@ END"""
                 connection, job_id, attempt_id
             )
 
-    @classmethod
+    def release_quarantined_attempt(
+        self, job_id: str, attempt_id: str, *, timestamp: str
+    ) -> bool:
+        """Release a fenced terminal attempt after late verified cgroup proof."""
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                """SELECT resource.state AS resource_state,
+                          resource.job_id AS resource_job_id,
+                          resource.attempt_id AS resource_attempt_id,
+                          jobs.current_attempt_id, attempts.status AS attempt_status,
+                          attempts.claim_epoch,
+                          attempts.containment_contract
+                   FROM execution_resource AS resource
+                   JOIN execution_jobs AS jobs ON jobs.job_id = resource.job_id
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = resource.attempt_id
+                   WHERE resource.id = 1 AND resource.job_id = ?
+                     AND resource.attempt_id = ?""",
+                (job_id, attempt_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["resource_state"] != "quarantined"
+                or row["resource_job_id"] != job_id
+                or row["resource_attempt_id"] != attempt_id
+                or row["current_attempt_id"] != attempt_id
+                or row["attempt_status"] not in {"failed", "canceled"}
+                or row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                or not self._attempt_termination_proven(connection, job_id, attempt_id)
+            ):
+                return False
+            if connection.execute(
+                """SELECT 1 FROM artifact_publications WHERE job_id = ?
+                   AND state IN ('ready','committed')""",
+                (job_id,),
+            ).fetchone() is not None:
+                return False
+            admission = AdmissionPersistence.snapshot(connection, job_id)
+            if admission is None:
+                return False
+            connection.execute(
+                """UPDATE execution_attempts SET termination_proven = 1
+                   WHERE attempt_id = ? AND job_id = ?""",
+                (attempt_id, job_id),
+            )
+            connection.execute(
+                """UPDATE execution_resource
+                   SET state = 'available', job_id = NULL, attempt_id = NULL,
+                       owner_id = NULL, reason = NULL, updated_at = ?
+                   WHERE id = 1 AND state = 'quarantined'
+                     AND job_id = ? AND attempt_id = ?""",
+                (timestamp, job_id, attempt_id),
+            )
+            if not AdmissionPersistence.finish(
+                connection,
+                job_id,
+                decision="released",
+                reason="verified_cgroup_termination_and_reconciled_publication",
+                timestamp=timestamp,
+            ):
+                raise RuntimeError("admission release transition was rejected")
+            connection.execute(
+                """UPDATE execution_cancellations
+                   SET state = 'acknowledged', acknowledged_at = ?
+                   WHERE job_id = ? AND attempt_id = ? AND claim_epoch = ?
+                     AND state = 'requested'""",
+                (timestamp, job_id, attempt_id, row["claim_epoch"]),
+            )
+            return True
+
     def _attempt_termination_proven(
-        cls,
+        self,
         connection: sqlite3.Connection,
         job_id: str,
         attempt_id: str,
     ) -> bool:
-        direct_child_termination_proven = cls._attempt_termination_evidence(
+        direct_child_termination_proven = self._attempt_termination_evidence(
             connection, job_id, attempt_id
         )
-        if cls._attempt_requires_process_tree_resource_release(
+        if self._attempt_requires_process_tree_resource_release(
             connection, job_id, attempt_id
         ):
             return direct_child_termination_proven
         row = connection.execute(
             """SELECT containment_contract, process_contained
-               FROM execution_attempts
-               WHERE job_id = ? AND attempt_id = ?""",
+               FROM execution_attempts WHERE job_id = ? AND attempt_id = ?""",
             (job_id, attempt_id),
         ).fetchone()
         if row is None:
             return direct_child_termination_proven
         contract = row["containment_contract"]
+        if contract == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT:
+            return self._attempt_cgroup_termination_evidence(
+                connection, job_id, attempt_id
+            )
         return direct_child_termination_proven or (
             isinstance(contract, str)
             and bool(contract)
@@ -2995,6 +3619,7 @@ END"""
         failure_class: str = "terminal",
         termination_proven: bool = False,
         prelaunch_refusal: bool = False,
+        _recovery_fenced: bool = False,
         _revoked_publication_id: str | None = None,
     ) -> bool:
         """Finalize one current attempt and apply the durable outcome.
@@ -3055,7 +3680,39 @@ END"""
                          AND resource.owner_id = attempts.owner_id AND resource.state = 'claimed'""",
                     (_revoked_publication_id, job_id, attempt_id, attempt_owner_id, claim_epoch),
                 ).fetchone() is not None
-                if not canceled_claim and not revoked_claim:
+                recovery_fenced_claim = (
+                    _recovery_fenced
+                    and failure_class != "canceled"
+                    and connection.execute(
+                        """SELECT 1 FROM execution_jobs AS jobs
+                           JOIN execution_attempts AS attempts
+                             ON attempts.attempt_id = jobs.current_attempt_id
+                           JOIN execution_resource AS resource ON resource.id = 1
+                           WHERE jobs.job_id = ? AND jobs.status = 'running'
+                             AND jobs.current_attempt_id = ?
+                             AND jobs.fence_epoch = ? + 1
+                             AND attempts.attempt_id = ? AND attempts.status = 'running'
+                             AND attempts.owner_id = ? AND attempts.claim_epoch = ?
+                             AND resource.state = 'claimed' AND resource.job_id = jobs.job_id
+                             AND resource.attempt_id = attempts.attempt_id
+                             AND resource.owner_id = attempts.owner_id
+                             AND NOT EXISTS (
+                               SELECT 1 FROM artifact_publications
+                               WHERE job_id = jobs.job_id
+                                 AND state IN ('ready','committed')
+                             )""",
+                        (
+                            job_id,
+                            attempt_id,
+                            claim_epoch,
+                            attempt_id,
+                            attempt_owner_id,
+                            claim_epoch,
+                        ),
+                    ).fetchone()
+                    is not None
+                )
+                if not canceled_claim and not revoked_claim and not recovery_fenced_claim:
                     return False
             if connection.execute(
                 "SELECT 1 FROM artifact_publications WHERE job_id = ? "
@@ -3229,6 +3886,14 @@ END"""
             )
             if not admission_finished:
                 raise RuntimeError("admission failure transition was rejected")
+            if failure_class == "canceled" and effective_termination_proven:
+                connection.execute(
+                    """UPDATE execution_cancellations
+                       SET state = 'acknowledged', acknowledged_at = ?
+                       WHERE job_id = ? AND attempt_id = ? AND claim_epoch = ?
+                         AND state = 'requested'""",
+                    (timestamp, job_id, attempt_id, claim_epoch),
+                )
             return True
 
     def get_request(self, request_id: str) -> GenerationRequestRecord:

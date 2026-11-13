@@ -314,9 +314,10 @@ incompatible development database and select a new database path; delete a
 disposable database only after explicit operator acceptance.
 
 Cancellation of a never-claimed job is terminal and creates no attempt. An
-active attempt is fenced immediately, but cancel returns `accepted` while the
-adapter may still be running. Releasing the heavyweight resource requires
-evidence that execution stopped. A cancel after the artifact transaction commits
+active attempt is fenced immediately, and cancel returns `requested` while the
+engine may still be running. The broker returns `acknowledged` only after it
+records verified whole-cgroup termination. Releasing the heavyweight resource
+requires that proof and safe publication reconciliation. A cancel after the artifact transaction commits
 returns `too_late`; the successful artifact remains authoritative. Run `recover`
 after an interrupted worker stops. It reconciles interrupted publication state
 and reports `attention_required` when a process outcome or retained file cannot

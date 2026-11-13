@@ -629,6 +629,128 @@ numbering, publisher ownership, fence epochs, retry eligibility, or
 no-clobber artifact publication.
 
 
+## Systemd-contained GPU attempts
+
+For a systemd-enabled Stable Diffusion C++ attempt, the worker resolves the
+invocation once and persists its canonical record before dispatch. The broker
+checks the request against that exact record, then starts a fixed attempt
+runner in a transient system service. The runner receives the durable argv,
+environment, and broker-created scratch path. It does not resolve a new
+invocation or choose systemd properties.
+
+The runner owns `ProcessSupervisor` and the engine child. It records the
+existing `LaunchFact` after spawn and the existing `ProcessObservation` after
+the engine child is reaped. The broker writes those facts through the normal
+claim-owner and epoch checks while the attempt remains current. The supervisor
+continues to verify the exact argv and environment and stores only bounded,
+privacy-safe stream summaries. Direct-child execution paths keep their existing
+evidence contract; this design does not infer process-tree containment from
+their observations.
+
+The result keeps six facts separate:
+
+| Fact | Evidence | What it establishes |
+| --- | --- | --- |
+| Launcher exit | `systemd-run` process return code | The systemd client returned. With `--wait`, systemd-run can propagate the service result; that result is the runner's status, not the engine's. See the [systemd-run manual](https://freedesktop.org/software/systemd/man/latest/systemd-run.html). |
+| Runner exit | The matching unit's `MainPID`, `ExecMainCode`, `ExecMainStatus`, and `Result` | The transient service's runner process exited and systemd classified its exit code or signal. |
+| Engine exit | `ProcessObservation` exit code, signal, and reaped-child fields | The exact supervised engine child exited. It does not establish that every cgroup process exited. |
+| Unit identity | Invocation ID, control-group path, boot ID, and cgroup device/inode | The service and cgroup belong to this attempt. Identity alone does not establish termination. |
+| Cgroup termination | `cgroup.events` reports `populated 0` through the descriptor pinned to the validated unit and cgroup | No process remains in that attempt cgroup. |
+| Stream completion | The runner control stream ended with a complete success record | The broker received the runner result without a lost or malformed control message. |
+
+The broker captures the unit invocation ID, control-group path, boot ID, and
+cgroup device/inode before accepting engine evidence. `RemainAfterExit=yes`
+keeps the completed service available until the broker explicitly stops it.
+The broker opens `cgroup.events` after validating those identities and keeps
+that descriptor through `StopUnit` and the empty check. After receiving a
+runner completion record, it waits until the matching unit reports `MainPID=0`
+and a terminal `ExecMainCode` before it stops the unit and samples
+`cgroup.events`. On cancellation or worker loss, it stops the unit first and
+then verifies that same runner exit before recording cgroup emptiness. The
+broker saves the unit result and exit status before `StopUnit`, because systemd
+may garbage-collect the completed unit afterward. If systemd removes the unit
+or cgroup path before the descriptor is pinned, termination is unproven.
+If the pinned event reports an empty cgroup, the broker durably records the
+proof even when systemd has since removed the unit name or cgroup path. Once
+the proof is durable, later unit garbage collection does not invalidate it. A
+worker or host restart loses an unpersisted descriptor; recovery then needs new
+independently verified evidence or keeps capacity quarantined.
+
+`systemd-run --pipe` connects the transient service's standard streams to the
+broker's launcher pipes. The worker communicates with the broker over its
+authenticated local socket; worker loss alone leaves the launch pipes open
+because the broker owns them. The broker's disconnect watcher fences the
+attempt and stops its exact unit. If the broker or runner loses a pipe endpoint,
+writes may fail with `EPIPE` or `SIGPIPE`; an incomplete control stream cannot
+stand in for engine evidence. The broker treats that result as incomplete and
+uses cgroup proof for cleanup. A worker that dies before it receives a result
+cannot publish the scratch image.
+
+Success requires all of the following: a valid engine observation with exit
+code zero and no signal; successful launcher and unit results; a complete
+runner stream; validated image bytes; verified cgroup-empty evidence; and
+current publication authority. The worker passes the broker's read-only output
+descriptor to the adapter's existing `stream_systemd_execution` method. That
+method validates the image and copies it into the publisher's original staging
+descriptor. The existing publication transaction remains the only path that
+creates the artifact and commits the job.
+
+Cancellation and worker-loss recovery use termination evidence independently
+of engine success evidence. The worker fences publication, the broker stops
+the exact authenticated unit, and recovery waits for the whole cgroup to empty.
+Recovery reconciles or revokes incomplete publication rows before applying the
+existing resource and admission checks. A missing engine observation prevents
+success; it does not by itself prove that a GPU process survived. Verified
+cgroup termination and safe publication state can release capacity for a
+canceled or failed attempt. Uncertain unit identity, missing cgroup proof, or
+unreconciled publication keeps the resource quarantined.
+
+The system service runs under the configured non-root runner UID and primary
+GID. The broker allowlists the required GPU device nodes, model and input read
+roots, scratch directory, and runner executable, then supplies fixed
+`User=`, `Group=`, device, filesystem, and kill-policy properties. State-changing
+system-manager calls pass through its D-Bus/polkit authorization for
+`org.freedesktop.systemd1.manage-units`. The [systemd manager documentation](https://freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html)
+describes this boundary. The root-owned broker is the only component that
+invokes the system manager; the worker has no general systemd management
+privilege. A unit-name prefix only limits the namespace. The broker also checks
+peer credentials, the exact request fields, claim and epoch, durable resolved
+invocation, unit identity, and the live service properties.
+
+The runner receives only the configured supplementary groups needed for the
+ROCm device nodes and private scratch group. systemd also initializes the
+service's supplementary groups from the account database; `SupplementaryGroups=`
+adds groups to that set. The broker checks the runner's actual NSS group list
+against its allowlist and rejects any membership outside it, including the
+worker's publication group. See the [systemd.exec manual](https://freedesktop.org/software/systemd/man/latest/systemd.exec.html).
+`DeviceAllow` names each GPU device; the configured read roots cover ROCm
+runtime files, model files, and inputs. `ProtectSystem=strict` and the
+attempt-specific `ReadWritePaths` keep model and runtime paths read-only while
+the runner writes scratch output. The runner has no database access. The root
+broker opens the configured SQLite database to persist launch and
+engine-observation facts. It also maintains a root-owned evidence ledger next
+to that database at `<database filename>.systemd-evidence.sqlite3`. The broker
+stores each immutable unit identity and cgroup-empty proof in this ledger, then
+mirrors the facts into the job database. The job database may be writable by
+the worker, so its copy alone is never accepted as proof of containment or
+termination. The ledger is owned by root, readable by the configured worker
+group, and not writable by that group. The worker opens it read-only and
+requires its identity and termination records to match before resource
+release. Missing or conflicting ledger data fails closed.
+
+Broker configuration, runner executable, socket, scratch root, and database
+paths must sit beneath root-owned, nonreplaceable directory chains. The broker
+rejects symlinked or worker-owned ancestors and writable ancestors without a
+root-owned sticky bit. The sidecar ledger needs the same protected parent
+directory as the database, with root ownership and read access for the worker
+group. APEX must provide those paths and the required worker, runner,
+ROCm-group, GPU-device, model, scratch, database, and ledger access before
+qualification. Implementation does not apply host permission changes.
+Approving the broker software does not authorize installing it or changing
+systemd or host permissions on APEX. The owner must authorize the installation,
+service configuration, identities, directories, and device access. Until then,
+the APEX backend remains unqualified.
+
 ## Pre-dispatch refusals
 
 An adapter prepares and resolves the execution before it marks the attempt as

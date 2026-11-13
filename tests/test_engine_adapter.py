@@ -1776,3 +1776,157 @@ def test_registered_backend_identity_requires_the_exact_configuration_version(
             adapter=_identity_adapter(adapter, configuration_version="sd-cpp-local/v2"),
             admission_profile=heavy_admission_profile(),
         )
+
+
+def test_systemd_arguments_cover_execution_and_lifecycle_commands() -> None:
+    parser = cli.build_parser()
+    broker_arguments = [
+        "--systemd-broker-socket",
+        "/run/media-generation/broker.sock",
+        "--systemd-scratch-root",
+        "/var/lib/media-generation/scratch",
+        "--systemd-runner-uid",
+        "2301",
+        "--systemd-runner-gid",
+        "2301",
+    ]
+    commands = [
+        [
+            "submit", "--db", "db.sqlite3", "--output-dir", "images",
+            "--idempotency-key", "key", "--request-json", '{"prompt":"x"}',
+        ],
+        ["worker", "--db", "db.sqlite3", "--output-dir", "images"],
+        ["recover", "--db", "db.sqlite3", "--output-dir", "images"],
+        ["cancel", "--db", "db.sqlite3", "--job-id", "job_x"],
+        [
+            "batch", "run", "--db", "db.sqlite3", "--output-dir", "images",
+            "--batch-key", "key", "--requests-json", "[]",
+        ],
+        [
+            "batch", "resume", "--db", "db.sqlite3", "--output-dir", "images",
+            "--batch-id", "batch_x",
+        ],
+    ]
+
+    for command in commands:
+        options = parser.parse_args([*command, *broker_arguments])
+        assert options.systemd_broker_socket == Path(
+            "/run/media-generation/broker.sock"
+        )
+        assert options.systemd_scratch_root == Path(
+            "/var/lib/media-generation/scratch"
+        )
+        assert (options.systemd_runner_uid, options.systemd_runner_gid) == (2301, 2301)
+
+
+def test_systemd_cli_builds_runner_for_all_service_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    created: list[dict[str, object]] = []
+    adapter = object.__new__(engine.StableDiffusionCppAdapter)
+
+    class FakeService:
+        def __init__(self, *_args, **kwargs) -> None:
+            created.append(kwargs)
+
+        def submit(self, *_args, **_kwargs):
+            class Result:
+                attention_required = False
+
+                @staticmethod
+                def to_dict():
+                    return {"job_id": "job_x"}
+
+            return Result()
+
+        @staticmethod
+        def work(*_args, **_kwargs):
+            return {"status": "complete", "outcomes": []}
+
+        @staticmethod
+        def recover(*_args, **_kwargs):
+            return {"status": "complete"}
+
+        @staticmethod
+        def cancel(job_id: str):
+            return {"job_id": job_id, "outcome": "requested"}
+
+    class FakeBatchService:
+        def __init__(self, _service) -> None:
+            pass
+
+        @staticmethod
+        def submit(*_args, **_kwargs):
+            return {"report_state": "complete"}
+
+        @staticmethod
+        def resume(*_args, **_kwargs):
+            return {"report_state": "complete"}
+
+    monkeypatch.setattr(cli, "GenerationService", FakeService)
+    monkeypatch.setattr(cli, "GenerationBatchService", FakeBatchService)
+    monkeypatch.setattr(cli, "_engine_adapter", lambda _options, _output: adapter)
+    monkeypatch.setattr(cli, "_admission_inputs", lambda _options: (None, None))
+    monkeypatch.setattr(cli, "_batch_admission_inputs", lambda _options: (None, None))
+    broker_arguments = [
+        "--systemd-broker-socket", str(tmp_path / "broker.sock"),
+        "--systemd-scratch-root", str(tmp_path / "scratch"),
+        "--systemd-runner-uid", "2301",
+        "--systemd-runner-gid", "2301",
+    ]
+    commands = [
+        [
+            "submit", "--db", str(tmp_path / "submit.sqlite3"), "--output-dir",
+            str(tmp_path / "images"), "--idempotency-key", "key",
+            "--request-json", '{"prompt":"x"}',
+        ],
+        ["worker", "--db", str(tmp_path / "worker.sqlite3"), "--output-dir", str(tmp_path / "images")],
+        ["recover", "--db", str(tmp_path / "recover.sqlite3"), "--output-dir", str(tmp_path / "images")],
+        ["cancel", "--db", str(tmp_path / "cancel.sqlite3"), "--job-id", "job_x"],
+        [
+            "batch", "run", "--db", str(tmp_path / "batch-run.sqlite3"),
+            "--output-dir", str(tmp_path / "images"), "--batch-key", "key",
+            "--requests-json", '[{"prompt":"x"}]',
+        ],
+        [
+            "batch", "resume", "--db", str(tmp_path / "batch-resume.sqlite3"),
+            "--output-dir", str(tmp_path / "images"), "--batch-id", "batch_x",
+        ],
+    ]
+
+    for command in commands:
+        assert cli.main([*command, *broker_arguments]) == 0
+        capsys.readouterr()
+
+    assert len(created) == 6
+    assert all(item.get("attempt_runner") is not None for item in created)
+    assert all(
+        item["attempt_runner"].socket_path == tmp_path / "broker.sock"
+        for item in created
+    )
+
+
+def test_systemd_cli_rejects_partial_configuration_and_missing_engine_adapter() -> None:
+    parser = cli.build_parser()
+    options = parser.parse_args(
+        [
+            "recover", "--db", "db.sqlite3", "--output-dir", "images",
+            "--systemd-broker-socket", "/run/broker.sock",
+        ]
+    )
+    with pytest.raises(InputValidationError, match="all four systemd options"):
+        cli._systemd_attempt_runner(options, adapter=None, for_execution=False)
+
+    execution_options = parser.parse_args(
+        [
+            "worker", "--db", "db.sqlite3", "--output-dir", "images",
+            "--systemd-broker-socket", "/run/broker.sock",
+            "--systemd-scratch-root", "/var/scratch",
+            "--systemd-runner-uid", "2301",
+            "--systemd-runner-gid", "2301",
+        ]
+    )
+    with pytest.raises(InputValidationError, match="StableDiffusionCppAdapter"):
+        cli._systemd_attempt_runner(
+            execution_options, adapter=None, for_execution=True
+        )

@@ -158,7 +158,7 @@ The public retry operation may acknowledge an eligible bounded retry while it is
 
 Cancellation of a queued job makes it terminal before any attempt exists. For a
 claimed attempt, cancellation fences the current owner and epoch immediately and
-returns `accepted` while that execution may still be stopping. The heavyweight
+returns `requested` while that execution may still be stopping. The heavyweight
 resource is released only after recovery proves termination and publication
 state is safe. An active attempt may accept cancellation through every precommit
 publication checkpoint because the database artifact/lineage transaction remains
@@ -298,7 +298,7 @@ non-mutation when older, newer, malformed-current, or nonempty unversioned
 databases are rejected. Runtime images exercise the import boundary and full
 decoding. The
 field-by-field publication fault matrix covers allocation through reply loss.
-Focused cancellation tests exercise all 14 precommit checkpoints as accepted and
+Focused cancellation tests exercise all 14 precommit checkpoints as requested and
 all six postcommit checkpoints as `too_late`. Recovery tests cover canceled ready
 journals before and after physical link, repeated convergence, committed-wins
 refusal, retained-final orphan reporting, owner and epoch fences, stale
@@ -375,3 +375,24 @@ Workers coordinate through one SQLite database and one local filesystem. This
 implementation has no distributed scheduling, HTTP service, model download,
 network inference, or model installation. The bundled deterministic adapter is
 CPU-only test infrastructure, not a production model result.
+
+## 8. Systemd runner output and publication
+
+For systemd-contained Stable Diffusion C++ attempts, the worker keeps the
+publisher's existing staging descriptor and publication authority. The runner
+cannot write artifact or publication rows and cannot finalize the job. After
+the broker validates the exact attempt identity and proves the cgroup empty, it
+passes the worker a read-only descriptor for the runner's scratch output. The
+adapter validates that descriptor and streams its bytes into the existing
+staging descriptor; the existing publisher then performs image validation,
+lineage updates, filesystem synchronization, and atomic no-clobber
+publication.
+
+The broker retains the scratch directory until the worker acknowledges
+validation or recovery has fenced publication and reconciled its journal. A
+worker crash before result retrieval cannot use stale scratch output. Recovery
+removes scratch only after it validates the immutable unit identity, durable
+cgroup proof, and publication fence. If output cannot be opened or validated,
+the attempt cannot succeed and no artifact is published. The engine observation
+is required for success, while verified cgroup termination can still release a
+canceled or failed attempt whose observation was lost.
