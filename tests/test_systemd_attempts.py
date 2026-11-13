@@ -18,6 +18,7 @@ from media_generation import engine
 from media_generation import service as service_module
 from media_generation import store as store_module
 from media_generation import systemd_broker as broker_module
+from media_generation.attempt_runner import _validate_manifest
 from media_generation.backend_provenance import backend_digest
 from media_generation.errors import BackendEvidenceError, RetryableGenerationError
 from media_generation.comfyui import ComfyUIAdapter
@@ -308,6 +309,7 @@ def _broker_configuration(tmp_path) -> BrokerConfiguration:
         scratch_gid=2302,
         device_allow=(Path("/dev/kfd"),),
         read_roots=(tmp_path,),
+        environment_path_allowlist=(tmp_path,),
     )
 
 
@@ -556,6 +558,39 @@ def test_broker_rejects_runner_database_groups_outside_allowlist(
         configuration.validate_host_paths()
 
 
+def test_broker_rejects_worker_supplementary_groups(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configuration = _broker_configuration(tmp_path)
+    runner = SimpleNamespace(pw_name="engine-runner", pw_gid=configuration.runner_gid)
+    worker = SimpleNamespace(pw_name="generation-worker", pw_gid=configuration.worker_gid)
+    monkeypatch.setattr(
+        broker_module.pwd,
+        "getpwuid",
+        lambda uid: runner if uid == configuration.runner_uid else worker,
+    )
+    monkeypatch.setattr(
+        broker_module.grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid)
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_require_runner_group_allowlist",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        broker_module.os,
+        "getgrouplist",
+        lambda name, gid: (
+            [configuration.runner_gid, *configuration.runner_supplementary_gids]
+            if name == runner.pw_name
+            else [gid, 9999]
+        ),
+    )
+
+    with pytest.raises(ValueError, match="worker account has supplementary groups"):
+        configuration.validate_host_paths()
+
+
 @pytest.mark.parametrize("component_flag", ["--llm", "--llm_vision"])
 def test_engine_component_paths_must_be_inside_broker_read_roots(
     tmp_path: Path,
@@ -577,6 +612,9 @@ def test_engine_component_paths_must_be_inside_broker_read_roots(
         runner_groups=frozenset({os.getgid()}),
     )
     monkeypatch.setattr(
+        broker_module, "_require_root_owned_ancestors", lambda _path: None
+    )
+    monkeypatch.setattr(
         broker_module, "_mode_allows", lambda *_args, **_kwargs: True
     )
 
@@ -584,6 +622,29 @@ def test_engine_component_paths_must_be_inside_broker_read_roots(
         broker._validate_engine_paths(
             [str(executable), component_flag, str(model)]
         )
+
+
+def test_broker_rejects_worker_owned_engine_files_inside_read_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    executable = allowed_root / "engine"
+    executable.write_bytes(b"engine")
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        read_roots=(allowed_root,),
+        runner_uid=os.getuid(),
+        runner_groups=frozenset({os.getgid()}),
+    )
+    monkeypatch.setattr(broker_module, "_require_root_owned_ancestors", lambda _path: None)
+    monkeypatch.setattr(
+        broker_module, "_mode_allows", lambda *_args, **_kwargs: True
+    )
+
+    with pytest.raises(PermissionError, match="root-owned and not worker-writable"):
+        broker._validate_engine_paths([str(executable)])
 
 
 def test_systemd_command_uses_only_fixed_runner_and_broker_properties(
@@ -805,6 +866,204 @@ def test_wait_for_runner_exit_requires_matching_unit_and_exited_main_pid(
     result = broker._wait_for_runner_exit(identity, timeout=1.0)
 
     assert result == exited
+
+
+@pytest.mark.parametrize(
+    "changed_name",
+    ["LD_LIBRARY_PATH", "PATH", "ROCM_PATH"],
+)
+def test_broker_rejects_changed_resolved_environment_before_unit_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    changed_name: str,
+) -> None:
+    identity = _identity()
+    expected_environment = {
+        "LD_LIBRARY_PATH": "/srv/runtime/lib",
+        "PATH": "/usr/bin",
+        "ROCM_PATH": "/srv/runtime/rocm",
+    }
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": broker_module.environment_record(expected_environment),
+    }
+    resolved_digest = backend_digest(resolved)
+
+    class _Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": resolved_digest,
+            }
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        runner_uid=identity.runner_uid,
+        runner_gid=identity.runner_gid,
+        scratch_root=tmp_path / "scratch",
+    )
+    broker.store = _Store()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: {})
+
+    changed_environment = dict(expected_environment)
+    changed_environment[changed_name] += ".substituted"
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": changed_environment,
+        "scratch_directory": str(broker.configuration.scratch_root / identity.attempt_id),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    with pytest.raises(BackendEvidenceError, match="environment differs from durable resolution"):
+        broker._execute(object(), request)
+
+
+@pytest.mark.parametrize(
+    "invalid_kind",
+    ["empty-entry", "relative", "symlink-escape", "outside-allowlist"],
+)
+def test_broker_rejects_unsafe_library_search_path_entries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_kind: str,
+) -> None:
+    identity = _identity()
+    monkeypatch.setattr(broker_module, "_require_root_directory", lambda _path: None)
+    allowed = tmp_path / "runtime"
+    library = allowed / "lib"
+    binary = allowed / "bin"
+    rocm = allowed / "rocm"
+    library.mkdir(parents=True)
+    binary.mkdir()
+    (rocm / ".info").mkdir(parents=True)
+    (rocm / ".info" / "version").write_text("10.1.0\n", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    symlink = allowed / "escape"
+    symlink.symlink_to(outside, target_is_directory=True)
+    invalid_entries = {
+        "empty-entry": f"{library}:",
+        "relative": f"{library}:relative/lib",
+        "symlink-escape": str(symlink),
+        "outside-allowlist": str(outside),
+    }
+    environment = {
+        "LD_LIBRARY_PATH": invalid_entries[invalid_kind],
+        "PATH": str(binary),
+        "ROCM_PATH": str(rocm),
+    }
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": broker_module.environment_record(environment),
+    }
+    resolved_digest = backend_digest(resolved)
+
+    class _Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": resolved_digest,
+            }
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        runner_uid=identity.runner_uid,
+        runner_gid=identity.runner_gid,
+        scratch_root=tmp_path / "scratch",
+        environment_path_allowlist=(library, binary, rocm),
+    )
+    broker.store = _Store()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: {})
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": environment,
+        "scratch_directory": str(broker.configuration.scratch_root / identity.attempt_id),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    with pytest.raises(PermissionError, match="environment search path"):
+        broker._execute(object(), request)
+
+
+def test_broker_accepts_configured_environment_search_paths() -> None:
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        environment_path_allowlist=(Path("/usr/bin"),),
+    )
+
+    broker._validate_engine_environment(
+        {"LD_LIBRARY_PATH": "/usr/bin", "PATH": "/usr/bin"}
+    )
+
+
+def test_broker_rechecks_environment_directory_permissions_before_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_directory = tmp_path / "runtime"
+    runtime_directory.mkdir()
+    original_lstat = Path.lstat
+    observed = SimpleNamespace(st_mode=stat.S_IFDIR | 0o777, st_uid=0)
+
+    monkeypatch.setattr(
+        broker_module,
+        "_require_root_owned_ancestors",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        Path,
+        "lstat",
+        lambda path: observed if path == runtime_directory else original_lstat(path),
+    )
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        environment_path_allowlist=(runtime_directory,),
+    )
+
+    with pytest.raises(PermissionError, match="broker directory"):
+        broker._validate_environment_path(str(runtime_directory))
+
+
+def test_runner_rejects_changed_environment_binding(tmp_path: Path) -> None:
+    identity = _identity()
+    expected_environment = {"LD_LIBRARY_PATH": "/srv/runtime/lib"}
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine", "-o", str(tmp_path / "output.png")],
+        "environment": broker_module.environment_record(expected_environment),
+        "output_basename": "output.png",
+    }
+
+    with pytest.raises(BackendEvidenceError, match="runner environment differs"):
+        _validate_manifest(
+            identity,
+            list(resolved["argv"]),
+            {"LD_LIBRARY_PATH": "/srv/runtime/other"},
+            tmp_path,
+            resolved,
+        )
 
 
 def test_prepare_returns_scratch_path_without_creating_directory(tmp_path) -> None:

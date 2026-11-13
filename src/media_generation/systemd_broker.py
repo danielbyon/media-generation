@@ -55,6 +55,7 @@ _CONFIG_KEYS = frozenset(
         "scratch_gid",
         "device_allow",
         "read_roots",
+        "environment_path_allowlist",
         "empty_timeout_seconds",
     }
 )
@@ -81,7 +82,7 @@ _MAX_OUTPUT_BYTES = 512 * 1024 * 1024
 
 @dataclass(frozen=True)
 class BrokerConfiguration:
-    """Root-owned allowlist for runner identity, GPU devices, and readable data."""
+    """Root-owned policy for the runner, GPU, readable data, and search paths."""
 
     database_path: Path
     socket_path: Path
@@ -95,6 +96,7 @@ class BrokerConfiguration:
     scratch_gid: int
     device_allow: tuple[Path, ...]
     read_roots: tuple[Path, ...]
+    environment_path_allowlist: tuple[Path, ...]
     empty_timeout_seconds: float = 30.0
 
     @classmethod
@@ -129,6 +131,9 @@ class BrokerConfiguration:
         supplementary = _int_tuple(value["runner_supplementary_gids"], "runner_supplementary_gids")
         devices = _path_tuple(value["device_allow"], "device_allow")
         roots = _path_tuple(value["read_roots"], "read_roots")
+        environment_paths = _path_tuple(
+            value["environment_path_allowlist"], "environment_path_allowlist"
+        )
         timeout = value["empty_timeout_seconds"]
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ValueError("empty_timeout_seconds must be positive")
@@ -145,6 +150,7 @@ class BrokerConfiguration:
             scratch_gid=value["scratch_gid"],
             device_allow=devices,
             read_roots=roots,
+            environment_path_allowlist=environment_paths,
             empty_timeout_seconds=float(timeout),
         )
         config.validate_host_paths()
@@ -168,6 +174,14 @@ class BrokerConfiguration:
             primary_gid=self.runner_gid,
             allowed_gids=self.runner_groups,
         )
+        try:
+            worker_groups = frozenset(
+                os.getgrouplist(worker.pw_name, worker.pw_gid)
+            )
+        except (AttributeError, OSError) as error:
+            raise ValueError("worker supplementary groups cannot be verified") from error
+        if worker_groups != frozenset((self.worker_gid,)):
+            raise ValueError("worker account has supplementary groups outside its primary group")
         if self.scratch_gid not in self.runner_groups:
             raise ValueError("runner is not configured for the private scratch group")
         if (
@@ -196,8 +210,9 @@ class BrokerConfiguration:
         if not self.read_roots:
             raise ValueError("at least one exact engine/model read root is required")
         for root in self.read_roots:
-            if not root.is_absolute() or not root.is_dir() or root.is_symlink():
-                raise ValueError("configured model and input roots must be real directories")
+            _require_root_directory(root)
+        for path in self.environment_path_allowlist:
+            _require_root_directory(path)
         if not self.device_allow:
             raise ValueError("GPU execution requires an explicit device allowlist")
         for device in self.device_allow:
@@ -357,6 +372,7 @@ class SystemdAttemptBroker:
             or environment_record(environment) != durable.get("environment")
         ):
             raise BackendEvidenceError("environment differs from durable resolution")
+        self._validate_engine_environment(environment)
         scratch = self.configuration.scratch_root / attempt
         if request.get("scratch_directory") != str(scratch):
             raise PermissionError("scratch directory is not the broker-created attempt directory")
@@ -1019,7 +1035,7 @@ class SystemdAttemptBroker:
             return active
 
     def _validate_engine_paths(self, argv: list[str]) -> None:
-        paths: list[tuple[Path, bool]] = [(Path(argv[0]), True)]
+        paths: list[tuple[Path, bool, bool]] = [(Path(argv[0]), True, True)]
         for index, item in enumerate(argv[:-1]):
             if item in {
                 "--diffusion-model",
@@ -1028,8 +1044,15 @@ class SystemdAttemptBroker:
                 "--llm_vision",
                 "-r",
             }:
-                paths.append((Path(argv[index + 1]), False))
-        for path, executable in paths:
+                paths.append(
+                    (
+                        Path(argv[index + 1]),
+                        False,
+                        item != "-r",
+                    )
+                )
+        validated_paths: list[tuple[Path, bool, bool]] = []
+        for path, executable, root_owned in paths:
             if not path.is_absolute():
                 raise PermissionError("engine invocation contains a non-absolute input path")
             resolved = path.resolve(strict=True)
@@ -1039,6 +1062,11 @@ class SystemdAttemptBroker:
             )
             if not allowed:
                 raise PermissionError("engine input path is outside broker read roots")
+            validated_paths.append((resolved, executable, root_owned))
+
+        for resolved, executable, root_owned in validated_paths:
+            if root_owned:
+                _require_root_owned_ancestors(resolved)
             parents: list[Path] = []
             cursor = resolved.parent
             while True:
@@ -1059,6 +1087,10 @@ class SystemdAttemptBroker:
             info = resolved.stat()
             if not stat.S_ISREG(info.st_mode):
                 raise PermissionError("engine input path is not a regular file")
+            if root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+                raise PermissionError(
+                    "engine input must be root-owned and not worker-writable"
+                )
             if not _mode_allows(
                 info,
                 self.configuration.runner_uid,
@@ -1067,6 +1099,76 @@ class SystemdAttemptBroker:
                 execute=executable,
             ):
                 raise PermissionError("configured runner cannot read an engine input")
+
+    def _validate_engine_environment(self, environment: Mapping[str, str]) -> None:
+        """Allow only fixed, protected directories in executable search paths."""
+        for name in ("LD_LIBRARY_PATH", "PATH"):
+            value = environment.get(name)
+            if value is None:
+                continue
+            entries = value.split(os.pathsep)
+            if not value or any(not entry for entry in entries):
+                raise PermissionError("engine environment search path has an empty entry")
+            for entry in entries:
+                self._validate_environment_path(entry)
+
+        rocm_path = environment.get("ROCM_PATH")
+        if rocm_path is not None:
+            self._validate_environment_path(rocm_path)
+            self._validate_rocm_release_marker(Path(rocm_path))
+
+    def _validate_environment_path(self, value: str) -> None:
+        """Recheck one configured search directory immediately before launch."""
+        path = Path(value)
+        if not path.is_absolute() or str(path) != value:
+            raise PermissionError("engine environment search path is not absolute and normalized")
+        try:
+            info = path.lstat()
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise PermissionError("engine environment search path is unavailable") from error
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or resolved != path
+            or path not in self.configuration.environment_path_allowlist
+        ):
+            raise PermissionError("engine environment search path is not authorized")
+        _require_root_directory(path)
+
+    def _validate_rocm_release_marker(self, rocm_path: Path) -> None:
+        marker = rocm_path / ".info" / "version"
+        try:
+            _require_root_owned_ancestors(marker)
+            info = marker.lstat()
+        except OSError as error:
+            raise PermissionError("configured ROCm release marker is unavailable") from error
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+            or not info.st_mode & 0o444
+            or info.st_size <= 0
+            or info.st_size > 256
+        ):
+            raise PermissionError("configured ROCm release marker is unsafe or unreadable")
+        worker = pwd.getpwuid(self.configuration.worker_uid)
+        try:
+            worker_groups = frozenset(os.getgrouplist(worker.pw_name, worker.pw_gid))
+        except (AttributeError, OSError) as error:
+            raise PermissionError("worker group access to the ROCm marker is unavailable") from error
+        if not _mode_allows(
+            info, self.configuration.worker_uid, worker_groups, read=True
+        ) or not _mode_allows(
+            info, self.configuration.runner_uid, self.configuration.runner_groups, read=True
+        ):
+            raise PermissionError("configured worker or runner cannot read the ROCm marker")
+        try:
+            if not marker.read_text(encoding="utf-8").strip():
+                raise PermissionError("configured ROCm release marker is empty")
+        except (OSError, UnicodeError) as error:
+            raise PermissionError("configured ROCm release marker is unreadable") from error
 
     def _open_output(
         self,

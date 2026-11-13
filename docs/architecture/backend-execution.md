@@ -638,6 +638,16 @@ runner in a transient system service. The runner receives the durable argv,
 environment, and broker-created scratch path. It does not resolve a new
 invocation or choose systemd properties.
 
+The resolved environment record stores variable names and the selected GPU
+override values. A domain-separated SHA-256 also binds every effective
+environment value, including `PATH`, `LD_LIBRARY_PATH`, and `ROCM_PATH`, without
+copying those path values into public provenance. The broker and runner
+recompute the digest before launch. The broker's root-owned
+`environment_path_allowlist` names the exact directories that may appear in
+search-path variables. Empty entries, relative paths, symlinked directories,
+and paths outside that list are rejected. A configured `ROCM_PATH` must also
+contain a readable `.info/version` file.
+
 The runner owns `ProcessSupervisor` and the engine child. It records the
 existing `LaunchFact` after spawn and the existing `ProcessObservation` after
 the engine child is reaped. The broker writes those facts through the normal
@@ -737,6 +747,10 @@ termination. The ledger is owned by root, readable by the configured worker
 group, and not writable by that group. The worker opens it read-only and
 requires its identity and termination records to match before resource
 release. Missing or conflicting ledger data fails closed.
+
+The broker also checks that the worker account uses only its primary group.
+That group grants access to the worker database, broker socket, artifact output,
+and read-only evidence ledger. It grants no GPU-device or runner-scratch access.
 
 Broker configuration, runner executable, socket, scratch root, and database
 paths must sit beneath root-owned, nonreplaceable directory chains. The broker

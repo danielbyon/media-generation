@@ -271,6 +271,47 @@ def test_successful_execution_persists_complete_observed_evidence(tmp_path: Path
     }
     assert resolved["runtime"]["rocm_version"] == RUNTIME["rocm_version"]
     assert resolved["output_basename"] == "output.png"
+    legacy_record = dict(resolved)
+    legacy_record["environment"] = dict(resolved["environment"])
+    legacy_record["environment"].pop("sha256")
+    backend_provenance.validate_resolved_record(legacy_record)
+
+
+@pytest.mark.parametrize(
+    "changed_name",
+    [
+        "LD_LIBRARY_PATH",
+        "PATH",
+        "ROCM_PATH",
+        "HIP_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+    ],
+)
+def test_environment_record_binds_every_effective_value_without_storing_paths(
+    changed_name: str,
+) -> None:
+    environment = {
+        "LD_LIBRARY_PATH": "/srv/runtime/lib",
+        "PATH": "/usr/bin",
+        "ROCM_PATH": "/srv/runtime/rocm",
+        "HIP_VISIBLE_DEVICES": "0",
+        "HSA_OVERRIDE_GFX_VERSION": "11.0.0",
+    }
+    changed = dict(environment)
+    changed[changed_name] += ".changed"
+
+    record = backend_provenance.environment_record(environment)
+    changed_record = backend_provenance.environment_record(changed)
+
+    assert record != changed_record
+    assert set(record["values"]) == {
+        "HIP_VISIBLE_DEVICES",
+        "HSA_OVERRIDE_GFX_VERSION",
+    }
+    serialized = json.dumps(record)
+    assert "/srv/runtime/lib" not in serialized
+    assert "/usr/bin" not in serialized
+    assert "/srv/runtime/rocm" not in serialized
 
 
 def test_failed_reaped_execution_is_terminal_and_releases_resource(
