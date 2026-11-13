@@ -691,6 +691,30 @@ def test_scratch_is_private_outside_output_and_removed_after_cleanup(tmp_path: P
     assert not scratch.exists()
 
 
+def test_engine_child_uses_root_working_directory_for_loader_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = build_bundle(tmp_path)
+    adapter = _adapter(bundle, tmp_path / "images")
+    plan = _plan()
+    prepared = adapter.resolve_execution(plan)
+    supervisor = _supervisor(prepared)
+    original_run = supervisor.run
+    observed_cwds: list[Path | None] = []
+
+    def record_child_cwd(
+        argv: tuple[str, ...], *, env: dict[str, str], cwd: Path
+    ) -> ProcessObservation:
+        observed_cwds.append(cwd)
+        return original_run(argv, env=env, cwd=cwd)
+
+    monkeypatch.setattr(supervisor, "run", record_child_cwd)
+    with open(tmp_path / "staged.bin", "w+b") as handle:
+        adapter.execute(plan, handle, supervisor=supervisor)
+
+    assert observed_cwds == [Path("/")]
+
+
 def test_execute_copies_validated_bytes_and_rejects_bad_images(
     tmp_path: Path,
 ) -> None:

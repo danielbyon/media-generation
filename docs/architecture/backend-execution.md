@@ -805,6 +805,11 @@ the publisher's already-open staging descriptor. The existing publisher then
 performs its normal full-image validation, filesystem synchronization, lineage
 insertion, and no-clobber publication.
 
+The C++ engine subprocess starts in `/`. glibc resolves an empty RUNPATH
+component against the current directory ([GNU libc source](https://sourceware.org/pipermail/libc-stable/2017-January/000518.html)),
+so writable attempt scratch is outside that library search. The adapter resolves
+model, reference, and output paths before building the engine arguments.
+
 The adapter removes the scratch directory in `finally` after success or failure.
 The service also removes it if publication fails after resolution but before
 `execute` opens the publisher's staging descriptor. A process crash can leave the

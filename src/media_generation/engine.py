@@ -1217,7 +1217,9 @@ class StableDiffusionCppAdapter:
             process_observation = supervisor.run(
                 resolved.argv,
                 env=resolved.environment,
-                cwd=resolved.scratch_directory,
+                # An empty ELF RUNPATH component searches the process CWD.
+                # Keep that search outside the writable attempt scratch.
+                cwd=Path("/"),
             )
             if (
                 process_observation.exit_code != 0
