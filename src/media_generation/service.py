@@ -726,6 +726,11 @@ class GenerationService:
                     else "complete"
                 )
                 result["publications"] = report
+                # Cleanup rows only enter the queue after their exact attempt
+                # outcome is durable. An unrelated orphan must not starve it.
+                result["scratch_cleanups"] = (
+                    self._retry_pending_systemd_output_cleanups(limit=16)
+                )
                 return result
             job_id = resource.get("job_id")
             attempt_id = resource.get("attempt_id")
@@ -788,6 +793,14 @@ class GenerationService:
         try:
             self._attempt_runner.cleanup_after_recovery(identity)
         except (OSError, RuntimeError, ValueError):
+            return self._resource_result("attention_required")
+        try:
+            self._store.mark_systemd_output_cleanup_complete(
+                identity,
+                validated=False,
+                timestamp=_now(),
+            )
+        except Exception:
             return self._resource_result("attention_required")
         if not self._store.release_quarantined_attempt(
             job_id, attempt_id, timestamp=_now()
@@ -880,6 +893,7 @@ class GenerationService:
         owner_id = None if attempt["owner_id"] is None else str(attempt["owner_id"])
         epoch = int(attempt["claim_epoch"])
         contained = self._store.attempt_termination_proven(job_id, attempt_id)
+        recovery_cleanup_identity = None
         if (
             contained
             and attempt.get("containment_contract")
@@ -894,6 +908,7 @@ class GenerationService:
                 self._attempt_runner.cleanup_after_recovery(identity)
             except (OSError, RuntimeError, ValueError):
                 return self._resource_result("attention_required")
+            recovery_cleanup_identity = identity
         timestamp = _now()
         if attempt["job_status"] == "canceled":
             finalized = self._store.fail_execution(
@@ -909,6 +924,15 @@ class GenerationService:
             )
             if not finalized:
                 return self._resource_result("attention_required")
+            if recovery_cleanup_identity is not None:
+                try:
+                    self._store.mark_systemd_output_cleanup_complete(
+                        recovery_cleanup_identity,
+                        validated=False,
+                        timestamp=_now(),
+                    )
+                except Exception:
+                    return self._resource_result("attention_required")
             return self._resource_result("canceled")
         if publication_was_fenced:
             finalized = self._store.fail_execution(
@@ -929,6 +953,15 @@ class GenerationService:
             )
             if not finalized:
                 return self._resource_result("attention_required")
+            if recovery_cleanup_identity is not None:
+                try:
+                    self._store.mark_systemd_output_cleanup_complete(
+                        recovery_cleanup_identity,
+                        validated=False,
+                        timestamp=_now(),
+                    )
+                except Exception:
+                    return self._resource_result("attention_required")
             return self._resource_result("attention_required")
         if contained:
             finalized = self._store.fail_execution(
@@ -944,6 +977,15 @@ class GenerationService:
             )
             if not finalized:
                 return self._resource_result("attention_required")
+            if recovery_cleanup_identity is not None:
+                try:
+                    self._store.mark_systemd_output_cleanup_complete(
+                        recovery_cleanup_identity,
+                        validated=False,
+                        timestamp=_now(),
+                    )
+                except Exception:
+                    return self._resource_result("attention_required")
             return self._resource_result("complete")
         self._store.fail_execution(
             job_id,
@@ -1115,7 +1157,6 @@ class GenerationService:
         prepared_execution = None
         supervisor: ProcessSupervisor | None = None
         systemd_completion: SystemdAttemptCompletion | None = None
-        systemd_output_acknowledged = False
         systemd_output_fd_consumed = False
         try:
             plan = GenerationPlan(
@@ -1151,7 +1192,7 @@ class GenerationService:
 
             def write_image(destination: Path, staged: BinaryIO) -> None:
                 nonlocal metadata, adapter_dispatched, execute_entered, executed
-                nonlocal supervisor, systemd_completion, systemd_output_acknowledged
+                nonlocal supervisor, systemd_completion
                 nonlocal systemd_output_fd_consumed
                 if prepared_execution is not None:
                     execute_entered = True
@@ -1230,10 +1271,12 @@ class GenerationService:
                             metadata = self.adapter.stream_systemd_execution(
                                 prepared_execution, staged, output_source
                             )
-                        self._attempt_runner.acknowledge_output(
-                            systemd_completion.identity, validated=True
+                        self._store.record_systemd_stream_complete(
+                            systemd_completion.identity,
+                            owner_id=claim.owner_id,
+                            claim_epoch=claim.claim_epoch,
+                            timestamp=_now(),
                         )
-                        systemd_output_acknowledged = True
                     executed = True
                     if self._attempt_runner is None:
                         self._verify_execution_evidence(claim, prepared_execution)
@@ -1403,22 +1446,9 @@ class GenerationService:
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=max(0.1, self._heartbeat_seconds * 2))
-            if (
-                systemd_completion is not None
-                and not systemd_output_acknowledged
-                and self._attempt_runner is not None
-                and self._store.attempt_termination_proven(
-                    claim.job_id, claim.attempt_id
-                )
-            ):
-                try:
-                    self._attempt_runner.acknowledge_output(
-                        systemd_completion.identity, validated=False
-                    )
-                except Exception:
-                    # Keep the execution outcome; recovery can retry scratch
-                    # cleanup after the publication journal is reconciled.
-                    pass
+            self._retry_pending_systemd_output_cleanups(
+                limit=1, attempt_id=claim.attempt_id
+            )
             if (
                 systemd_completion is not None
                 and systemd_completion.output_fd is not None
@@ -1428,6 +1458,36 @@ class GenerationService:
             cleanup = getattr(self.adapter, "cleanup_execution", None)
             if prepared_execution is not None and callable(cleanup):
                 cleanup(prepared_execution)
+
+    def _retry_pending_systemd_output_cleanups(
+        self, *, limit: int = 16, attempt_id: str | None = None
+    ) -> int:
+        """Retry a bounded set of broker cleanups after durable outcome checks."""
+        if self._attempt_runner is None:
+            return 0
+        try:
+            pending = self._store.pending_systemd_output_cleanups(
+                limit=limit, attempt_id=attempt_id
+            )
+        except Exception:
+            return 0
+        completed = 0
+        for cleanup in pending:
+            try:
+                self._attempt_runner.acknowledge_output(
+                    cleanup.identity, validated=cleanup.validated
+                )
+                self._store.mark_systemd_output_cleanup_complete(
+                    cleanup.identity,
+                    validated=cleanup.validated,
+                    timestamp=_now(),
+                )
+            except Exception:
+                # The attempt outcome remains durable; failed deletion stays
+                # pending for the next bounded recovery pass.
+                continue
+            completed += 1
+        return completed
 
     def _require_selected_candidate_binding(
         self,

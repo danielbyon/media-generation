@@ -15,13 +15,14 @@ relative filename, observed source identity and timestamps, and import time.
 The source bytes are copied unchanged, including metadata and orientation.
 Later edits to the source file cannot change the stored artifact.
 
-The current schema is `user_version = 7`. A new database creates artifact,
-lineage, publication, execution, backend-evidence, privacy, admission, and
-batch-coordination structures directly in one transaction. An existing
-database reopens through a read-only connection and must match the complete
-current schema exactly. Older, newer, partial, malformed-current, and nonempty
-unversioned databases are rejected without mutation. There is no migration,
-backfill, historical publication repair, or old-job compatibility path.
+The current schema is `user_version = 9`. A new database creates artifact,
+lineage, publication, execution, backend-evidence, privacy, admission,
+batch-coordination, and systemd output-lifecycle structures directly in one
+transaction. An existing database reopens through a read-only connection and
+must match the complete current schema exactly. Older, newer, partial,
+malformed-current, and nonempty unversioned databases are rejected without
+mutation. There is no migration, backfill, historical publication repair, or
+old-job compatibility path.
 
 Every current generation job has an `execution_jobs` sidecar with non-null
 privacy-compliance evidence and exactly one `execution_admissions` row. The
@@ -33,7 +34,7 @@ incompatible. A `not_required` admission is accepted only for the exact bundled
 The store also creates immutable-artifact and writer-epoch triggers. Every
 connection registers the connection-local
 `media_generation_writer_epoch()` function. `BEFORE INSERT/UPDATE` guards on
-current mutation tables require epoch 7. A client that lacks the function, or
+current mutation tables require epoch 8. A client that lacks the function, or
 that reports a different epoch, aborts on its first guarded mutation.
 Validation compares every table, index, trigger definition, singleton resource
 row, execution sidecar, admission row, batch table, and batch slot. Unknown

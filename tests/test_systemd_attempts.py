@@ -19,7 +19,7 @@ from media_generation import service as service_module
 from media_generation import store as store_module
 from media_generation import systemd_broker as broker_module
 from media_generation.backend_provenance import backend_digest
-from media_generation.errors import BackendEvidenceError
+from media_generation.errors import BackendEvidenceError, RetryableGenerationError
 from media_generation.comfyui import ComfyUIAdapter
 from media_generation.systemd_evidence import SystemdEvidenceLedger
 from media_generation.service import (
@@ -118,11 +118,13 @@ class _SyntheticSystemdAttemptRunner(SystemdAttemptRunner):
         self.fence_before_return = fence_before_return
         self.cancel_before_return = cancel_before_return
         self.scratch_directory = None
+        self.scratch_directories: dict[str, Path] = {}
         self.acknowledgements: list[bool] = []
 
     def prepare_attempt(self, claim) -> Path:
         directory = self.scratch_root / claim.attempt_id
         self.scratch_directory = directory
+        self.scratch_directories[claim.attempt_id] = directory
         return directory
 
     def execute_attempt(self, claim, prepared) -> SystemdAttemptCompletion:
@@ -246,8 +248,9 @@ class _SyntheticSystemdAttemptRunner(SystemdAttemptRunner):
         self.acknowledgements.append(validated)
         if self.acknowledgement_error is not None:
             raise self.acknowledgement_error
-        if self.scratch_directory is not None:
-            shutil.rmtree(self.scratch_directory, ignore_errors=True)
+        scratch = self.scratch_directories.get(identity.attempt_id)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
 
     def cancel_attempt(self, claim) -> str:
         assert self.store is not None
@@ -936,9 +939,33 @@ def test_post_fence_cgroup_evidence_is_idempotent_and_does_not_create_engine_obs
     monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
     store, claim, identity = _claimed_systemd_attempt(tmp_path)
     store.bind_attempt_containment(identity, timestamp=_now())
+    root = tmp_path / "allocated-publication-root"
+    root.mkdir()
+    root_identity = root.stat()
+    publication_id = "pub_recovery_cleanup_allocated"
+    store.create_publication(
+        {
+            "publication_id": publication_id,
+            "artifact_id": "art_recovery_cleanup_allocated",
+            "root": str(root),
+            "root_dev": root_identity.st_dev,
+            "root_ino": root_identity.st_ino,
+            "root_token": "test-root-token",
+            "stage_name": f".{publication_id}.stage",
+            "state": "allocated",
+            "job_id": claim.job_id,
+            "attempt_id": claim.attempt_id,
+            "sources_json": "[]",
+            "created_at": _now(),
+        },
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+    )
     assert store.attempt_recovery_cleanup_authorized(identity) is False
 
     assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert store.attempt_recovery_cleanup_authorized(identity) is False
+    store.abandon_publication(publication_id, "recovery test revoked allocation")
     assert store.attempt_recovery_cleanup_authorized(identity) is True
     evidence = CgroupTerminationEvidence(
         identity=identity,
@@ -1168,6 +1195,30 @@ def test_systemd_runner_streams_validated_scratch_into_existing_publication(
     monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
     runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
     service, runner = _systemd_service(tmp_path, runner)
+    events: list[str] = []
+    complete_execution = service._store.complete_execution
+    acknowledge_output = runner.acknowledge_output
+    stream_systemd_execution = service.adapter.stream_systemd_execution
+
+    def record_output_copy(*args, **kwargs):
+        result = stream_systemd_execution(*args, **kwargs)
+        events.append("output_copy_completed")
+        return result
+
+    def record_commit(*args, **kwargs):
+        result = complete_execution(*args, **kwargs)
+        events.append("publication_committed")
+        return result
+
+    def record_ack(identity, *, validated):
+        events.append("scratch_cleanup_acknowledged")
+        return acknowledge_output(identity, validated=validated)
+
+    monkeypatch.setattr(service._store, "complete_execution", record_commit)
+    monkeypatch.setattr(runner, "acknowledge_output", record_ack)
+    monkeypatch.setattr(
+        service.adapter, "stream_systemd_execution", record_output_copy
+    )
 
     queued = service.enqueue(
         "systemd-success", _request(), workload_demand=heavy_workload_demand()
@@ -1184,6 +1235,147 @@ def test_systemd_runner_streams_validated_scratch_into_existing_publication(
     assert runner.acknowledgements == [True]
     assert runner.scratch_directory is not None
     assert runner.scratch_directory.exists() is False
+    assert events == [
+        "output_copy_completed",
+        "publication_committed",
+        "scratch_cleanup_acknowledged",
+    ]
+
+
+@pytest.mark.parametrize("proof_state", ("missing", "conflicting"))
+def test_systemd_publication_rejects_missing_or_conflicting_transaction_proof(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, proof_state: str
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    service, _runner = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        f"systemd-atomic-proof-{proof_state}",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+    complete_execution = service._store.complete_execution
+    validate_cgroup_proof = service._store._attempt_cgroup_termination_evidence
+
+    def missing_or_conflicting_proof(connection, job_id, attempt_id):
+        if proof_state == "missing":
+            return False
+        raise BackendEvidenceError("injected conflicting cgroup proof")
+
+    def inject_proof_state(*args, **kwargs):
+        service._store._attempt_cgroup_termination_evidence = (
+            missing_or_conflicting_proof
+        )
+        try:
+            return complete_execution(*args, **kwargs)
+        finally:
+            service._store._attempt_cgroup_termination_evidence = validate_cgroup_proof
+
+    monkeypatch.setattr(service._store, "complete_execution", inject_proof_state)
+
+    report = service.work()
+
+    assert report["processed"] == 1
+    assert service.get_provenance(queued.job_id)["status"] != "succeeded"
+    assert service._store.artifacts() == []
+
+
+def test_recovery_pins_cgroup_events_fd_across_path_substitution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    template = _identity()
+    cgroup_path = Path("/sys/fs/cgroup") / template.cgroup_path.lstrip("/")
+    original_cgroup = tmp_path / "original-cgroup"
+    replacement_cgroup = tmp_path / "replacement-cgroup"
+    original_cgroup.mkdir()
+    replacement_cgroup.mkdir()
+    (original_cgroup / "cgroup.events").write_text("populated 0\n", encoding="ascii")
+    (replacement_cgroup / "cgroup.events").write_text("populated 1\n", encoding="ascii")
+    moved_cgroup = tmp_path / "moved-original-cgroup"
+    original_open = os.open
+    original_fstat = os.fstat
+    original_stat = Path.stat
+    cgroup_stat = original_stat(original_cgroup)
+    template = replace(
+        template,
+        cgroup_device=cgroup_stat.st_dev,
+        cgroup_inode=cgroup_stat.st_ino,
+    )
+    substituted = False
+    relative_event_opened = False
+    pinned_directory_fd: int | None = None
+
+    def substitute_path() -> None:
+        nonlocal substituted
+        if substituted:
+            return
+        original_cgroup.rename(moved_cgroup)
+        replacement_cgroup.rename(original_cgroup)
+        substituted = True
+
+    def fake_open(path, flags, *args, dir_fd=None):
+        nonlocal pinned_directory_fd, relative_event_opened
+        if dir_fd is not None and path == "cgroup.events":
+            relative_event_opened = True
+            return original_open(path, flags, *args, dir_fd=dir_fd)
+        if dir_fd is None and Path(path) == cgroup_path:
+            pinned_directory_fd = original_open(original_cgroup, flags, *args)
+            return pinned_directory_fd
+        if dir_fd is None and Path(path) == cgroup_path / "cgroup.events":
+            assert substituted
+            return original_open(original_cgroup / "cgroup.events", flags, *args)
+        return original_open(path, flags, *args, dir_fd=dir_fd)
+
+    def fake_fstat(descriptor: int):
+        observed = original_fstat(descriptor)
+        if descriptor == pinned_directory_fd:
+            substitute_path()
+        return observed
+
+    def fake_stat(path: Path, *, follow_symlinks: bool = True):
+        if path == cgroup_path:
+            observed = original_stat(original_cgroup, follow_symlinks=follow_symlinks)
+            substitute_path()
+            return observed
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(broker_module.os, "open", fake_open)
+    monkeypatch.setattr(broker_module.os, "fstat", fake_fstat)
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr(broker_module, "_boot_id", lambda: template.boot_id)
+    monkeypatch.setattr(
+        broker_module,
+        "_unit_properties",
+        lambda _unit: {
+            "InvocationID": template.invocation_id,
+            "ControlGroup": template.cgroup_path,
+        },
+    )
+    monkeypatch.setattr(broker_module, "_stop_unit", lambda _unit: None)
+    monkeypatch.setattr(
+        broker_module,
+        "_wait_cgroup_empty",
+        lambda events_fd, *, timeout: broker_module._read_populated(events_fd) == 0,
+    )
+    proof = CgroupTerminationEvidence(
+        identity=template,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda _store, _identity, _events_fd: proof,
+    )
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(empty_timeout_seconds=0.1)
+    broker.store = object()
+    termination = broker._stop_and_record(template)
+
+    assert substituted is True
+    assert relative_event_opened is True
+    assert termination == proof
 
 
 def test_worker_writable_database_cannot_forge_cgroup_termination(
@@ -1586,7 +1778,7 @@ def test_signaled_runner_with_successful_engine_cannot_publish(
     assert service._store.resource_snapshot()["state"] == "available"
 
 
-def test_output_ack_failure_preserves_attempt_failure_and_leaves_recovery_scratch(
+def test_output_ack_failure_preserves_committed_success_and_leaves_recovery_scratch(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
@@ -1603,11 +1795,197 @@ def test_output_ack_failure_preserves_attempt_failure_and_leaves_recovery_scratc
     report = service.work()
 
     assert report["processed"] == 1
-    assert service.get_provenance(queued.job_id)["status"] == "failed"
-    assert service._store.artifacts() == []
-    assert runner.acknowledgements == [True, False]
+    assert service.get_provenance(queued.job_id)["status"] == "succeeded"
+    assert len(service._store.artifacts()) == 1
+    assert runner.acknowledgements == [True]
     assert runner.scratch_directory is not None
     assert runner.scratch_directory.exists()
+    pending = service._store.pending_systemd_output_cleanups(
+        attempt_id=service._store.current_attempt(queued.job_id)["attempt_id"]
+    )
+    assert len(pending) == 1
+    assert pending[0].validated is True
+
+    runner.acknowledgement_error = None
+    recovered = service.recover()
+
+    assert recovered["resource_state"] == "available"
+    assert recovered["scratch_cleanups"] == 1
+    assert runner.acknowledgements == [True, True]
+    assert runner.scratch_directory.exists() is False
+    assert service._store.pending_systemd_output_cleanups() == ()
+
+
+def test_bounded_recovery_cleans_old_attempt_after_retry_becomes_current(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    runner = _SyntheticSystemdAttemptRunner(
+        tmp_path / "broker-scratch",
+        acknowledgement_error=OSError("broker unavailable"),
+    )
+    service, runner = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        "systemd-old-attempt-cleanup",
+        _request(),
+        max_attempts=2,
+        workload_demand=heavy_workload_demand(),
+    )
+    stream = service.adapter.stream_systemd_execution
+    stream_count = 0
+
+    def fail_first_stream(*args, **kwargs):
+        nonlocal stream_count
+        stream_count += 1
+        if stream_count == 1:
+            raise RetryableGenerationError("injected retryable stream failure")
+        return stream(*args, **kwargs)
+
+    monkeypatch.setattr(service.adapter, "stream_systemd_execution", fail_first_stream)
+    first = service.work(limit=1)
+
+    assert first["processed"] == 1
+    first_attempt = service._store.current_attempt(queued.job_id)
+    assert first_attempt is not None
+    first_attempt_id = str(first_attempt["attempt_id"])
+    first_scratch = runner.scratch_directory
+    assert first_scratch is not None and first_scratch.exists()
+    assert len(
+        service._store.pending_systemd_output_cleanups(attempt_id=first_attempt_id)
+    ) == 1
+
+    runner.acknowledgement_error = None
+    second = service.work(limit=1)
+
+    assert second["processed"] == 1
+    second_attempt = service._store.current_attempt(queued.job_id)
+    assert second_attempt is not None
+    assert second_attempt["attempt_id"] != first_attempt_id
+    old_identity = service._store.attempt_containment_identity(
+        queued.job_id, first_attempt_id
+    )
+    assert old_identity is not None
+    assert service._store.systemd_output_cleanup_authorized(
+        old_identity, validated=False
+    ) is True
+
+    recovered = service.recover()
+
+    assert recovered["scratch_cleanups"] == 1
+    assert first_scratch.exists() is False
+
+
+@pytest.mark.parametrize("checkpoint", ("before_file_sync", "before_commit"))
+def test_systemd_scratch_survives_until_publication_boundary_is_reconciled(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, checkpoint: str
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    service, runner = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        f"systemd-cleanup-{checkpoint}",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+    reached: list[str] = []
+
+    def interrupt(name: str) -> None:
+        if name == checkpoint:
+            reached.append(name)
+            assert runner.scratch_directory is not None
+            assert runner.scratch_directory.exists()
+            assert runner.acknowledgements == []
+            raise RuntimeError(f"injected publication interruption at {name}")
+
+    service._publication.checkpoint = interrupt
+    report = service.work()
+
+    assert report["processed"] == 1
+    assert reached == [checkpoint]
+    assert service.get_provenance(queued.job_id)["status"] != "succeeded"
+    assert service._store.artifacts() == []
+    assert runner.scratch_directory is not None
+    assert runner.acknowledgements in ([], [False])
+    assert runner.scratch_directory.exists() == (runner.acknowledgements == [])
+
+
+def test_systemd_scratch_survives_after_durable_commit_until_cleanup_ack(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    service, runner = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        "systemd-cleanup-after-commit",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+    reached: list[str] = []
+
+    def interrupt(name: str) -> None:
+        if name == "after_commit":
+            reached.append(name)
+            assert runner.scratch_directory is not None
+            assert runner.scratch_directory.exists()
+            assert runner.acknowledgements == []
+            raise RuntimeError("injected interruption after durable commit")
+
+    service._publication.checkpoint = interrupt
+    report = service.work()
+
+    assert report["processed"] == 1
+    assert reached == ["after_commit"]
+    assert service.get_provenance(queued.job_id)["status"] == "succeeded"
+    assert len(service._store.artifacts()) == 1
+    assert runner.acknowledgements == [True]
+    assert runner.scratch_directory is not None
+    assert runner.scratch_directory.exists() is False
+
+
+def test_concurrent_cancellation_at_publication_commit_fences_scratch_cleanup(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    service, runner = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        "systemd-cancel-at-publication-commit",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+    reached: list[str] = []
+    cancellation_finished = threading.Event()
+    cancellation_result: list[str] = []
+
+    def cancel_before_commit(name: str) -> None:
+        if name == "before_commit":
+            reached.append(name)
+            assert runner.scratch_directory is not None
+            assert runner.scratch_directory.exists()
+            assert runner.acknowledgements == []
+            def cancel() -> None:
+                cancellation_result.append(
+                    service._store.cancel_execution(queued.job_id, _now())
+                )
+                cancellation_finished.set()
+
+            cancellation_thread = threading.Thread(target=cancel)
+            cancellation_thread.start()
+            assert cancellation_finished.wait(timeout=5)
+            cancellation_thread.join(timeout=5)
+            assert cancellation_thread.is_alive() is False
+
+    service._publication.checkpoint = cancel_before_commit
+    report = service.work()
+
+    assert report["processed"] == 1
+    assert reached == ["before_commit"]
+    assert cancellation_result == ["requested"]
+    assert service.get_provenance(queued.job_id)["status"] == "canceled"
+    assert service._store.artifacts() == []
+    assert runner.acknowledgements == [False]
+    assert runner.scratch_directory is not None
+    assert runner.scratch_directory.exists() is False
 
 
 def test_missing_engine_observation_cannot_succeed_but_cgroup_proof_releases(
@@ -1725,7 +2103,7 @@ def test_cancellation_after_runner_completion_cannot_publish_stale_output(
     assert service._store.resource_snapshot()["state"] == "available"
     # The worker may finish validation after cancellation, but publication
     # authority is fenced and the existing publisher refuses the commit.
-    assert runner.acknowledgements == [True]
+    assert runner.acknowledgements == [False]
     assert runner.scratch_directory is not None
     assert runner.scratch_directory.exists() is False
 

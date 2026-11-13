@@ -89,9 +89,9 @@ def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
             "persisted ComfyUI adapter configuration has no workflow approval pin"
         )
     return configuration["workflow_approval"]
-_WRITER_EPOCH = 7
+_WRITER_EPOCH = 8
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_CURRENT_SCHEMA_VERSION = 8
+_CURRENT_SCHEMA_VERSION = 9
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -110,6 +110,8 @@ _WRITER_GUARDS = (
     ("backend_executions", "UPDATE"),
     ("execution_containment", "INSERT"),
     ("execution_containment", "UPDATE"),
+    ("systemd_output_lifecycle", "INSERT"),
+    ("systemd_output_lifecycle", "UPDATE"),
     ("execution_cancellations", "INSERT"),
     ("execution_cancellations", "UPDATE"),
 ("generation_batches", "INSERT"),
@@ -191,6 +193,23 @@ _EXECUTION_CONTAINMENT_DDL = """CREATE TABLE execution_containment (
         OR (termination_json IS NOT NULL AND termination_at IS NOT NULL))
 )"""
 
+_SYSTEMD_OUTPUT_LIFECYCLE_DDL = """CREATE TABLE systemd_output_lifecycle (
+    attempt_id TEXT PRIMARY KEY REFERENCES execution_attempts(attempt_id),
+    job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
+    identity_digest TEXT NOT NULL CHECK (length(identity_digest) = 64),
+    stream_complete INTEGER NOT NULL CHECK (stream_complete IN (0,1)),
+    cleanup_state TEXT NOT NULL CHECK (cleanup_state IN ('active','pending','complete')),
+    cleanup_validated INTEGER CHECK (cleanup_validated IN (0,1)),
+    created_at TEXT NOT NULL,
+    cleanup_at TEXT,
+    CHECK ((cleanup_state = 'active' AND cleanup_validated IS NULL
+                AND cleanup_at IS NULL)
+        OR (cleanup_state = 'pending' AND cleanup_validated IS NOT NULL
+                AND cleanup_at IS NULL)
+        OR (cleanup_state = 'complete' AND cleanup_validated IS NOT NULL
+                AND cleanup_at IS NOT NULL))
+)"""
+
 _EXECUTION_CANCELLATIONS_DDL = """CREATE TABLE execution_cancellations (
     cancellation_id INTEGER PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
@@ -222,6 +241,35 @@ BEGIN
     WHERE OLD.termination_json IS NOT NULL
        OR NEW.termination_json IS NULL
        OR NEW.termination_at IS NULL;
+END"""
+
+_SYSTEMD_OUTPUT_LIFECYCLE_TRANSITION_DDL = """CREATE TRIGGER systemd_output_lifecycle_transition
+BEFORE UPDATE ON systemd_output_lifecycle
+BEGIN
+    SELECT RAISE(ABORT, 'systemd output lifecycle identity is immutable')
+    WHERE NEW.attempt_id IS NOT OLD.attempt_id
+       OR NEW.job_id IS NOT OLD.job_id
+       OR NEW.identity_digest IS NOT OLD.identity_digest
+       OR NEW.created_at IS NOT OLD.created_at;
+    SELECT RAISE(ABORT, 'systemd output stream evidence is immutable')
+    WHERE OLD.stream_complete = 1 AND NEW.stream_complete != 1;
+    SELECT RAISE(ABORT, 'systemd output cleanup transition is invalid')
+    WHERE NOT (
+        (OLD.cleanup_state = 'active'
+            AND NEW.cleanup_state IN ('active','pending','complete'))
+        OR (OLD.cleanup_state = 'pending'
+            AND NEW.cleanup_state IN ('pending','complete'))
+        OR (OLD.cleanup_state = 'complete' AND NEW.cleanup_state = 'complete')
+    );
+    SELECT RAISE(ABORT, 'systemd cleanup validation is immutable')
+    WHERE OLD.cleanup_validated IS NOT NULL
+      AND NEW.cleanup_validated IS NOT OLD.cleanup_validated;
+    SELECT RAISE(ABORT, 'completed systemd cleanup timestamp is immutable')
+    WHERE OLD.cleanup_at IS NOT NULL AND NEW.cleanup_at IS NOT OLD.cleanup_at;
+    SELECT RAISE(ABORT, 'systemd cleanup timestamp requires completion')
+    WHERE NEW.cleanup_state != 'complete' AND NEW.cleanup_at IS NOT NULL;
+    SELECT RAISE(ABORT, 'systemd cleanup completion requires timestamp')
+    WHERE NEW.cleanup_state = 'complete' AND NEW.cleanup_at IS NULL;
 END"""
 
 _EXECUTION_CONTAINMENT_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER execution_containment_immutable_delete
@@ -598,6 +646,7 @@ _EXECUTION_TABLE_DDL: dict[str, str] = {
     "execution_admissions": _EXECUTION_ADMISSIONS_DDL,
     "backend_executions": _BACKEND_EXECUTIONS_DDL,
     "execution_containment": _EXECUTION_CONTAINMENT_DDL,
+    "systemd_output_lifecycle": _SYSTEMD_OUTPUT_LIFECYCLE_DDL,
     "execution_cancellations": _EXECUTION_CANCELLATIONS_DDL,
 }
 
@@ -624,6 +673,11 @@ _CURRENT_INDEX_DDL: dict[str, str] = {
     "execution_attempts_running_idx": _EXECUTION_ATTEMPTS_RUNNING_INDEX_DDL,
     "execution_admissions_dispatch_idx": _EXECUTION_ADMISSIONS_DISPATCH_INDEX_DDL,
     "backend_executions_job_idx": _BACKEND_EXECUTIONS_JOB_INDEX_DDL,
+    "systemd_output_lifecycle_pending_idx": (
+        "CREATE INDEX systemd_output_lifecycle_pending_idx "
+        "ON systemd_output_lifecycle(cleanup_state, created_at, attempt_id) "
+        "WHERE cleanup_state = 'pending'"
+    ),
 }
 
 _STATIC_TRIGGER_DDL: dict[str, str] = {
@@ -651,6 +705,15 @@ _STATIC_TRIGGER_DDL: dict[str, str] = {
     ),
     "execution_containment_immutable_delete": (
         _EXECUTION_CONTAINMENT_IMMUTABLE_DELETE_DDL
+    ),
+    "systemd_output_lifecycle_transition": (
+        _SYSTEMD_OUTPUT_LIFECYCLE_TRANSITION_DDL
+    ),
+    "systemd_output_lifecycle_immutable_delete": (
+        "CREATE TRIGGER systemd_output_lifecycle_immutable_delete "
+        "BEFORE DELETE ON systemd_output_lifecycle BEGIN "
+        "SELECT RAISE(ABORT, 'systemd output lifecycle evidence is immutable'); "
+        "END"
     ),
     "execution_cancellations_transition": (
         _EXECUTION_CANCELLATIONS_TRANSITION_DDL
@@ -721,6 +784,14 @@ class ExecutionClaim:
     process_contained: bool
     containment_contract: str | None
     lease_expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSystemdOutputCleanup:
+    """A terminal attempt whose broker scratch cleanup still needs retry."""
+
+    identity: AttemptUnitIdentity
+    validated: bool
 
 
 class SQLiteStore:
@@ -1988,6 +2059,15 @@ END"""
                     raise BackendEvidenceError(
                         "attempt is already bound to another systemd invocation"
                     )
+                lifecycle = connection.execute(
+                    """SELECT identity_digest FROM systemd_output_lifecycle
+                       WHERE job_id = ? AND attempt_id = ?""",
+                    (identity.job_id, identity.attempt_id),
+                ).fetchone()
+                if lifecycle is None or lifecycle["identity_digest"] != identity_hash:
+                    raise BackendEvidenceError(
+                        "systemd output lifecycle is missing or identifies another invocation"
+                    )
                 self._systemd_evidence_ledger.bind_identity(identity)
                 return
             self._systemd_evidence_ledger.bind_identity(identity)
@@ -2002,6 +2082,301 @@ END"""
                     identity_json,
                     identity_hash,
                     timestamp,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO systemd_output_lifecycle
+                   (attempt_id,job_id,identity_digest,stream_complete,
+                    cleanup_state,cleanup_validated,created_at,cleanup_at)
+                   VALUES (?,?,?,0,'active',NULL,?,NULL)""",
+                (identity.attempt_id, identity.job_id, identity_hash, timestamp),
+            )
+
+    def record_systemd_stream_complete(
+        self,
+        identity: AttemptUnitIdentity,
+        *,
+        owner_id: str,
+        claim_epoch: int,
+        timestamp: str,
+    ) -> None:
+        """Persist that this attempt's pinned scratch stream passed validation."""
+        if not isinstance(identity, AttemptUnitIdentity):
+            raise TypeError("identity must be an AttemptUnitIdentity")
+        identity_hash = identity_digest(identity)
+        with self._connection(transaction=True) as connection:
+            self._require_backend_authority(
+                connection, identity.job_id, identity.attempt_id,
+                owner_id, claim_epoch,
+            )
+            row = connection.execute(
+                """SELECT containment.identity_json, containment.identity_digest,
+                          backend.resolved_digest, attempts.containment_contract
+                   FROM execution_containment AS containment
+                   JOIN backend_executions AS backend USING (attempt_id)
+                   JOIN execution_attempts AS attempts USING (attempt_id)
+                   WHERE containment.job_id = ? AND containment.attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["identity_json"] != backend_canonical_json(identity.to_mapping())
+                or row["identity_digest"] != identity_hash
+                or row["resolved_digest"] != identity.resolved_digest
+                or row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+            ):
+                raise BackendEvidenceError(
+                    "validated stream does not match the current systemd attempt"
+                )
+            lifecycle = connection.execute(
+                """SELECT identity_digest, stream_complete, cleanup_state
+                   FROM systemd_output_lifecycle
+                   WHERE job_id = ? AND attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if (
+                lifecycle is None
+                or lifecycle["identity_digest"] != identity_hash
+                or lifecycle["cleanup_state"] != "active"
+            ):
+                raise BackendEvidenceError(
+                    "systemd output lifecycle is missing or no longer active"
+                )
+            if lifecycle["stream_complete"] == 1:
+                return
+            updated = connection.execute(
+                """UPDATE systemd_output_lifecycle
+                   SET stream_complete = 1
+                   WHERE job_id = ? AND attempt_id = ?
+                     AND identity_digest = ? AND stream_complete = 0
+                     AND cleanup_state = 'active'""",
+                (identity.job_id, identity.attempt_id, identity_hash),
+            )
+            if updated.rowcount != 1:
+                raise BackendEvidenceError(
+                    "systemd output stream completion could not be recorded"
+                )
+
+    def pending_systemd_output_cleanups(
+        self, *, limit: int = 16, attempt_id: str | None = None
+    ) -> tuple[PendingSystemdOutputCleanup, ...]:
+        """Return a bounded batch of terminal attempts with resolved publications."""
+        if type(limit) is not int or not 1 <= limit <= 64:
+            raise ValueError("cleanup batch limit must be an integer from 1 through 64")
+        if attempt_id is not None and (not isinstance(attempt_id, str) or not attempt_id):
+            raise ValueError("attempt_id must be a nonempty string when provided")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT lifecycle.job_id, lifecycle.attempt_id,
+                          lifecycle.identity_digest AS lifecycle_identity_digest,
+                          lifecycle.cleanup_validated,
+                          containment.identity_json,
+                          containment.identity_digest AS containment_identity_digest,
+                          backend.resolved_digest, attempts.status AS attempt_status
+                   FROM systemd_output_lifecycle AS lifecycle
+                   JOIN execution_containment AS containment
+                     ON containment.job_id = lifecycle.job_id
+                    AND containment.attempt_id = lifecycle.attempt_id
+                   JOIN backend_executions AS backend
+                     ON backend.attempt_id = lifecycle.attempt_id
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = lifecycle.attempt_id
+                   WHERE lifecycle.cleanup_state = 'pending'
+                     AND ((lifecycle.cleanup_validated = 1
+                           AND attempts.status = 'succeeded'
+                           AND EXISTS (
+                               SELECT 1 FROM artifact_publications AS publications
+                               WHERE publications.attempt_id = lifecycle.attempt_id
+                                 AND publications.state = 'committed'
+                           ))
+                       OR (lifecycle.cleanup_validated = 0
+                           AND attempts.status IN ('failed','canceled')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM artifact_publications AS publications
+                               WHERE publications.attempt_id = lifecycle.attempt_id
+                                 AND publications.state IN ('allocated','ready','committed')
+                           )))
+                     AND (? IS NULL OR lifecycle.attempt_id = ?)
+                   ORDER BY lifecycle.created_at, lifecycle.attempt_id
+                   LIMIT ?""",
+                (attempt_id, attempt_id, limit),
+            ).fetchall()
+        pending: list[PendingSystemdOutputCleanup] = []
+        for row in rows:
+            try:
+                identity = AttemptUnitIdentity.from_mapping(
+                    json.loads(str(row["identity_json"]))
+                )
+                if (
+                    identity.job_id != row["job_id"]
+                    or identity.attempt_id != row["attempt_id"]
+                    or identity.resolved_digest != row["resolved_digest"]
+                    or identity_digest(identity) != row["containment_identity_digest"]
+                    or row["containment_identity_digest"]
+                    != row["lifecycle_identity_digest"]
+                ):
+                    raise ValueError("cleanup identity digest does not match")
+            except (TypeError, ValueError, json.JSONDecodeError) as error:
+                raise BackendEvidenceError(
+                    "pending systemd cleanup has a malformed attempt identity"
+                ) from error
+            with self._connection() as connection:
+                termination_proven = self._attempt_cgroup_termination_evidence(
+                    connection,
+                    identity.job_id,
+                    identity.attempt_id,
+                    require_current_attempt=False,
+                )
+            if not termination_proven:
+                continue
+            ledger_identity = self._systemd_evidence_ledger.read_identity(
+                identity.job_id, identity.attempt_id
+            )
+            if ledger_identity != identity:
+                raise BackendEvidenceError(
+                    "pending cleanup identity differs from the root evidence ledger"
+                )
+            pending.append(
+                PendingSystemdOutputCleanup(
+                    identity=identity,
+                    validated=bool(row["cleanup_validated"]),
+                )
+            )
+        return tuple(pending)
+
+    def systemd_output_cleanup_authorized(
+        self, identity: AttemptUnitIdentity, *, validated: bool
+    ) -> bool:
+        """Authorize cleanup for one terminal attempt and exact unit identity."""
+        if not isinstance(identity, AttemptUnitIdentity) or type(validated) is not bool:
+            return False
+        identity_hash = identity_digest(identity)
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT lifecycle.cleanup_state, lifecycle.cleanup_validated,
+                          lifecycle.identity_digest AS lifecycle_identity_digest,
+                          containment.identity_digest AS containment_identity_digest,
+                          containment.identity_json, attempts.status AS attempt_status,
+                          EXISTS (SELECT 1 FROM artifact_publications
+                                  WHERE attempt_id = lifecycle.attempt_id
+                                    AND state = 'committed') AS has_committed_publication,
+                          EXISTS (SELECT 1 FROM artifact_publications
+                                  WHERE attempt_id = lifecycle.attempt_id
+                                    AND state IN ('allocated','ready','committed')) AS has_unresolved_publication
+                   FROM systemd_output_lifecycle AS lifecycle
+                   JOIN execution_containment AS containment
+                     ON containment.job_id = lifecycle.job_id
+                    AND containment.attempt_id = lifecycle.attempt_id
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = lifecycle.attempt_id
+                   WHERE lifecycle.job_id = ? AND lifecycle.attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["cleanup_state"] not in {"pending", "complete"}
+                or row["cleanup_validated"] != int(validated)
+                or row["lifecycle_identity_digest"] != identity_hash
+                or row["containment_identity_digest"] != identity_hash
+                or row["identity_json"]
+                != backend_canonical_json(identity.to_mapping())
+                or (validated and row["attempt_status"] != "succeeded")
+                or (validated and not row["has_committed_publication"])
+                or (not validated and row["attempt_status"] not in {"failed", "canceled"})
+                or (not validated and row["has_unresolved_publication"])
+            ):
+                return False
+            if not self._attempt_cgroup_termination_evidence(
+                connection,
+                identity.job_id,
+                identity.attempt_id,
+                require_current_attempt=False,
+            ):
+                return False
+        return self._systemd_evidence_ledger.read_identity(
+            identity.job_id, identity.attempt_id
+        ) == identity
+
+    def mark_systemd_output_cleanup_complete(
+        self,
+        identity: AttemptUnitIdentity,
+        *,
+        validated: bool,
+        timestamp: str,
+    ) -> None:
+        """Record a broker-confirmed cleanup without changing execution authority."""
+        if not isinstance(identity, AttemptUnitIdentity):
+            raise TypeError("identity must be an AttemptUnitIdentity")
+        if type(validated) is not bool:
+            raise ValueError("validated must be a boolean")
+        identity_hash = identity_digest(identity)
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                """SELECT lifecycle.cleanup_state, lifecycle.cleanup_validated,
+                          lifecycle.identity_digest AS lifecycle_identity_digest,
+                          containment.identity_json,
+                          containment.identity_digest AS containment_identity_digest,
+                          attempts.status AS attempt_status,
+                          EXISTS (SELECT 1 FROM artifact_publications
+                                  WHERE attempt_id = lifecycle.attempt_id
+                                    AND state = 'committed') AS has_committed_publication,
+                          EXISTS (SELECT 1 FROM artifact_publications
+                                  WHERE attempt_id = lifecycle.attempt_id
+                                    AND state IN ('allocated','ready','committed')) AS has_unresolved_publication
+                   FROM systemd_output_lifecycle AS lifecycle
+                   JOIN execution_containment AS containment
+                     ON containment.job_id = lifecycle.job_id
+                    AND containment.attempt_id = lifecycle.attempt_id
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = lifecycle.attempt_id
+                   WHERE lifecycle.job_id = ? AND lifecycle.attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if (
+                row is None
+                or row["lifecycle_identity_digest"] != identity_hash
+                or row["lifecycle_identity_digest"]
+                != row["containment_identity_digest"]
+                or row["identity_json"]
+                != backend_canonical_json(identity.to_mapping())
+                or (validated and row["attempt_status"] != "succeeded")
+                or (validated and not row["has_committed_publication"])
+                or (not validated and row["attempt_status"] not in {"failed", "canceled"})
+                or (not validated and row["has_unresolved_publication"])
+            ):
+                raise BackendEvidenceError(
+                    "cleanup acknowledgment identifies another systemd invocation"
+                )
+            current_state = str(row["cleanup_state"])
+            current_validation = row["cleanup_validated"]
+            if current_state == "complete":
+                if current_validation != int(validated):
+                    raise BackendEvidenceError(
+                        "cleanup acknowledgment conflicts with completed lifecycle evidence"
+                    )
+                return
+            if current_state == "pending" and current_validation != int(validated):
+                raise BackendEvidenceError(
+                    "cleanup acknowledgment conflicts with pending lifecycle evidence"
+                )
+            if not self._attempt_cgroup_termination_evidence(
+                connection,
+                identity.job_id,
+                identity.attempt_id,
+                require_current_attempt=False,
+            ):
+                raise BackendEvidenceError(
+                    "cleanup acknowledgment requires verified whole-cgroup termination"
+                )
+            connection.execute(
+                """UPDATE systemd_output_lifecycle
+                   SET cleanup_state = 'complete',
+                       cleanup_validated = ?, cleanup_at = ?
+                   WHERE job_id = ? AND attempt_id = ?
+                     AND cleanup_state IN ('active','pending')""",
+                (
+                    int(validated), timestamp,
+                    identity.job_id, identity.attempt_id,
                 ),
             )
 
@@ -2082,7 +2457,7 @@ END"""
                 return False
             if connection.execute(
                 """SELECT 1 FROM artifact_publications WHERE job_id = ?
-                   AND state IN ('ready','committed')""",
+                   AND state IN ('allocated','ready','committed')""",
                 (identity.job_id,),
             ).fetchone() is not None:
                 return False
@@ -2646,6 +3021,8 @@ END"""
         connection: sqlite3.Connection,
         job_id: str,
         attempt_id: str,
+        *,
+        require_current_attempt: bool = True,
     ) -> bool:
         """Validate the persisted whole-cgroup proof independently of engine exit."""
         row = connection.execute(
@@ -2665,7 +3042,7 @@ END"""
             return False
         if (
             row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
-            or row["current_attempt_id"] != attempt_id
+            or (require_current_attempt and row["current_attempt_id"] != attempt_id)
         ):
             return False
         try:
@@ -3136,6 +3513,92 @@ END"""
                     "was not written"
                 )
 
+    def _require_systemd_success_evidence(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> None:
+        """Require engine, stream, and root-ledger proof before systemd success."""
+        if not self._attempt_cgroup_termination_evidence(
+            connection, job_id, attempt_id
+        ):
+            raise BackendEvidenceError(
+                "systemd publication success requires verified whole-cgroup termination"
+            )
+        backend = connection.execute(
+            """SELECT state, observed_json, observed_at
+               FROM backend_executions WHERE job_id = ? AND attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+        if (
+            backend is None
+            or backend["state"] != "observed"
+            or backend["observed_json"] is None
+            or backend["observed_at"] is None
+        ):
+            raise BackendEvidenceError(
+                "systemd publication success requires a durable engine observation"
+            )
+        try:
+            observation = json.loads(str(backend["observed_json"]))
+            if not isinstance(observation, dict):
+                raise ValueError("engine observation is not an object")
+            validate_observed_record(observation)
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BackendEvidenceError(
+                "systemd engine observation is malformed"
+            ) from error
+        if (
+            observation.get("attempt_id") != attempt_id
+            or not observation_proves_reaped_child(observation)
+            or type(observation.get("exit_code")) is not int
+            or observation.get("exit_code") != 0
+            or observation.get("signal") is not None
+        ):
+            raise BackendEvidenceError(
+                "systemd publication success requires a successful engine exit observation"
+            )
+        lifecycle = connection.execute(
+            """SELECT lifecycle.identity_digest AS lifecycle_identity_digest,
+                      lifecycle.stream_complete, lifecycle.cleanup_state,
+                      containment.identity_digest AS containment_identity_digest,
+                      containment.identity_json, backend.resolved_digest
+               FROM systemd_output_lifecycle AS lifecycle
+               JOIN execution_containment AS containment
+                 ON containment.job_id = lifecycle.job_id
+                AND containment.attempt_id = lifecycle.attempt_id
+               JOIN backend_executions AS backend
+                 ON backend.attempt_id = lifecycle.attempt_id
+               WHERE lifecycle.job_id = ? AND lifecycle.attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+        if lifecycle is None:
+            raise BackendEvidenceError(
+                "systemd publication success lacks durable output lifecycle evidence"
+            )
+        try:
+            identity = AttemptUnitIdentity.from_mapping(
+                json.loads(str(lifecycle["identity_json"]))
+            )
+            if (
+                identity.job_id != job_id
+                or identity.attempt_id != attempt_id
+                or identity.resolved_digest != lifecycle["resolved_digest"]
+                or identity_digest(identity) != lifecycle["containment_identity_digest"]
+                or lifecycle["lifecycle_identity_digest"]
+                != lifecycle["containment_identity_digest"]
+            ):
+                raise ValueError("output lifecycle identity does not match containment")
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise BackendEvidenceError(
+                "systemd output lifecycle identity is malformed"
+            ) from error
+        if lifecycle["stream_complete"] != 1 or lifecycle["cleanup_state"] != "active":
+            raise BackendEvidenceError(
+                "systemd publication success requires validated stream completion"
+            )
+
     def complete_execution(
         self, artifact: GenerationArtifact, timestamp: str, *,
         publication_id: str | None = None, sources: tuple[ArtifactSource, ...] = (),
@@ -3179,6 +3642,14 @@ END"""
                 attempt_owner_id, claim_epoch,
             ):
                 raise RuntimeError("attempt ownership, epoch, or current-job authority is stale")
+            is_systemd_attempt = (
+                attempt["containment_contract"]
+                == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+            )
+            if is_systemd_attempt:
+                self._require_systemd_success_evidence(
+                    connection, artifact.job_id, artifact.attempt_id
+                )
             connection.execute(
                 """INSERT INTO generation_artifacts (
                     artifact_id, job_id, attempt_id, output_slot_id, path, media_type,
@@ -3228,6 +3699,25 @@ END"""
                     attempt_owner_id=attempt_owner_id,
                     claim_epoch=claim_epoch,
                 )
+            if is_systemd_attempt:
+                pending_cleanup = connection.execute(
+                    """UPDATE systemd_output_lifecycle
+                       SET cleanup_state = 'pending', cleanup_validated = 1
+                       WHERE job_id = ? AND attempt_id = ?
+                         AND cleanup_state = 'active' AND stream_complete = 1
+                         AND identity_digest = (
+                             SELECT identity_digest FROM execution_containment
+                             WHERE job_id = ? AND attempt_id = ?
+                         )""",
+                    (
+                        artifact.job_id, artifact.attempt_id,
+                        artifact.job_id, artifact.attempt_id,
+                    ),
+                )
+                if pending_cleanup.rowcount != 1:
+                    raise BackendEvidenceError(
+                        "systemd scratch cleanup could not be queued with publication"
+                    )
             direct_child_termination_proven = self._attempt_termination_evidence(
                 connection, artifact.job_id, artifact.attempt_id
             )
@@ -3832,6 +4322,29 @@ END"""
                     job_id,
                 ),
             )
+            if (
+                attempt["containment_contract"]
+                == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                and resource_release_proven
+            ):
+                bound_containment = connection.execute(
+                    """SELECT identity_digest FROM execution_containment
+                       WHERE job_id = ? AND attempt_id = ?""",
+                    (job_id, attempt_id),
+                ).fetchone()
+                if bound_containment is not None:
+                    cleanup = connection.execute(
+                        """UPDATE systemd_output_lifecycle
+                           SET cleanup_state = 'pending', cleanup_validated = 0
+                           WHERE job_id = ? AND attempt_id = ?
+                             AND cleanup_state = 'active'
+                             AND identity_digest = ?""",
+                        (job_id, attempt_id, bound_containment["identity_digest"]),
+                    )
+                    if cleanup.rowcount != 1:
+                        raise RuntimeError(
+                            "systemd failed-attempt cleanup could not be queued"
+                        )
             resource_state = (
                 "quarantined"
                 if failure_class == "ambiguous" or not resource_release_proven

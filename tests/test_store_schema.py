@@ -227,14 +227,18 @@ def test_current_schema_reopens_and_preserves_queued_data(tmp_path: Path) -> Non
     assert reopened.inspect_admission(queued.job_id).admission.decision == "not_required"
 
 
-def test_schema_v8_contains_containment_and_cancellation_tables(tmp_path: Path) -> None:
+def test_schema_v9_contains_systemd_output_lifecycle(tmp_path: Path) -> None:
     database = tmp_path / "studio.sqlite3"
     SQLiteStore(database)
 
     objects = _objects(database)
-    assert _CURRENT_SCHEMA_VERSION == 8
+    assert _CURRENT_SCHEMA_VERSION == 9
     assert {"generation_batches", "generation_batch_slots"} <= objects["table"]
-    assert {"execution_containment", "execution_cancellations"} <= objects["table"]
+    assert {
+        "execution_containment",
+        "execution_cancellations",
+        "systemd_output_lifecycle",
+    } <= objects["table"]
     batch_guards = {
         SQLiteStore._writer_guard_sql(table, operation)[0]
         for table, operation in _WRITER_GUARDS
@@ -242,6 +246,33 @@ def test_schema_v8_contains_containment_and_cancellation_tables(tmp_path: Path) 
     }
     assert batch_guards
     assert batch_guards <= objects["trigger"]
+    lifecycle_guards = {
+        SQLiteStore._writer_guard_sql(table, operation)[0]
+        for table, operation in _WRITER_GUARDS
+        if table == "systemd_output_lifecycle"
+    }
+    assert lifecycle_guards
+    assert lifecycle_guards <= objects["trigger"]
+
+
+def test_schema_v8_database_is_rejected_without_migration(tmp_path: Path) -> None:
+    database = tmp_path / "schema-v8.sqlite3"
+    SQLiteStore(database)
+    with sqlite3.connect(database) as connection:
+        triggers = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+            "AND name LIKE '%systemd_output_lifecycle%'"
+        ).fetchall()
+        for (name,) in triggers:
+            connection.execute(f'DROP TRIGGER "{name}"')
+        connection.execute("DROP INDEX systemd_output_lifecycle_pending_idx")
+        connection.execute("DROP TABLE systemd_output_lifecycle")
+        connection.execute("PRAGMA user_version = 8")
+
+    _assert_rejected_without_mutation(
+        database,
+        "unsupported database schema version 8",
+    )
 
 
 def test_schema_v6_database_is_rejected_without_mutation(tmp_path: Path) -> None:

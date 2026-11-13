@@ -61,12 +61,32 @@ streams the broker-pinned output descriptor into the publisher's existing
 staging descriptor. The runner and broker do not publish artifacts or finalize
 jobs.
 
+The worker records validated stream completion against the immutable attempt
+identity. `complete_execution` checks that record, the successful engine
+observation, current publication authority, and matching root-ledger cgroup
+proof in the same transaction that commits the artifact. That transaction also
+queues validated scratch cleanup. The worker asks the broker to remove scratch
+only after the publisher returns from its durable commit. If cleanup fails or
+the worker exits before sending the acknowledgment, recovery retries a bounded
+set of durable cleanup records. Recovery skips cleanup while a publication is
+allocated or ready, leaving scratch available until reconciliation resolves it.
+
 Cancellation and worker-loss recovery fence publication first, stop the exact
 attempt unit, reconcile or revoke incomplete publication state, and verify
 whole-cgroup termination. They may release capacity without an engine
 observation when the immutable containment identity, termination proof,
 publication state, and existing resource authority checks are valid. Missing
 or uncertain containment evidence leaves the resource quarantined.
+
+Failed or canceled attempts queue unvalidated cleanup only after their terminal
+state, publication outcome, and whole-cgroup proof are durable. Recovery uses
+the immutable attempt identity and root-ledger proof, so a later attempt cannot
+redirect cleanup to a reused unit or cgroup.
+
+The job database schema is version 9 and records stream completion and pending
+scratch cleanup in `systemd_output_lifecycle`. The project has no migration
+path. Existing version-8 databases remain unchanged and cannot open under the
+new schema; their owner must select a new database path before deployment.
 
 The broker's software design is approved. Installing the privileged component,
 creating its service account, granting device or filesystem access, and

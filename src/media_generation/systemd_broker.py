@@ -855,40 +855,67 @@ class SystemdAttemptBroker:
         if identity.boot_id != _boot_id():
             return None
         properties = _unit_properties(identity.unit_name)
-        if properties is None:
-            return None
-        if (
+        if properties is None or (
             properties.get("InvocationID") != identity.invocation_id
             or properties.get("ControlGroup") != identity.cgroup_path
         ):
             return None
         cgroup = Path("/sys/fs/cgroup") / identity.cgroup_path.lstrip("/")
+        directory_fd: int | None = None
+        events_fd: int | None = None
         try:
-            observed = cgroup.stat(follow_symlinks=False)
-        except OSError:
-            return None
-        if (observed.st_dev, observed.st_ino) != (
-            identity.cgroup_device,
-            identity.cgroup_inode,
-        ):
-            return None
-        events_fd = os.open(
-            cgroup / "cgroup.events",
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-        try:
+            directory_fd = os.open(
+                cgroup,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            observed = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or (observed.st_dev, observed.st_ino)
+                != (identity.cgroup_device, identity.cgroup_inode)
+            ):
+                return None
+            events_fd = os.open(
+                "cgroup.events",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            pinned = os.fstat(directory_fd)
+            if (pinned.st_dev, pinned.st_ino) != (
+                identity.cgroup_device,
+                identity.cgroup_inode,
+            ):
+                return None
+            # StopUnit accepts only a unit name. Re-read the exact invocation
+            # immediately before calling it so a reused name is never stopped.
+            current_properties = _unit_properties(identity.unit_name)
+            if current_properties is None or (
+                current_properties.get("InvocationID") != identity.invocation_id
+                or current_properties.get("ControlGroup") != identity.cgroup_path
+            ):
+                return None
+            current = os.fstat(directory_fd)
+            if (current.st_dev, current.st_ino) != (
+                identity.cgroup_device,
+                identity.cgroup_inode,
+            ):
+                return None
             _stop_unit(identity.unit_name)
             if not _wait_cgroup_empty(
                 events_fd,
                 timeout=self.configuration.empty_timeout_seconds,
             ):
                 return None
-            # The FD was opened from the inode whose device/inode and systemd
-            # invocation were checked above. StopUnit may unload the unit or
-            # remove its path after the kernel reports this pinned cgroup empty.
+            # The event FD remains attached to the verified cgroup even if
+            # StopUnit unloads the unit or removes its pathname.
             return _record_pinned_empty_event(self.store, identity, events_fd)
+        except OSError:
+            return None
         finally:
-            os.close(events_fd)
+            if events_fd is not None:
+                os.close(events_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def _output_ack(self, request: Mapping[str, object]) -> dict[str, object]:
         identity = AttemptUnitIdentity.from_mapping(
@@ -898,18 +925,14 @@ class SystemdAttemptBroker:
         if type(validated) is not bool:
             raise ValueError("validated must be a boolean")
         self._require_identity(identity)
-        if not self.store.attempt_termination_proven(identity.job_id, identity.attempt_id):
-            raise BackendEvidenceError("scratch cleanup requires durable cgroup-empty proof")
-        if not validated:
-            attempt = self.store.current_attempt(identity.job_id)
-            if (
-                attempt is None
-                or attempt.get("attempt_id") != identity.attempt_id
-                or attempt.get("status") not in {"succeeded", "failed", "canceled"}
-            ):
-                raise BackendEvidenceError(
-                    "unvalidated scratch cleanup requires a terminal attempt"
-                )
+        if not self.store.systemd_output_cleanup_authorized(
+            identity, validated=validated
+        ):
+            raise BackendEvidenceError(
+                "validated scratch cleanup requires committed success evidence"
+                if validated
+                else "unvalidated scratch cleanup requires terminal attempt and reconciled publication"
+            )
         self._cleanup_pinned_scratch(identity)
         return {"ok": True, "acknowledged": True}
 
