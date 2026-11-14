@@ -8,7 +8,6 @@ import os
 import fcntl
 import threading
 import uuid
-from types import SimpleNamespace
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -679,19 +678,20 @@ class GenerationService:
         outcome = self._store.cancel_execution(job_id, _now())
         if outcome == "requested" and self._attempt_runner is not None:
             attempt = self._store.current_attempt(job_id)
+            claim_epoch = None if attempt is None else attempt.get("claim_epoch")
             if (
                 attempt is not None
                 and isinstance(attempt.get("owner_id"), str)
                 and isinstance(attempt.get("attempt_id"), str)
+                and type(claim_epoch) is int
+                and claim_epoch > 0
             ):
                 try:
                     outcome = self._attempt_runner.cancel_attempt(
-                        SimpleNamespace(
-                            job_id=job_id,
-                            attempt_id=attempt["attempt_id"],
-                            owner_id=attempt["owner_id"],
-                            claim_epoch=int(attempt["claim_epoch"]),
-                        )
+                        job_id=job_id,
+                        attempt_id=attempt["attempt_id"],
+                        owner_id=attempt["owner_id"],
+                        claim_epoch=claim_epoch,
                     )
                 except (OSError, RuntimeError):
                     # The durable fence remains in force. Recovery retries
@@ -748,16 +748,21 @@ class GenerationService:
         if attempt.get("containment_contract") != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT:
             return self._resource_result("attention_required")
         if not self._store.attempt_termination_proven(job_id, attempt_id):
-            if self._attempt_runner is None or not isinstance(attempt.get("owner_id"), str):
+            claim_epoch = attempt.get("claim_epoch")
+            if (
+                self._attempt_runner is None
+                or not isinstance(attempt.get("owner_id"), str)
+                or not isinstance(attempt.get("attempt_id"), str)
+                or type(claim_epoch) is not int
+                or claim_epoch < 1
+            ):
                 return self._resource_result("attention_required")
             try:
                 self._attempt_runner.cancel_attempt(
-                    SimpleNamespace(
-                        job_id=job_id,
-                        attempt_id=attempt_id,
-                        owner_id=attempt["owner_id"],
-                        claim_epoch=int(attempt["claim_epoch"]),
-                    )
+                    job_id=job_id,
+                    attempt_id=attempt_id,
+                    owner_id=attempt["owner_id"],
+                    claim_epoch=claim_epoch,
                 )
             except (OSError, RuntimeError, ValueError):
                 return self._resource_result("attention_required")
@@ -844,15 +849,14 @@ class GenerationService:
             and self._attempt_runner is not None
         ):
             owner_id = attempt.get("owner_id")
-            if isinstance(owner_id, str):
+            claim_epoch = attempt.get("claim_epoch")
+            if isinstance(owner_id, str) and type(claim_epoch) is int and claim_epoch > 0:
                 try:
                     self._attempt_runner.cancel_attempt(
-                        SimpleNamespace(
-                            job_id=job_id,
-                            attempt_id=attempt_id,
-                            owner_id=owner_id,
-                            claim_epoch=int(attempt["claim_epoch"]),
-                        )
+                        job_id=job_id,
+                        attempt_id=attempt_id,
+                        owner_id=owner_id,
+                        claim_epoch=claim_epoch,
                     )
                 except (OSError, RuntimeError, ValueError):
                     # The recovery fence is durable; missing broker evidence

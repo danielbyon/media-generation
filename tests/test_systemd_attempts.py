@@ -137,6 +137,7 @@ class _SyntheticSystemdAttemptRunner(SystemdAttemptRunner):
         self.scratch_directory = None
         self.scratch_directories: dict[str, Path] = {}
         self.acknowledgements: list[bool] = []
+        self.cancel_requests: list[tuple[str, str, str, int]] = []
 
     def prepare_attempt(self, claim) -> Path:
         directory = self.scratch_root / claim.attempt_id
@@ -269,14 +270,18 @@ class _SyntheticSystemdAttemptRunner(SystemdAttemptRunner):
         if scratch is not None:
             shutil.rmtree(scratch, ignore_errors=True)
 
-    def cancel_attempt(self, claim) -> str:
+    def cancel_attempt(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str,
+        claim_epoch: int,
+    ) -> str:
         assert self.store is not None
-        identity = self.store.attempt_containment_identity(
-            claim.job_id, claim.attempt_id
-        )
-        if identity is not None and self.store.attempt_termination_proven(
-            claim.job_id, claim.attempt_id
-        ):
+        self.cancel_requests.append((job_id, attempt_id, owner_id, claim_epoch))
+        identity = self.store.attempt_containment_identity(job_id, attempt_id)
+        if identity is not None and self.store.attempt_termination_proven(job_id, attempt_id):
             return "acknowledged"
         return "requested"
 
@@ -508,13 +513,6 @@ def _install_valid_broker_host_mocks(
     monkeypatch.setattr(
         broker_module.pwd, "getpwall", lambda: primary_users
     )
-    monkeypatch.setattr(
-        broker_module,
-        "_complete_account_members",
-        lambda: tuple((entry.pw_name, entry.pw_gid) for entry in primary_users),
-        raising=False,
-    )
-
     def fake_group(gid: int) -> SimpleNamespace:
         return SimpleNamespace(gr_gid=gid, gr_mem=sorted(groups.get(gid, set())))
 
@@ -581,6 +579,32 @@ def test_broker_rejects_nss_account_uid_substitution(
         configuration.validate_host_paths()
 
 
+@pytest.mark.parametrize("group_field", ("worker_gid", "scratch_gid", "render_gid"))
+def test_broker_rejects_mismatched_keyed_group_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    group_field: str,
+) -> None:
+    configuration = _install_valid_broker_host_mocks(tmp_path, monkeypatch)
+    gid = (
+        configuration.runner_supplementary_gids[-1]
+        if group_field == "render_gid"
+        else getattr(configuration, group_field)
+    )
+    original_getgrgid = broker_module.grp.getgrgid
+
+    def substituted_group(requested_gid: int) -> SimpleNamespace:
+        group = original_getgrgid(requested_gid)
+        if requested_gid == gid:
+            return SimpleNamespace(gr_gid=requested_gid + 1, gr_mem=group.gr_mem)
+        return group
+
+    monkeypatch.setattr(broker_module.grp, "getgrgid", substituted_group)
+
+    with pytest.raises(ValueError, match="keyed group identity"):
+        configuration.validate_host_paths()
+
+
 @pytest.mark.parametrize(
     "ledger_exists", (False, True), ids=("first-start", "existing-ledger")
 )
@@ -615,128 +639,53 @@ def test_broker_validates_evidence_directory_before_optional_ledger_file(
     assert (ledger_path in checked_paths) is ledger_exists
 
 
-@pytest.mark.parametrize(
-    ("group_field", "member_source"),
-    [
-        ("runner_gid", "supplementary"),
-        ("model_read_gid", "supplementary"),
-        ("scratch_gid", "supplementary"),
-        ("worker_gid", "supplementary"),
-        ("runner_gid", "primary"),
-        ("model_read_gid", "primary"),
-        ("scratch_gid", "primary"),
-        ("worker_gid", "primary"),
-    ],
-    ids=[
-        "runner-extra-supplementary",
-        "model-read-extra-supplementary",
-        "scratch-extra-supplementary",
-        "worker-extra-supplementary",
-        "runner-extra-primary",
-        "model-read-extra-primary",
-        "scratch-extra-primary",
-        "worker-extra-primary",
-    ],
-)
-def test_broker_rejects_unapproved_member_of_private_group(
+def test_broker_accepts_apex_nss_sources_without_global_enumeration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    group_field: str,
-    member_source: str,
-) -> None:
-    configuration = _broker_configuration(tmp_path)
-    gid = getattr(configuration, group_field)
-    configuration = _install_valid_broker_host_mocks(
-        tmp_path,
-        monkeypatch,
-        configuration=configuration,
-        extra_group_member_gid=gid if member_source == "supplementary" else None,
-        extra_primary_member_gid=gid if member_source == "primary" else None,
-    )
-
-    with pytest.raises(PermissionError, match="group membership"):
-        configuration.validate_host_paths()
-
-
-def test_broker_fails_closed_when_protected_group_membership_is_unavailable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configuration = _install_valid_broker_host_mocks(tmp_path, monkeypatch)
-
-    def unavailable_accounts():
-        raise OSError("NSS account enumeration failed")
-
-    monkeypatch.setattr(
-        broker_module, "_complete_account_members", unavailable_accounts, raising=False
-    )
-
-    with pytest.raises(PermissionError, match="host group membership cannot be verified"):
-        configuration.validate_host_paths()
-
-
-@pytest.mark.parametrize(
-    "enumerated_accounts",
-    [[], [SimpleNamespace(pw_name="runner", pw_gid=970)]],
-    ids=["empty-getpwall", "partial-getpwall"],
-)
-def test_broker_account_primary_group_check_uses_complete_passwd_file(
-    monkeypatch: pytest.MonkeyPatch,
-    enumerated_accounts: list[SimpleNamespace],
-) -> None:
-    passwd_text = """\
-root:x:0:0:root:/root:/bin/sh
-runner:x:970:970:runner:/nonexistent:/usr/sbin/nologin
-worker:x:972:972:worker:/nonexistent:/usr/sbin/nologin
-unapproved:x:1888:971:unapproved:/nonexistent:/usr/sbin/nologin
-"""
     monkeypatch.setattr(broker_module.sys, "platform", "linux")
-    monkeypatch.setattr(broker_module.pwd, "getpwall", lambda: enumerated_accounts)
     monkeypatch.setattr(
-        broker_module,
-        "_read_protected_nss_file",
-        lambda path: (
-            "passwd: files\ngroup: files\n"
-            if path.name == "nsswitch.conf"
-            else passwd_text
-        ),
-        raising=False,
+        broker_module.pwd,
+        "getpwall",
+        lambda: (_ for _ in ()).throw(OSError("global account enumeration unavailable")),
     )
 
-    members = broker_module._complete_account_members()
+    def unavailable_global_file(_path: Path) -> str:
+        raise OSError("global account enumeration unavailable")
 
-    assert members == (
-        ("root", 0),
-        ("runner", 970),
-        ("worker", 972),
-        ("unapproved", 971),
-    )
-    assert {name for name, gid in members if gid == 971} == {"unapproved"}
-
-
-def test_broker_rejects_incomplete_nss_sources_for_protected_groups(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(broker_module.sys, "platform", "linux")
     monkeypatch.setattr(
         broker_module,
         "_read_protected_nss_file",
         lambda path: (
             "passwd: files systemd sss\ngroup: files systemd sss\n"
             if path.name == "nsswitch.conf"
-            else "runner:x:970:970:runner:/nonexistent:/usr/sbin/nologin\n"
+            else unavailable_global_file(path)
         ),
         raising=False,
     )
 
-    with pytest.raises(PermissionError, match="complete local NSS sources"):
-        broker_module._complete_account_members()
+    configuration.validate_host_paths()
 
 
-def test_broker_configuration_surfaces_external_nss_membership_block(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("member_source", ("supplementary", "primary"))
+def test_broker_ignores_unrelated_host_group_membership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    member_source: str,
 ) -> None:
-    complete_account_members = broker_module._complete_account_members
-    configuration = _install_valid_broker_host_mocks(tmp_path, monkeypatch)
+    configuration = _broker_configuration(tmp_path)
+    configuration = _install_valid_broker_host_mocks(
+        tmp_path,
+        monkeypatch,
+        configuration=configuration,
+        extra_group_member_gid=(
+            configuration.scratch_gid if member_source == "supplementary" else None
+        ),
+        extra_primary_member_gid=(
+            configuration.scratch_gid if member_source == "primary" else None
+        ),
+    )
     monkeypatch.setattr(broker_module.sys, "platform", "linux")
     monkeypatch.setattr(
         broker_module,
@@ -746,50 +695,157 @@ def test_broker_configuration_surfaces_external_nss_membership_block(
             if path.name == "nsswitch.conf"
             else ""
         ),
-    )
-    monkeypatch.setattr(
-        broker_module, "_complete_account_members", complete_account_members
+        raising=False,
     )
 
-    with pytest.raises(PermissionError, match="complete local NSS sources"):
-        configuration.validate_host_paths()
+    configuration.validate_host_paths()
 
 
-def test_broker_rejects_primary_group_member_hidden_by_getpwall(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+
+def test_broker_checks_actual_runner_credentials_before_binding_containment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    complete_account_members = broker_module._complete_account_members
-    configuration = _install_valid_broker_host_mocks(tmp_path, monkeypatch)
-    passwd_text = """\
-root:x:0:0:root:/root:/bin/sh
-engine-runner:x:2301:2301:runner:/nonexistent:/sbin/nologin
-generation-worker:x:2300:2300:worker:/nonexistent:/sbin/nologin
-unapproved:x:2400:2303:user:/nonexistent:/sbin/nologin
-"""
-    monkeypatch.setattr(broker_module.sys, "platform", "linux")
+    configuration = _broker_configuration(tmp_path)
+    identity = _identity()
+    cgroup_directory = tmp_path / "attempt-cgroup"
+    cgroup_directory.mkdir()
+    (cgroup_directory / "cgroup.events").write_text("populated 1\n", encoding="ascii")
+    bound: list[AttemptUnitIdentity] = []
+    credential_checks: list[tuple[int, dict[str, object]]] = []
+
+    class Store:
+        @staticmethod
+        def bind_attempt_containment(observed: AttemptUnitIdentity, *, timestamp: str) -> None:
+            assert timestamp
+            bound.append(observed)
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    expected_properties = {
+        "User": str(configuration.runner_uid),
+        "Group": str(configuration.runner_gid),
+        "KillMode": "control-group",
+        "Delegate": "no",
+        "RemainAfterExit": "yes",
+        "DevicePolicy": "closed",
+        "ProtectSystem": "strict",
+        "ProtectHome": "read-only",
+        "NoNewPrivileges": "yes",
+        "InvocationID": identity.invocation_id,
+        "ControlGroup": identity.cgroup_path,
+        "MainPID": "4242",
+    }
     monkeypatch.setattr(
-        broker_module.pwd,
-        "getpwall",
-        lambda: [
-            SimpleNamespace(pw_name="engine-runner", pw_gid=2301),
-            SimpleNamespace(pw_name="generation-worker", pw_gid=2300),
-        ],
+        broker_module,
+        "_unit_properties",
+        lambda _unit: expected_properties,
     )
     monkeypatch.setattr(
         broker_module,
-        "_read_protected_nss_file",
-        lambda path: (
-            "passwd: files\ngroup: files\n"
-            if path.name == "nsswitch.conf"
-            else passwd_text
-        ),
+        "_require_process_credentials",
+        lambda pid, **kwargs: credential_checks.append((pid, kwargs)),
+        raising=False,
     )
     monkeypatch.setattr(
-        broker_module, "_complete_account_members", complete_account_members
+        broker_module,
+        "_boot_id",
+        lambda: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    )
+    real_open = os.open
+
+    def open_cgroup(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is None and os.fspath(path) == f"/sys/fs/cgroup{identity.cgroup_path}":
+            return real_open(cgroup_directory, flags, mode)
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(broker_module.os, "open", open_cgroup)
+    process = SimpleNamespace(poll=lambda: None)
+
+    observed, events_fd = broker._wait_for_containment(
+        process,
+        identity.unit_name,
+        identity.job_id,
+        identity.attempt_id,
+        identity.owner_id,
+        identity.claim_epoch,
+        identity.resolved_digest,
+    )
+    os.close(events_fd)
+
+    assert observed.unit_name == identity.unit_name
+    assert bound == [observed]
+    assert credential_checks == [
+        (
+            4242,
+            {
+                "uid": configuration.runner_uid,
+                "gid": configuration.runner_gid,
+                "supplementary_gids": frozenset(
+                    configuration.runner_supplementary_gids
+                ),
+                "cgroup_path": identity.cgroup_path,
+            },
+        )
+    ]
+
+
+def test_process_credentials_parser_reads_kernel_ids_and_groups(
+    tmp_path: Path,
+) -> None:
+    proc_root = tmp_path / "proc"
+    process_directory = proc_root / "4242"
+    process_directory.mkdir(parents=True)
+    (process_directory / "status").write_text(
+        "Name:\tengine-runner\n"
+        "Pid:\t4242\n"
+        "Uid:\t970\t970\t970\t970\n"
+        "Gid:\t970\t970\t970\t970\n"
+        "Groups:\t971 973 990\n",
+        encoding="ascii",
+    )
+    (process_directory / "cgroup").write_text(
+        "0::/system.slice/media-generation-attempt-1234.service\n",
+        encoding="ascii",
+    )
+    reader = getattr(broker_module, "_read_process_credentials", None)
+    assert callable(reader)
+
+    credentials = reader(4242, proc_root=proc_root)
+
+    assert credentials == (
+        (970, 970, 970, 970),
+        (970, 970, 970, 970),
+        frozenset({971, 973, 990}),
+        "/system.slice/media-generation-attempt-1234.service",
     )
 
-    with pytest.raises(PermissionError, match="model-read group membership differs"):
-        configuration.validate_host_paths()
+
+def test_broker_rejects_actual_process_groups_outside_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        broker_module,
+        "_read_process_credentials",
+        lambda _pid: (
+            (970, 970, 970, 970),
+            (970, 970, 970, 970),
+            frozenset({971, 973, 990, 44}),
+            "/system.slice/media-generation-attempt-1234.service",
+        ),
+    )
+
+    with pytest.raises(PermissionError, match="supplementary groups"):
+        broker_module._require_process_credentials(
+            4242,
+            uid=970,
+            gid=970,
+            supplementary_gids=frozenset({971, 973, 990}),
+            cgroup_path="/system.slice/media-generation-attempt-1234.service",
+        )
 
 
 def test_broker_rejects_default_acl_on_scratch_root(
@@ -1043,12 +1099,17 @@ def test_broker_authenticates_worker_socket_peer(
     if not sys.platform.startswith("linux"):
         pytest.skip("the broker uses Linux AF_UNIX/SOCK_SEQPACKET sockets")
     broker = object.__new__(SystemdAttemptBroker)
-    broker.configuration = SimpleNamespace(worker_uid=2300, worker_gid=2300)
+    broker.configuration = SimpleNamespace(
+        worker_uid=2300, worker_gid=2300, model_read_gid=2303
+    )
     validation_calls: list[bytes] = []
     monkeypatch.setattr(
         broker_module,
         "_peer_credentials",
         lambda _connection: (42, peer_uid, peer_gid),
+    )
+    monkeypatch.setattr(
+        broker_module, "_require_process_credentials", lambda *_args, **_kwargs: None
     )
     monkeypatch.setattr(
         broker_module,
@@ -1082,7 +1143,9 @@ def test_broker_peer_authorization_uses_linux_credential_field_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     broker = object.__new__(SystemdAttemptBroker)
-    broker.configuration = SimpleNamespace(worker_uid=2300, worker_gid=2300)
+    broker.configuration = SimpleNamespace(
+        worker_uid=2300, worker_gid=2300, model_read_gid=2303
+    )
     responses: list[dict[str, object]] = []
 
     class PeerConnection:
@@ -1103,6 +1166,9 @@ def test_broker_peer_authorization_uses_linux_credential_field_order(
         lambda _connection: (42, 2300, 2300),
     )
     monkeypatch.setattr(
+        broker_module, "_require_process_credentials", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
         broker_module, "_validated_request", lambda _packet: ("output_ack", {})
     )
     monkeypatch.setattr(
@@ -1119,6 +1185,72 @@ def test_broker_peer_authorization_uses_linux_credential_field_order(
     broker._serve_connection(connection)
 
     assert responses == [{"ok": True, "acknowledged": True}]
+
+
+def test_broker_rejects_worker_peer_with_unexpected_process_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        worker_uid=2300,
+        worker_gid=2300,
+        model_read_gid=2303,
+    )
+    validation_calls: list[bytes] = []
+    responses: list[dict[str, object]] = []
+
+    class PeerConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def recvmsg(_limit):
+            return b"request", (), 0, None
+
+    def reject_process_groups(pid: int, **kwargs: object) -> None:
+        assert pid == 42
+        assert kwargs == {
+            "uid": 2300,
+            "gid": 2300,
+            "supplementary_gids": frozenset({2303}),
+        }
+        raise PermissionError("process supplementary groups differ from broker policy")
+
+    monkeypatch.setattr(
+        broker_module,
+        "_peer_credentials",
+        lambda _connection: (42, 2300, 2300),
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_require_process_credentials",
+        reject_process_groups,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_validated_request",
+        lambda packet: (validation_calls.append(packet) or ("output_ack", {})),
+    )
+    monkeypatch.setattr(
+        broker,
+        "_output_ack",
+        lambda _request: {"ok": True, "acknowledged": True},
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_send",
+        lambda _connection, response, **_kwargs: responses.append(dict(response)),
+    )
+
+    broker._serve_connection(PeerConnection())
+
+    assert validation_calls == []
+    assert len(responses) == 1
+    assert responses[0].get("ok") is False
 
 
 def test_systemd_attempt_runner_launches_engine_from_root_working_directory(
@@ -1422,21 +1554,9 @@ def test_broker_rejects_runner_database_groups_outside_allowlist(
         lambda uid: runner if uid == configuration.runner_uid else worker,
     )
     monkeypatch.setattr(
-        broker_module.pwd, "getpwall", lambda: [runner, worker]
-    )
-    monkeypatch.setattr(
-        broker_module,
-        "_complete_account_members",
-        lambda: ((runner.pw_name, runner.pw_gid), (worker.pw_name, worker.pw_gid)),
-        raising=False,
-    )
-    monkeypatch.setattr(
         broker_module.grp,
         "getgrgid",
         lambda gid: SimpleNamespace(gr_gid=gid, gr_mem=group_members.get(gid, [])),
-    )
-    monkeypatch.setattr(
-        broker_module.grp, "getgrall", lambda: [SimpleNamespace(gr_gid=0, gr_mem=[]) ]
     )
     monkeypatch.setattr(
         broker_module.os,
@@ -1448,7 +1568,7 @@ def test_broker_rejects_runner_database_groups_outside_allowlist(
         ),
     )
 
-    with pytest.raises(ValueError, match="supplementary groups outside the broker allowlist"):
+    with pytest.raises(ValueError, match="runner account groups differ from broker policy"):
         configuration.validate_host_paths()
 
 
@@ -1478,23 +1598,9 @@ def test_broker_rejects_worker_supplementary_groups(
         lambda uid: runner if uid == configuration.runner_uid else worker,
     )
     monkeypatch.setattr(
-        broker_module.pwd, "getpwall", lambda: [runner, worker]
-    )
-    monkeypatch.setattr(
-        broker_module,
-        "_complete_account_members",
-        lambda: ((runner.pw_name, runner.pw_gid), (worker.pw_name, worker.pw_gid)),
-        raising=False,
-    )
-    monkeypatch.setattr(
         broker_module.grp,
         "getgrgid",
         lambda gid: SimpleNamespace(gr_gid=gid, gr_mem=group_members.get(gid, [])),
-    )
-    monkeypatch.setattr(
-        broker_module,
-        "_require_runner_group_allowlist",
-        lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
         broker_module.os,
@@ -1506,7 +1612,7 @@ def test_broker_rejects_worker_supplementary_groups(
         ),
     )
 
-    with pytest.raises(ValueError, match="worker account has supplementary groups"):
+    with pytest.raises(ValueError, match="worker account groups differ from broker policy"):
         configuration.validate_host_paths()
 
 
@@ -3278,19 +3384,25 @@ def test_systemd_evidence_ledger_requires_worker_group_read_access(
         ledger.validate_worker_access(worker_gid)
 
 
-def test_worker_scratch_membership_uses_nss_group_lookup(
+def test_worker_keyed_group_lookup_rejects_unexpected_scratch_membership(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user = SimpleNamespace(pw_name="media-worker", pw_gid=81230)
     scratch_gid = 81231
-    monkeypatch.setattr(broker_module.grp, "getgrall", lambda: [])
+    model_read_gid = 81232
     monkeypatch.setattr(
         broker_module.os,
         "getgrouplist",
-        lambda name, primary_gid: [primary_gid, scratch_gid],
+        lambda name, primary_gid: [primary_gid, scratch_gid, model_read_gid],
     )
 
-    assert broker_module._member_of_group(user, scratch_gid)
+    with pytest.raises(PermissionError, match="account groups differ from broker policy"):
+        broker_module._account_group_ids(
+            user.pw_name,
+            primary_gid=user.pw_gid,
+            expected=frozenset({user.pw_gid, model_read_gid}),
+            label="worker",
+        )
 
 
 def test_worker_scratch_membership_fails_closed_when_nss_lookup_fails(
@@ -3303,8 +3415,13 @@ def test_worker_scratch_membership_fails_closed_when_nss_lookup_fails(
 
     monkeypatch.setattr(broker_module.os, "getgrouplist", unavailable)
 
-    with pytest.raises(ValueError, match="worker supplementary group membership"):
-        broker_module._member_of_group(user, 81231)
+    with pytest.raises(PermissionError, match="supplementary group membership cannot be verified"):
+        broker_module._account_group_ids(
+            user.pw_name,
+            primary_gid=user.pw_gid,
+            expected=frozenset({user.pw_gid, 81232}),
+            label="worker",
+        )
 
 
 def test_systemd_runner_rejects_comfyui_adapter(
@@ -3961,6 +4078,14 @@ def test_cancel_after_worker_loss_fence_preserves_recovery_convergence(
 
     cancellation = service.cancel(queued.job_id)
     assert cancellation["outcome"] == "acknowledged"
+    assert runner.cancel_requests == [
+        (
+            queued.job_id,
+            attempt["attempt_id"],
+            attempt["owner_id"],
+            claim_epoch,
+        )
+    ]
     assert service.get_provenance(queued.job_id)["execution"]["fence_epoch"] == (
         claim_epoch + 1
     )
@@ -4015,28 +4140,24 @@ def test_containment_event_descriptor_stays_bound_to_opened_cgroup(
     cgroup_path = Path("/sys/fs/cgroup") / template.cgroup_path.lstrip("/")
     original_cgroup = tmp_path / "original-cgroup"
     replacement_cgroup = tmp_path / "replacement-cgroup"
+    pinned_cgroup = tmp_path / "pinned-cgroup"
     original_cgroup.mkdir()
     replacement_cgroup.mkdir()
     (original_cgroup / "cgroup.events").write_text("populated 0\n", encoding="ascii")
     (replacement_cgroup / "cgroup.events").write_text("populated 1\n", encoding="ascii")
-    original_stat = Path.stat
+    original_stat = os.stat
     original_open = os.open
-
-    def fake_stat(path: Path, *, follow_symlinks: bool = True):
-        if path == cgroup_path:
-            return original_stat(original_cgroup, follow_symlinks=follow_symlinks)
-        return original_stat(path, follow_symlinks=follow_symlinks)
 
     def fake_open(path, flags, *args, dir_fd=None):
         if dir_fd is not None:
             return original_open(path, flags, *args, dir_fd=dir_fd)
         if Path(path) == cgroup_path:
-            return original_open(original_cgroup, flags, *args)
-        if Path(path) == cgroup_path / "cgroup.events":
-            return original_open(replacement_cgroup / "cgroup.events", flags, *args)
+            descriptor = original_open(original_cgroup, flags, *args)
+            original_cgroup.rename(pinned_cgroup)
+            replacement_cgroup.rename(original_cgroup)
+            return descriptor
         return original_open(path, flags, *args)
 
-    monkeypatch.setattr(Path, "stat", fake_stat)
     monkeypatch.setattr(broker_module.os, "open", fake_open)
     monkeypatch.setattr(
         broker_module,
@@ -4044,13 +4165,19 @@ def test_containment_event_descriptor_stays_bound_to_opened_cgroup(
         lambda _unit: {
             "InvocationID": template.invocation_id,
             "ControlGroup": template.cgroup_path,
+            "MainPID": "4242",
         },
     )
     monkeypatch.setattr(broker_module, "_validate_unit_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        broker_module, "_require_process_credentials", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(broker_module, "_boot_id", lambda: template.boot_id)
     broker = object.__new__(SystemdAttemptBroker)
     broker.configuration = SimpleNamespace(
-        runner_uid=template.runner_uid, runner_gid=template.runner_gid
+        runner_uid=template.runner_uid,
+        runner_gid=template.runner_gid,
+        runner_supplementary_gids=(971, 973, 990),
     )
     broker.store = SimpleNamespace(bind_attempt_containment=lambda *_args, **_kwargs: None)
 
@@ -4065,8 +4192,8 @@ def test_containment_event_descriptor_stays_bound_to_opened_cgroup(
     )
     try:
         assert (identity.cgroup_device, identity.cgroup_inode) == (
-            original_stat(original_cgroup).st_dev,
-            original_stat(original_cgroup).st_ino,
+            original_stat(pinned_cgroup).st_dev,
+            original_stat(pinned_cgroup).st_ino,
         )
         assert broker_module._read_populated(events_fd) == 0
     finally:

@@ -388,15 +388,22 @@ class SystemdAttemptRunner:
                 os.close(output_fd)
             raise
 
-    def cancel_attempt(self, claim: object) -> str:
+    def cancel_attempt(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str,
+        claim_epoch: int,
+    ) -> str:
         """Request stop for the exact current attempt; never select a unit by prefix."""
         response, descriptor = self._request(
             {
                 "operation": "cancel",
-                "job_id": getattr(claim, "job_id"),
-                "attempt_id": getattr(claim, "attempt_id"),
-                "owner_id": getattr(claim, "owner_id"),
-                "claim_epoch": getattr(claim, "claim_epoch"),
+                "job_id": job_id,
+                "attempt_id": attempt_id,
+                "owner_id": owner_id,
+                "claim_epoch": claim_epoch,
             }
         )
         if descriptor is not None:

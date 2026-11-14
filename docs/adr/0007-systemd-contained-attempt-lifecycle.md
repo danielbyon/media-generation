@@ -1,6 +1,6 @@
 # ADR 0007: Systemd-contained GPU attempt lifecycle
 
-Status: Accepted software design; APEX deployment authorization is pending
+Status: Accepted software design; trusted-workstation threat model approved by owner
 
 ## Context
 
@@ -13,6 +13,53 @@ after the worker stops owning publication authority.
 The worker must keep ownership of image validation and publication. A runner
 that can publish artifacts or finalize jobs would create a second authority
 path and make cancellation races harder to fence.
+
+## APEX workstation threat model
+
+APEX is a trusted, single-owner workstation. Its owner, administrators, and OS
+account configuration are trusted. Hostile local accounts and arbitrary
+third-party code execution are outside the supported threat model.
+
+The worker and inference engine may be faulty or compromised. The worker stays
+in its dedicated non-root account and reaches systemd only through the
+kernel-authenticated broker socket. The engine runs under the separate
+non-root runner account inside one systemd cgroup with fixed device, filesystem,
+capability, and namespace restrictions. The worker remains the only publisher;
+the runner cannot access the worker database or artifact directory.
+
+The broker checks keyed account and group records for the configured service
+identities. It checks each account's NSS group lookup against its exact policy,
+then verifies the runner's live UID, GID, supplementary groups, and cgroup from
+the kernel before binding containment. For each worker request, it checks
+SO_PEERCRED and the peer's live UID, GID, and supplementary groups. It does not
+enumerate every host account or require protected groups to have no other
+members.
+
+Exhaustive NSS enumeration was rejected because the approved threat model
+trusts the owner-administered account database, while enumeration across
+multiple NSS providers is incomplete on this host and can change as providers
+start or refresh. Global group exclusivity would add that same host-wide
+dependency without restricting the worker or engine more than checking their
+actual credentials. The broker instead rejects unexpected groups on the two
+service identities and verifies the credentials systemd and the kernel gave
+each process.
+
+The accepted residual risk is that a trusted administrator can change NSS,
+service groups, device ownership, or protected paths. Another trusted local
+account can receive access through a shared group such as `render`, scratch,
+or model-read. The worker must write its job database and publication output;
+a compromised worker can misuse those role-level rights. It has no direct GPU
+device or runner-scratch access, and the broker accepts only authenticated,
+attempt-bound operations. The engine runs under the separate runner identity,
+which can use the allowlisted GPU devices and read-only model/runtime paths
+and can damage its own attempt scratch. The runner has no database or artifact
+write access and cannot choose arbitrary systemd operations or escape
+whole-cgroup cancellation.
+
+Reassess this decision before supporting hostile local users, multi-owner
+operation, untrusted third-party execution, or an administrator outside the
+trusted boundary. Reassessment must also cover any change that gives another
+account access to the private scratch or model-read groups.
 
 ## Decision
 
@@ -37,8 +84,9 @@ mismatch is not termination proof.
 An existing user manager was not selected because APEX has not been qualified
 to provide the required system-service identity, GPU device allowlist, cgroup
 policy, and durable unit lifecycle. The root broker keeps those controls in
-one narrowly constrained component; installing it remains a separate owner
-decision.
+one narrowly constrained component. The owner has authorized the isolated
+installation, but provisioning remains gated on independent source review and
+the final security review of the candidate.
 
 The attempt runner owns `ProcessSupervisor` and launches the engine as its
 direct child. It records the existing launch and engine observation facts
@@ -88,13 +136,10 @@ scratch cleanup in `systemd_output_lifecycle`. The project has no migration
 path. Existing version-8 databases remain unchanged and cannot open under the
 new schema; their owner must select a new database path before deployment.
 
-The broker's software design is approved. Installing the privileged component,
-creating its service account, granting device or filesystem access, and
-provisioning the root-owned evidence ledger, or changing systemd configuration
-on APEX require separate owner authorization. That action includes granting
-the worker group read access to the ledger and verifying its protected parent
-directory. APEX remains unqualified until the owner authorizes installation
-and host-specific checks are complete.
+The owner has approved the isolated APEX installation under this threat model.
+The source and security review gate must pass before provisioning. Installation
+uses a manual broker start; the service is not enabled at boot. Host-specific
+identity, permission, systemd, and real-engine checks remain required.
 
 ## Consequences
 
@@ -107,10 +152,12 @@ and host-specific checks are complete.
   verified.
 - The root broker is part of the trusted computing base and needs its own
   deployment review and host qualification.
-- APEX qualification remains blocked until its owner authorizes installation
-  and verifies the configured identities, ROCm and GPU device groups, model and
-  input roots, root-owned broker path ancestors, scratch access, broker database
-  access, and systemd cgroup behavior.
+- NSS account and group enumeration is not a startup requirement. Keyed service
+  identity checks and live kernel credential checks remain mandatory.
+- APEX qualification remains incomplete until the approved source is installed
+  and the configured identities, ROCm and GPU device groups, model and input
+  roots, broker paths, scratch access, database access, and systemd cgroup
+  behavior are verified.
 
 ## Rejected alternatives
 
@@ -119,4 +166,6 @@ commands, identities, or unit properties. A unit-name-prefix check does not
 constrain those operations. Process-group signalling also cannot prove that all
 processes in a GPU attempt have terminated. A separate publisher in the runner
 would duplicate artifact authority and weaken the existing cancellation and
-publication fence.
+publication fence. Exhaustive host NSS enumeration and protected-group
+exclusivity were also rejected under the trusted-workstation assumption; exact
+keyed identity checks and actual process credentials remain required.

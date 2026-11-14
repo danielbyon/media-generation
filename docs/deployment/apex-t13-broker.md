@@ -2,7 +2,8 @@
 
 This file records a host-specific deployment proposal for T13. It is not an
 installation record. The owner has authorized the isolated APEX installation;
-execution still waits for the NSS identity checks and final technical review.
+execution waits for independent source review and the final security review of
+the candidate. No privileged APEX installation has been performed.
 
 ## 1. Read-only host facts
 
@@ -56,21 +57,24 @@ device modes, immediately before any owner-authorized provisioning. Keep the
 runner out of GID 44; do not change the existing `daniel` membership.
 
 The current `/etc/nsswitch.conf` uses `passwd: files systemd sss` and
-`group: files systemd sss`. The Linux broker requires complete membership
-evidence, including every primary GID. Its current verifier reads the protected
-`/etc/passwd` file and refuses startup when NSS adds other sources, because
-`getpwall()` can return a partial list without reporting an enumeration error.
+`group: files systemd sss`. A read-only check on 2026-11-13 found that global
+account and group enumeration did not return records from every configured NSS
+provider. This is recorded as a host fact, not a deployment blocker under the
+owner-approved trusted-workstation model. The broker does not require
+files-only NSS sources or exhaustive host-wide enumeration.
 
 A read-only check on 2026-11-13 found `libnss_sss.so.2` installed,
 `sssd.service` enabled but inactive, no `/etc/sssd/sssd.conf`, and no `sssctl`
 command. `getent -s sss passwd` and `getent -s sss group` each exited zero with
 no entries. The `systemd` source also returned no entries during enumeration,
-while keyed lookups still resolved its synthetic `root` and `nobody` records.
-Those empty enumerations do not establish complete membership. No scoped
-identity check has been established for this NSS configuration, so broker
-startup and APEX qualification remain blocked. Do not change
-`/etc/nsswitch.conf` or relax the membership checks. A reviewed identity design
-must prove complete protected-group membership before deployment.
+while keyed lookups resolved its synthetic `root` and `nobody` records. Under
+the approved model, the broker instead validates keyed records for the exact
+runner and worker IDs, checks the exact expected groups for those two service
+accounts, and verifies the live process credentials supplied by the kernel.
+It does not require protected groups to exclude every other host account.
+Leave `/etc/nsswitch.conf` unchanged. The host administrator and account
+configuration are trusted; hostile local accounts and arbitrary third-party
+execution are outside the supported threat model.
 
 The proposed service accounts are not installed, so effective access has not
 been tested under UIDs 970 and 972. The owner checks in section 6 cover model,
@@ -92,13 +96,16 @@ confirm that no unrelated inference workload is competing for the GPU.
 | `media-generation-model-read` group | GID 973 | Runner and worker only. Read/traverse access to the immutable candidate mirror. |
 | Existing `render` group | GID 990 | Add the runner for `/dev/kfd` and `/dev/dri/renderD128`. Do not add the runner to GID 44 (`video`) or change existing membership. |
 
-The broker requires the runner's actual NSS groups to be a subset of its
-configured list and the worker's actual groups to equal `{972, 973}`. It also
-enumerates group records and primary account GIDs. The runner primary group
-must contain only the runner; the worker primary group only the worker; the
-scratch group only the runner; and the model-read group exactly the runner and
-worker. It refuses startup if NSS cannot provide that membership data. The
-worker is not the existing `daniel` account.
+The broker validates the runner's keyed account record and exact account group
+set `{970, 971, 973, 990}`; the worker's exact set is `{972, 973}`. Before
+binding a service to its attempt cgroup, it checks the runner process's live
+UIDs, GIDs, supplementary groups, and unified cgroup through `/proc`. For each
+worker socket request, it checks `SO_PEERCRED` and the peer process's live
+UIDs, GIDs, and supplementary groups. The account group list in configuration
+does not substitute for those live checks. These checks reject extra groups on
+either service account while allowing unrelated host accounts to share a group
+under the approved trust model. The worker is not the existing `daniel`
+account.
 
 The broker checks Unix owner/group/other bits. Named ACL entries are not an
 accepted substitute. The scratch-root path and the mirror must have no extended
@@ -297,17 +304,16 @@ engine's dynamic-loader search through an empty path entry.
 ## 6. Owner-authorized installation and verification sequence
 
 The owner has authorized the isolated installation described here. Do not run
-these commands until the NSS identity checks and final technical review pass.
-The service unit passed `systemd-analyze verify` with systemd 259.9 in an
-isolated temporary root containing a stub broker executable. No unit was
-installed or started.
+these commands until independent source review and the final candidate security
+review pass. The service unit passed `systemd-analyze verify` with systemd
+259.9 in an isolated temporary root containing a stub broker executable. No
+unit was installed or started.
 
 1. Before creating users or groups, run this read-only preflight. It checks
-   the assigned numeric IDs, preserves UID 973 for `sshd`, verifies the
-   approved `render` group, and stops if NSS cannot provide complete identity
-   records. The current `files systemd sss` configuration fails the check.
-   Keep deployment blocked until a reviewed identity source proves complete
-   protected-group membership without changing global NSS policy.
+   exact keyed lookups for the assigned numeric IDs, preserves UID 973 for
+   `sshd`, verifies the approved `render` group, and stops on an occupied or
+   substituted identity. It does not enumerate global accounts or groups and
+   does not inspect or change `/etc/nsswitch.conf`.
 
    ```sh
    set -eu
@@ -326,41 +332,17 @@ installed or started.
        fi
    done
    test "$(getent group 990 | cut -d: -f1)" = render
-   python3 - <<'PY'
-   from pathlib import Path
-
-   entries = {}
-   for raw_line in Path("/etc/nsswitch.conf").read_text(encoding="utf-8").splitlines():
-       line = raw_line.split("#", 1)[0].strip()
-       if not line or ":" not in line:
-           continue
-       name, value = line.split(":", 1)
-       sources = []
-       for token in value.split():
-           if token.startswith("[") and token.endswith("]"):
-               continue
-           if "[" in token or "]" in token:
-               raise SystemExit(f"malformed NSS action: {token}")
-           sources.append(token)
-       if name.strip() in {"passwd", "group", "initgroups"}:
-           if name.strip() in entries:
-               raise SystemExit(f"duplicate NSS rule: {name.strip()}")
-           entries[name.strip()] = sources
-   for database in ("passwd", "group"):
-       if entries.get(database) != ["files"]:
-           raise SystemExit(f"{database} NSS source must be exactly files")
-   if "initgroups" in entries and entries["initgroups"] != ["files"]:
-       raise SystemExit("initgroups NSS source must be exactly files")
-   PY
    stat -c '%n %u:%g %a' /dev/kfd /dev/dri/renderD128 /srv /run
    namei -l /home/daniel/ai/qualification-runs/t08-20261031T045433Z/runtime/sd-cpp-hip-b13a482-develvenv/bin/sd-cli
    namei -l /home/daniel/ai/qualification-runs/t08-20261031T045433Z/inputs/models
    namei -l /home/daniel/ai/hf-repos/qwen-image-components/split_files/vae
    ```
 
-2. After the NSS and technical gates pass and the preflight succeeds, create
-   the four groups and the two non-login accounts. UID 973 remains assigned to
-   `sshd`; GID 973 is the model-read group.
+2. After the source/security review gate and the preflight succeed, create the
+   four groups and the two non-login accounts. UID 973 remains assigned to
+   `sshd`; GID 973 is the model-read group. Validate only these service
+   accounts' keyed identity and group results; host-wide group exclusivity is
+   not part of the approved threat model.
 
    ```sh
    set -eu
@@ -464,12 +446,13 @@ installed or started.
 6. Install the configuration and unit exactly as shown. Before any service
    start, run `systemd-analyze verify
    /etc/systemd/system/media-generation-systemd-broker.service`. Do not grant
-   broad systemd or sudo permissions to the worker.
-7. After the technical gate passes and the owner-authorized installation has
-   proceeded, run these checks. They
+   broad systemd or sudo permissions to the worker. After the final security
+   gate passes, reload systemd and manually start
+   `media-generation-systemd-broker.service`; do not enable it at boot.
+7. After the manually started broker is healthy, run these checks. They
    prove the worker can reach the socket and `nobody` cannot traverse or
-   connect. The broker also rejects any peer whose `SO_PEERCRED` UID/GID is not
-   972/972.
+   connect. The broker also rejects a peer unless `SO_PEERCRED` and its live
+   process credentials match worker UID/GID 972/972 and supplementary GID 973.
 
    ```sh
    set -eu
@@ -519,27 +502,29 @@ installed or started.
    separate authorization.
 
 Before a future rollback, stop submissions, drain attempts, prove no
-`media-generation-attempt-*.service` cgroup remains, then stop and disable the
-broker. Preserve the database, evidence ledger, artifacts, and mirror. Remove
+`media-generation-attempt-*.service` cgroup remains, then stop the manually
+started broker. It is not enabled at boot. Preserve the database, evidence
+ledger, artifacts, and mirror. Remove
 or archive only the exact service unit/configuration and package path after
 checking their identities. Leave the service accounts and groups in place
 until an owner confirms that no retained files or evidence use those IDs.
 
 ## 7. Qualification status and remaining gates
 
-The owner has authorized the isolated installation. No accounts, groups,
-directories, permissions, units, or device settings have been changed. UID 973
-remains assigned to `sshd`; the proposed model-read GID is 973. The NSS
-identity source and final technical review remain unresolved, so provisioning
-is blocked. The runner membership in this proposal is limited to GIDs 970,
-971, 973, and 990. It does not include GID 44, and the unit does not allow
-`/dev/dri/card1`.
+The owner has authorized the isolated installation and the trusted-workstation
+security model. No accounts, groups, directories, permissions, units, or
+device settings have been changed. UID 973 remains assigned to `sshd`; the
+proposed model-read GID is 973. Provisioning remains gated on independent
+source review and final security review. The runner membership in this proposal
+is limited to GIDs 970, 971, 973, and 990. It does not include GID 44, and the
+unit does not allow `/dev/dri/card1`.
 
 The current `passwd` and `group` NSS source lists include `systemd` and `sss`.
-Changing `/etc/nsswitch.conf` is excluded by the current instructions and would
-change host-wide account and group lookups. No scoped source has been shown to
-prove complete membership for these providers. Keep broker startup and APEX
-qualification blocked until a reviewed design provides that evidence.
+Changing `/etc/nsswitch.conf` is excluded. The approved broker policy relies on
+keyed service-account lookups and live kernel process credentials; it does not
+claim global group exclusivity. APEX remains `UNVERIFIED` until the exact
+candidate mirror, service identity and access checks, native Linux tests, and
+non-disruptive real-engine qualification are complete.
 
 Reference-conditioned inference additionally needs an approved per-attempt
 read-only reference handoff. The current `0600` publication files remain

@@ -172,29 +172,27 @@ class BrokerConfiguration:
 
     @property
     def worker_groups(self) -> frozenset[int]:
-        """Return worker groups only when NSS matches the broker's exact policy."""
+        """Return keyed worker groups only when they match the broker policy."""
         worker = pwd.getpwuid(self.worker_uid)
-        try:
-            groups = frozenset(os.getgrouplist(worker.pw_name, worker.pw_gid))
-        except (AttributeError, OSError) as error:
-            raise PermissionError("worker supplementary groups cannot be verified") from error
+        if worker.pw_uid != self.worker_uid or worker.pw_gid != self.worker_gid:
+            raise PermissionError("worker account identity differs from broker policy")
         expected = frozenset((self.worker_gid, self.model_read_gid))
-        if groups != expected:
-            raise PermissionError(
-                "worker supplementary groups differ from the broker's read-only policy"
-            )
-        return groups
+        return _account_group_ids(
+            worker.pw_name,
+            primary_gid=self.worker_gid,
+            expected=expected,
+            label="worker",
+        )
 
     def validate_host_paths(self) -> None:
         """Fail closed unless configured identities and host paths are exact."""
         runner = pwd.getpwuid(self.runner_uid)
-        primary_group = grp.getgrgid(self.runner_gid)
         worker = pwd.getpwuid(self.worker_uid)
         if runner.pw_uid != self.runner_uid:
             raise ValueError("NSS account UID does not match runner configuration")
         if worker.pw_uid != self.worker_uid:
             raise ValueError("NSS account UID does not match worker configuration")
-        if runner.pw_gid != self.runner_gid or primary_group.gr_gid != self.runner_gid:
+        if runner.pw_gid != self.runner_gid:
             raise ValueError("configured runner name, UID, and primary group do not agree")
         if worker.pw_gid != self.worker_gid:
             raise ValueError("configured worker UID and primary group do not agree")
@@ -209,51 +207,38 @@ class BrokerConfiguration:
             self.worker_gid,
         }:
             raise ValueError("scratch group must be dedicated and non-root")
+        group_ids = {
+            self.runner_gid,
+            self.worker_gid,
+            self.scratch_gid,
+            self.model_read_gid,
+            *self.runner_supplementary_gids,
+        }
+        for gid in sorted(group_ids):
+            try:
+                group = grp.getgrgid(gid)
+            except (KeyError, OSError) as error:
+                raise ValueError(f"keyed group lookup failed for configured GID {gid}") from error
+            if group.gr_gid != gid:
+                raise ValueError("keyed group identity differs from broker policy")
         try:
-            model_read_group = grp.getgrgid(self.model_read_gid)
-        except KeyError as error:
-            raise ValueError("model-read group is not present on the host") from error
-        if model_read_group.gr_gid != self.model_read_gid:
-            raise ValueError("model-read group ID does not match broker policy")
-        try:
-            account_members = _complete_account_members()
-        except PermissionError:
-            raise
-        except (AttributeError, OSError) as error:
-            raise PermissionError("host group membership cannot be verified") from error
-        for gid, expected_members, label in (
-            (self.runner_gid, {runner.pw_name}, "runner"),
-            (self.worker_gid, {worker.pw_name}, "worker publication"),
-            (self.scratch_gid, {runner.pw_name}, "scratch"),
-            (
-                self.model_read_gid,
-                {runner.pw_name, worker.pw_name},
-                "model-read",
-            ),
-        ):
-            _require_exact_group_membership(
-                gid,
-                expected_members=frozenset(expected_members),
-                account_members=account_members,
-                label=label,
+            _account_group_ids(
+                runner.pw_name,
+                primary_gid=self.runner_gid,
+                expected=self.runner_groups,
+                label="runner",
             )
-        _require_runner_group_allowlist(
-            runner.pw_name,
-            primary_gid=self.runner_gid,
-            allowed_gids=self.runner_groups,
-        )
+        except PermissionError as error:
+            raise ValueError("runner account groups differ from broker policy") from error
         try:
             self.worker_groups
         except PermissionError as error:
-            raise ValueError("worker account has supplementary groups outside broker policy") from error
+            raise ValueError("worker account groups differ from broker policy") from error
         if self.model_read_gid not in self.runner_supplementary_gids:
             raise ValueError("runner is not configured for the private model-read group")
         if self.scratch_gid not in self.runner_groups:
             raise ValueError("runner is not configured for the private scratch group")
-        if (
-            self.scratch_gid == self.worker_gid
-            or _member_of_group(worker, self.scratch_gid)
-        ):
+        if self.scratch_gid in self.worker_groups:
             raise ValueError("worker account must not have access to runner scratch")
         if (
             self.worker_gid == self.runner_gid
@@ -393,9 +378,17 @@ class SystemdAttemptBroker:
     def _serve_connection(self, connection: socket.socket) -> None:
         with connection:
             try:
-                _pid, uid, gid = _peer_credentials(connection)
+                pid, uid, gid = _peer_credentials(connection)
                 if uid != self.configuration.worker_uid or gid != self.configuration.worker_gid:
                     raise PermissionError("worker RPC peer has an unauthorized identity")
+                _require_process_credentials(
+                    pid,
+                    uid=self.configuration.worker_uid,
+                    gid=self.configuration.worker_gid,
+                    supplementary_gids=frozenset(
+                        {self.configuration.model_read_gid}
+                    ),
+                )
                 packet, _ancillary, flags, _address = connection.recvmsg(_MAX_PACKET)
                 if flags & getattr(socket, "MSG_TRUNC", 0):
                     raise ValueError("broker request exceeds the protocol limit")
@@ -802,6 +795,19 @@ class SystemdAttemptBroker:
             if not _is_invocation_id(invocation) or cgroup != expected_cgroup:
                 time.sleep(0.02)
                 continue
+            main_pid = _int_property(properties.get("MainPID"))
+            if main_pid is None or main_pid <= 0:
+                time.sleep(0.02)
+                continue
+            _require_process_credentials(
+                main_pid,
+                uid=self.configuration.runner_uid,
+                gid=self.configuration.runner_gid,
+                supplementary_gids=frozenset(
+                    self.configuration.runner_supplementary_gids
+                ),
+                cgroup_path=cgroup,
+            )
             cgroup_directory = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
             directory_fd = os.open(
                 cgroup_directory,
@@ -1733,6 +1739,101 @@ def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
     return struct.unpack("3i", raw)
 
 
+def _read_process_credentials(
+    pid: int, *, proc_root: Path = Path("/proc")
+) -> tuple[tuple[int, ...], tuple[int, ...], frozenset[int], str]:
+    """Read one pinned process's kernel UID, GID, groups, and cgroup identity."""
+    if type(pid) is not int or pid <= 0:
+        raise PermissionError("process ID is invalid")
+    directory_flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    file_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    process_fd = os.open(Path(proc_root) / str(pid), directory_flags)
+    try:
+        def read_at(name: str) -> str:
+            descriptor = os.open(name, file_flags, dir_fd=process_fd)
+            try:
+                contents = bytearray()
+                while len(contents) <= 1024 * 1024:
+                    chunk = os.read(
+                        descriptor,
+                        min(65536, 1024 * 1024 + 1 - len(contents)),
+                    )
+                    if not chunk:
+                        break
+                    contents.extend(chunk)
+                if len(contents) > 1024 * 1024:
+                    raise PermissionError("process status exceeds the verification limit")
+            finally:
+                os.close(descriptor)
+            try:
+                return contents.decode("ascii")
+            except UnicodeError as error:
+                raise PermissionError("process status is not valid ASCII") from error
+
+        status = read_at("status")
+        cgroup = read_at("cgroup")
+    finally:
+        os.close(process_fd)
+
+    fields: dict[str, tuple[int, ...]] = {}
+    for line in status.splitlines():
+        key, separator, value = line.partition(":")
+        if key not in {"Pid", "Uid", "Gid", "Groups"}:
+            continue
+        if not separator or key in fields:
+            raise PermissionError("process status identity fields are malformed")
+        try:
+            values = tuple(int(token, 10) for token in value.split())
+        except ValueError as error:
+            raise PermissionError("process status contains an invalid identity field") from error
+        if any(item < 0 for item in values):
+            raise PermissionError("process status contains a negative identity value")
+        fields[key] = values
+
+    if (
+        fields.get("Pid") != (pid,)
+        or len(fields.get("Uid", ())) != 4
+        or len(fields.get("Gid", ())) != 4
+        or "Groups" not in fields
+    ):
+        raise PermissionError("process status omits complete kernel credentials")
+    cgroups = [line[3:] for line in cgroup.splitlines() if line.startswith("0::")]
+    if len(cgroups) != 1 or not cgroups[0].startswith("/"):
+        raise PermissionError("process unified cgroup identity is unavailable")
+    return (
+        fields["Uid"],
+        fields["Gid"],
+        frozenset(fields["Groups"]),
+        cgroups[0],
+    )
+
+
+def _require_process_credentials(
+    pid: int,
+    *,
+    uid: int,
+    gid: int,
+    supplementary_gids: frozenset[int],
+    cgroup_path: str | None = None,
+) -> None:
+    """Require live kernel credentials to match the broker's service policy."""
+    try:
+        uids, gids, groups, observed_cgroup = _read_process_credentials(pid)
+    except (OSError, ValueError) as error:
+        raise PermissionError("process credentials cannot be verified") from error
+    if uids != (uid, uid, uid, uid) or gids != (gid, gid, gid, gid):
+        raise PermissionError("process UID or GID credentials differ from broker policy")
+    if groups != supplementary_gids:
+        raise PermissionError("process supplementary groups differ from broker policy")
+    if cgroup_path is not None and observed_cgroup != cgroup_path:
+        raise PermissionError("process cgroup differs from broker unit identity")
+
+
 def _validated_request(packet: bytes) -> tuple[str, dict[str, object]]:
     """Parse one exact operation shape; worker input cannot carry unit policy."""
     request = _json_object(packet, "broker request")
@@ -1865,173 +1966,23 @@ def _absolute_path(value: object, label: str) -> Path:
     return Path(value)
 
 
-def _member_of_group(user: pwd.struct_passwd, gid: int) -> bool:
-    if user.pw_gid == gid:
-        return True
-    try:
-        groups = os.getgrouplist(user.pw_name, user.pw_gid)
-    except (AttributeError, OSError) as error:
-        raise ValueError(
-            "worker supplementary group membership cannot be verified"
-        ) from error
-    return gid in groups
-
-
-def _complete_account_members() -> tuple[tuple[str, int], ...]:
-    """Return primary GIDs from an account source that can be checked fully."""
-    if not sys.platform.startswith("linux"):
-        try:
-            return tuple((entry.pw_name, entry.pw_gid) for entry in pwd.getpwall())
-        except (AttributeError, OSError) as error:
-            raise PermissionError("host group membership cannot be verified") from error
-
-    nsswitch = _read_protected_nss_file(Path("/etc/nsswitch.conf"))
-    for database in ("passwd", "group"):
-        if _nss_database_sources(nsswitch, database) != ("files",):
-            raise PermissionError(
-                "protected groups require complete local NSS sources"
-            )
-    initgroups_sources = _nss_database_sources(
-        nsswitch, "initgroups", required=False
-    )
-    if initgroups_sources is not None and initgroups_sources != ("files",):
-        raise PermissionError(
-            "protected groups require complete local NSS sources"
-        )
-    passwd_text = _read_protected_nss_file(Path("/etc/passwd"))
-    return _parse_passwd_primary_groups(passwd_text)
-
-
-def _read_protected_nss_file(path: Path) -> str:
-    """Read a stable, root-owned local NSS file without following its final link."""
-    _require_root_owned_ancestors(path)
-    _require_no_extended_posix_acl_ancestors(path)
-    try:
-        before = path.lstat()
-        if (
-            stat.S_ISLNK(before.st_mode)
-            or not stat.S_ISREG(before.st_mode)
-            or before.st_uid != 0
-            or before.st_mode & 0o022
-        ):
-            raise PermissionError("local NSS policy file must be root-owned and protected")
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-        )
-    except OSError as error:
-        raise PermissionError("local NSS policy file is unavailable") from error
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_uid != 0
-            or opened.st_mode & 0o022
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-        ):
-            raise PermissionError("local NSS policy file changed during inspection")
-        content = bytearray()
-        while len(content) <= 64 * 1024 * 1024:
-            chunk = os.read(descriptor, min(65536, 64 * 1024 * 1024 + 1 - len(content)))
-            if not chunk:
-                break
-            content.extend(chunk)
-        if len(content) > 64 * 1024 * 1024:
-            raise PermissionError("local NSS policy file exceeds the verification limit")
-        after = os.fstat(descriptor)
-        if (
-            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
-        ):
-            raise PermissionError("local NSS policy file changed during inspection")
-    except OSError as error:
-        raise PermissionError("local NSS policy file cannot be read") from error
-    finally:
-        os.close(descriptor)
-    try:
-        return content.decode("utf-8")
-    except UnicodeError as error:
-        raise PermissionError("local NSS policy file is not valid UTF-8") from error
-
-
-def _nss_database_sources(
-    content: str, database: str, *, required: bool = True
-) -> tuple[str, ...] | None:
-    """Return one NSS database's source order, excluding bracketed actions."""
-    result: tuple[str, ...] | None = None
-    for raw_line in content.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        name, separator, value = line.partition(":")
-        if name.strip() != database:
-            continue
-        if not separator or result is not None:
-            raise PermissionError("local NSS source declaration is ambiguous")
-        sources: list[str] = []
-        for token in value.split():
-            if token.startswith("[") and token.endswith("]"):
-                continue
-            if "[" in token or "]" in token:
-                raise PermissionError("local NSS source action is malformed")
-            sources.append(token)
-        if not sources:
-            raise PermissionError("local NSS source declaration is empty")
-        result = tuple(sources)
-    if result is None and required:
-        raise PermissionError("local NSS source declaration is missing")
-    return result
-
-
-def _parse_passwd_primary_groups(content: str) -> tuple[tuple[str, int], ...]:
-    """Parse every primary GID from the authoritative local passwd file."""
-    members: list[tuple[str, int]] = []
-    seen_names: set[str] = set()
-    for line_number, raw_line in enumerate(content.splitlines(), start=1):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        fields = line.split(":")
-        if len(fields) != 7 or not fields[0] or fields[0] in seen_names:
-            raise PermissionError(
-                f"local passwd record is malformed at line {line_number}"
-            )
-        try:
-            uid = int(fields[2], 10)
-            gid = int(fields[3], 10)
-        except ValueError as error:
-            raise PermissionError(
-                f"local passwd record has invalid IDs at line {line_number}"
-            ) from error
-        if uid < 0 or gid < 0:
-            raise PermissionError(
-                f"local passwd record has negative IDs at line {line_number}"
-            )
-        seen_names.add(fields[0])
-        members.append((fields[0], gid))
-    return tuple(members)
-
-
-def _require_exact_group_membership(
-    gid: int,
+def _account_group_ids(
+    name: str,
     *,
-    expected_members: frozenset[str],
-    account_members: tuple[tuple[str, int], ...],
+    primary_gid: int,
+    expected: frozenset[int],
     label: str,
-) -> None:
-    """Require protected groups to contain only their authorized accounts."""
+) -> frozenset[int]:
+    """Check keyed NSS membership for one service account against policy."""
     try:
-        group = grp.getgrgid(gid)
-    except (KeyError, OSError) as error:
-        raise PermissionError(f"{label} group membership cannot be verified") from error
-    if group.gr_gid != gid:
-        raise PermissionError(f"{label} group identity does not match broker policy")
-    members = set(group.gr_mem)
-    members.update(
-        name for name, primary_gid in account_members if primary_gid == gid
-    )
-    if members != expected_members:
-        raise PermissionError(f"{label} group membership differs from broker policy")
+        actual = frozenset(os.getgrouplist(name, primary_gid))
+    except (AttributeError, OSError) as error:
+        raise PermissionError(
+            f"{label} supplementary group membership cannot be verified"
+        ) from error
+    if actual != expected:
+        raise PermissionError(f"{label} account groups differ from broker policy")
+    return actual
 
 
 def _require_directory_traversal(
@@ -2170,25 +2121,6 @@ def _require_root_owned_ancestors(path: Path) -> None:
         if ancestor.parent == ancestor:
             break
         ancestor = ancestor.parent
-
-
-def _require_runner_group_allowlist(
-    runner_name: str,
-    *,
-    primary_gid: int,
-    allowed_gids: frozenset[int],
-) -> None:
-    """Require NSS group memberships to fit systemd's configured group allowlist."""
-    try:
-        system_groups = set(os.getgrouplist(runner_name, primary_gid))
-    except (AttributeError, OSError) as error:
-        raise ValueError(
-            "runner supplementary group membership cannot be verified"
-        ) from error
-    if not system_groups.issubset(allowed_gids):
-        raise ValueError(
-            "runner account has supplementary groups outside the broker allowlist"
-        )
 
 
 def _boot_id() -> str:
