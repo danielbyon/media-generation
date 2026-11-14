@@ -653,9 +653,12 @@ existing `LaunchFact` after spawn and the existing `ProcessObservation` after
 the engine child is reaped. The broker writes those facts through the normal
 claim-owner and epoch checks while the attempt remains current. The supervisor
 continues to verify the exact argv and environment and stores only bounded,
-privacy-safe stream summaries. Direct-child execution paths keep their existing
-evidence contract; this design does not infer process-tree containment from
-their observations.
+privacy-safe stream summaries. The runner itself starts with the private
+attempt directory as its working directory; it starts the engine with `/` as
+its working directory because the durable engine argv contains absolute input
+and output paths. Direct-child execution paths keep their existing evidence
+contract; this design does not infer process-tree containment from their
+observations.
 
 The result keeps six facts separate:
 
@@ -716,41 +719,58 @@ canceled or failed attempt. Uncertain unit identity, missing cgroup proof, or
 unreconciled publication keeps the resource quarantined.
 
 The system service runs under the configured non-root runner UID and primary
-GID. The broker allowlists the required GPU device nodes, model and input read
+GID. Its supplementary groups are an exact allowlist: the GPU `render` and
+`video` groups when required by the configured device nodes, the private
+scratch group, and the read-only model/runtime group. The broker checks the
+runner's NSS memberships against that allowlist. The worker has its own primary
+publication group and only the read-only model/runtime group as a supplementary
+group; it never joins the scratch or GPU groups. The broker checks the worker's
+NSS memberships exactly. The shared read group relies on ordinary owner/group
+mode bits because broker validation does not evaluate named POSIX ACL entries.
+The mirrored runtime and model tree therefore has root-owned directories with
+group traversal/read permissions and root-owned read-only files. The engine
+executable is group-readable and executable so the runner can launch it; this
+also gives the worker execute permission on that file, but no GPU device or
+scratch access.
+
+Before launch, the broker inspects each direct entry in the configured `PATH`
+and `LD_LIBRARY_PATH` directories. It fails closed if an entry cannot be
+inspected, is a special file, targets a non-root-owned file, or is writable by
+the group, world, worker, or runner. Every symlink hop and directory in a
+target path must also be root-owned and nonreplaceable. Runtime libraries must
+be readable by both services, and executable `PATH` entries must be executable
+by the runner. Private engine and model inputs cannot be world-readable.
+
+The broker allowlists the required GPU device nodes, model and input read
 roots, scratch directory, and runner executable, then supplies fixed
-`User=`, `Group=`, device, filesystem, and kill-policy properties. State-changing
-system-manager calls pass through its D-Bus/polkit authorization for
-`org.freedesktop.systemd1.manage-units`. The [systemd manager documentation](https://freedesktop.org/software/systemd/man/latest/org.freedesktop.systemd1.html)
-describes this boundary. The root-owned broker is the only component that
-invokes the system manager; the worker has no general systemd management
-privilege. A unit-name prefix only limits the namespace. The broker also checks
-peer credentials, the exact request fields, claim and epoch, durable resolved
-invocation, unit identity, and the live service properties.
+`User=`, `Group=`, supplementary-group, device, filesystem, and kill-policy
+properties. The runner has no database access. The root broker opens the
+configured SQLite database to persist launch and engine-observation facts. It
+also maintains a root-owned evidence ledger in a dedicated protected
+directory at
+`<deployment root>/systemd-evidence/<database directory>-<database filename>.systemd-evidence.sqlite3`.
+For the APEX database, the path is
+`/var/lib/media-generation-v9/systemd-evidence/db-jobs.sqlite3.systemd-evidence.sqlite3`.
+The broker stores each
+immutable unit identity and cgroup-empty proof in this ledger, then mirrors the
+facts into the job database. The job database may be writable by the worker,
+so its copy alone is never accepted as proof of containment or termination.
+The ledger is owned by root, readable by the configured worker group, and not
+writable by that group. The directory is also outside the worker-writable
+database directory, so the worker cannot create or replace SQLite sidecars.
+The worker opens it read-only and requires its identity and termination records
+to match before resource release. Missing or conflicting ledger data fails
+closed.
 
-The runner receives only the configured supplementary groups needed for the
-ROCm device nodes and private scratch group. systemd also initializes the
-service's supplementary groups from the account database; `SupplementaryGroups=`
-adds groups to that set. The broker checks the runner's actual NSS group list
-against its allowlist and rejects any membership outside it, including the
-worker's publication group. See the [systemd.exec manual](https://freedesktop.org/software/systemd/man/latest/systemd.exec.html).
-`DeviceAllow` names each GPU device; the configured read roots cover ROCm
-runtime files, model files, and inputs. `ProtectSystem=strict` and the
-attempt-specific `ReadWritePaths` keep model and runtime paths read-only while
-the runner writes scratch output. The runner has no database access. The root
-broker opens the configured SQLite database to persist launch and
-engine-observation facts. It also maintains a root-owned evidence ledger next
-to that database at `<database filename>.systemd-evidence.sqlite3`. The broker
-stores each immutable unit identity and cgroup-empty proof in this ledger, then
-mirrors the facts into the job database. The job database may be writable by
-the worker, so its copy alone is never accepted as proof of containment or
-termination. The ledger is owned by root, readable by the configured worker
-group, and not writable by that group. The worker opens it read-only and
-requires its identity and termination records to match before resource
-release. Missing or conflicting ledger data fails closed.
-
-The broker also checks that the worker account uses only its primary group.
-That group grants access to the worker database, broker socket, artifact output,
-and read-only evidence ledger. It grants no GPU-device or runner-scratch access.
+The root-owned broker is the systemd authorization boundary. It invokes
+`systemd-run --system` as root, so the system manager authorizes the broker's
+root credentials; polkit does not give this root process a narrow per-property
+allowlist. The worker receives no general systemd management privilege. A
+unit-name prefix only limits the namespace. The broker also checks peer
+credentials, exact request fields, claim and epoch, the durable resolved
+invocation, and live unit properties; it constructs every transient-unit
+property itself. The broker executable, its root-owned configuration, and
+the protected socket directory must not be writable by the worker.
 
 Broker configuration, runner executable, socket, scratch root, and database
 paths must sit beneath root-owned, nonreplaceable directory chains. The broker
@@ -758,12 +778,21 @@ rejects symlinked or worker-owned ancestors and writable ancestors without a
 root-owned sticky bit. The sidecar ledger needs the same protected parent
 directory as the database, with root ownership and read access for the worker
 group. APEX must provide those paths and the required worker, runner,
-ROCm-group, GPU-device, model, scratch, database, and ledger access before
+ROCm, model-read, GPU-device, model, scratch, database, and ledger access before
 qualification. Implementation does not apply host permission changes.
 Approving the broker software does not authorize installing it or changing
 systemd or host permissions on APEX. The owner must authorize the installation,
 service configuration, identities, directories, and device access. Until then,
 the APEX backend remains unqualified.
+
+Published image staging files use mode `0600`. The runner is intentionally not
+a member of the worker publication group, so the current broker cannot read a
+published artifact used as an engine `-r` reference. Do not solve this by
+adding the runner to the worker group or broadening every artifact's mode. A
+reference-conditioned APEX run remains blocked until a separately reviewed
+per-attempt read-only input handoff gives the runner only the selected input.
+The deployment manifest covers model/runtime access and reference-free runs;
+it does not claim the reference-conditioned path is qualified.
 
 ## Pre-dispatch refusals
 

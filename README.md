@@ -178,7 +178,7 @@ for the profile contract, redaction rules, and integration responsibilities.
 
 ## Current database schema
 
-This release supports SQLite schema version 7 only. Opening a new database
+This release supports SQLite schema version 9 only. Opening a new database
 creates every table, index, trigger, singleton resource row, and the schema
 version marker in one transaction. Opening an existing database validates its
 complete structure and required admission evidence through a read-only
@@ -306,7 +306,7 @@ recovery, or another job's resource claim can make a later request fail instead
 of acknowledging stale eligibility. A later worker claim creates the next
 attempt only when the persisted retry policy permits it.
 
-Only the exact current schema can be reopened. A current queued job must
+Only exact schema version 9 can be reopened. A current queued job must
 already contain valid admission evidence; `work` and `retry` do not infer or
 backfill evidence from adapter identity or older rows. A database with
 historical or admission-less work is rejected without mutation. Preserve an
@@ -598,6 +598,12 @@ media-generation worker \
 
 media-generation execution --db ./studio.sqlite3 --job-id <job-id>
 ```
+
+For a systemd-contained Stable Diffusion C++ job, pass the broker socket,
+scratch root, runner UID, and runner GID to `enqueue` and `worker`, along with
+the same candidate and trusted-evidence paths. Enqueue requires a pinned
+Stable Diffusion C++ candidate when these systemd options are set. The worker
+must use the matching containment mode to claim the queued job.
 
 `submit`, `enqueue`, and `worker` accept engine flags. T06 inventory and
 capacity documents belong only to `submit` and `enqueue`; a worker validates

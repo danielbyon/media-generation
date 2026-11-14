@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 from pathlib import Path
@@ -17,6 +16,7 @@ from .supervisor import (
     ProcessSupervisor,
 )
 from .systemd_attempts import AttemptUnitIdentity
+from .systemd_protocol import encode_json_line, read_json_line
 
 
 class _BrokerPipeAuthority(ExecutionEvidenceAuthority):
@@ -47,13 +47,13 @@ class _BrokerPipeAuthority(ExecutionEvidenceAuthority):
 def main() -> int:
     """Read one broker manifest, supervise its engine child, and report facts."""
     try:
-        manifest = _read_object(sys.stdin.buffer.readline())
+        manifest = _read_runner_response()
         identity = AttemptUnitIdentity.from_mapping(manifest["identity"])
         argv = _text_list(manifest.get("argv"), "argv")
         environment = _environment(manifest.get("environment"))
-        cwd = _absolute_directory(manifest.get("scratch_directory"))
+        scratch_directory = _absolute_directory(manifest.get("scratch_directory"))
         resolved = _object(manifest.get("resolved_record"), "resolved_record")
-        _validate_manifest(identity, argv, environment, cwd, resolved)
+        _validate_manifest(identity, argv, environment, scratch_directory, resolved)
         if os.geteuid() != identity.runner_uid or os.getegid() != identity.runner_gid:
             raise BackendEvidenceError("runner service identity does not match the attempt")
         if _current_cgroup() != identity.cgroup_path:
@@ -64,7 +64,8 @@ def main() -> int:
             expected_argv=tuple(argv),
             expected_environment=environment,
         )
-        observation = supervisor.run(argv, env=environment, cwd=cwd)
+        # A writable scratch CWD can enter loader search through empty path entries.
+        observation = supervisor.run(argv, env=environment, cwd=Path("/"))
         _write_object(
             {
                 "operation": "complete",
@@ -135,29 +136,27 @@ def _current_cgroup() -> str:
 
 def _exchange(request: Mapping[str, object]) -> dict[str, object]:
     _write_object(request)
-    response = _read_object(sys.stdin.buffer.readline())
+    response = _read_runner_response()
     if response.get("ok") is not True:
         raise BackendEvidenceError("broker rejected the engine evidence operation")
     return response
 
 
-def _read_object(raw: bytes) -> dict[str, object]:
-    if not raw or len(raw) > 1024 * 1024:
-        raise BackendEvidenceError("broker control message is missing or oversized")
+def _read_runner_response() -> dict[str, object]:
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return read_json_line(sys.stdin.buffer)
+    except EOFError as error:
+        raise BackendEvidenceError("broker control message is missing or oversized") from error
+    except ValueError as error:
         raise BackendEvidenceError("broker control message is malformed") from error
-    return _object(value, "control message")
 
 
 def _write_object(value: Mapping[str, object]) -> None:
-    raw = json.dumps(
-        value, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
-    if len(raw) > 1024 * 1024:
-        raise BackendEvidenceError("runner control message is oversized")
-    sys.stdout.buffer.write(raw + b"\n")
+    try:
+        frame = encode_json_line(value)
+    except ValueError as error:
+        raise BackendEvidenceError("runner control message is invalid or oversized") from error
+    sys.stdout.buffer.write(frame)
     sys.stdout.buffer.flush()
 
 

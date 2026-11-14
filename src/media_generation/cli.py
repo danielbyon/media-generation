@@ -311,6 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_admission_arguments(enqueue)
     _add_engine_arguments(enqueue)
+    _add_systemd_attempt_arguments(enqueue)
 
     worker = commands.add_parser("worker", help="execute compatible queued jobs")
     worker.add_argument("--db", required=True, type=Path)
@@ -613,9 +614,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
             adapter = _engine_adapter(options, options.output_dir)
+            attempt_runner = _systemd_attempt_runner(
+                options, adapter=adapter, for_execution=False
+            )
+            if attempt_runner is not None and not isinstance(
+                adapter, StableDiffusionCppAdapter
+            ):
+                raise InputValidationError(
+                    "systemd enqueue requires a StableDiffusionCppAdapter"
+                )
             if adapter is None:
                 service = GenerationService(
-                    options.db, options.output_dir, admission_profile=profile
+                    options.db,
+                    options.output_dir,
+                    admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
             else:
                 service = GenerationService(
@@ -623,6 +636,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     options.output_dir,
                     adapter=adapter,
                     admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
             result = service.enqueue(
                 options.idempotency_key,

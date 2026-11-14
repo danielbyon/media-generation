@@ -38,12 +38,25 @@ class SystemdEvidenceLedger:
     @staticmethod
     def path_for(database_path: Path) -> Path:
         database = Path(database_path).expanduser().absolute()
-        return database.with_name(database.name + ".systemd-evidence.sqlite3")
+        evidence_directory = database.parent.parent / "systemd-evidence"
+        ledger_name = (
+            f"{database.parent.name}-{database.name}.systemd-evidence.sqlite3"
+        )
+        return evidence_directory / ledger_name
+
+    def _validate_parent(self, *, require_root: bool = True) -> None:
+        try:
+            info = self.path.parent.lstat()
+        except OSError as error:
+            raise PermissionError(
+                "systemd evidence ledger directory is unavailable"
+            ) from error
+        self._require_trusted_directory(info, require_root=require_root)
 
     def initialize(self, *, worker_gid: int | None = None) -> None:
         """Create or validate the root-owned, worker-readable evidence file."""
         self._require_root()
-        self.path.parent.lstat()
+        self._validate_parent()
         try:
             info = self.path.lstat()
         except FileNotFoundError:
@@ -72,6 +85,7 @@ class SystemdEvidenceLedger:
 
     def validate_worker_access(self, worker_gid: int) -> None:
         """Require an existing ledger to be readable by the worker group."""
+        self._validate_parent()
         try:
             info = self.path.lstat()
         except FileNotFoundError:
@@ -87,6 +101,7 @@ class SystemdEvidenceLedger:
         self._require_root()
         if not self.path.exists():
             self.initialize()
+        self._validate_parent()
         identity_json = backend_canonical_json(identity.to_mapping())
         digest = identity_digest(identity)
         with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
@@ -120,6 +135,7 @@ class SystemdEvidenceLedger:
     ) -> None:
         """Persist only a proof matching the already-pinned root identity."""
         self._require_root()
+        self._validate_parent()
         if evidence.identity != identity:
             raise BackendEvidenceError("cgroup proof identity differs from broker ledger")
         identity_json = backend_canonical_json(identity.to_mapping())
@@ -176,6 +192,7 @@ class SystemdEvidenceLedger:
     def _read_row(
         self, job_id: str, attempt_id: str
     ) -> tuple[str, str, str | None] | None:
+        self._validate_parent()
         try:
             info = self.path.lstat()
         except FileNotFoundError:
@@ -216,6 +233,20 @@ class SystemdEvidenceLedger:
     def _require_root() -> None:
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
             raise PermissionError("systemd evidence ledger is broker-owned")
+
+    @staticmethod
+    def _require_trusted_directory(
+        info: os.stat_result, *, require_root: bool = True
+    ) -> None:
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or (require_root and info.st_uid != 0)
+            or info.st_mode & 0o022
+        ):
+            raise PermissionError(
+                "systemd evidence ledger directory must be root-owned and non-writable"
+            )
 
     @staticmethod
     def _require_trusted_file(info: os.stat_result, *, require_root: bool) -> None:

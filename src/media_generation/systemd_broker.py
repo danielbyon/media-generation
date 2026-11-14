@@ -9,6 +9,7 @@ receives systemd management privileges.
 from __future__ import annotations
 
 import array
+import errno
 import json
 import os
 import pwd
@@ -34,6 +35,7 @@ from .engine import ENVIRONMENT_ALLOWLIST
 from .errors import BackendEvidenceError
 from .store import ExecutionClaim, SQLiteStore
 from .systemd_evidence import SystemdEvidenceLedger
+from .systemd_protocol import encode_json_line, read_json_line
 from .systemd_attempts import (
     SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
     AttemptUnitIdentity,
@@ -53,6 +55,7 @@ _CONFIG_KEYS = frozenset(
         "worker_uid",
         "worker_gid",
         "scratch_gid",
+        "model_read_gid",
         "device_allow",
         "read_roots",
         "environment_path_allowlist",
@@ -94,6 +97,7 @@ class BrokerConfiguration:
     worker_uid: int
     worker_gid: int
     scratch_gid: int
+    model_read_gid: int
     device_allow: tuple[Path, ...]
     read_roots: tuple[Path, ...]
     environment_path_allowlist: tuple[Path, ...]
@@ -119,7 +123,12 @@ class BrokerConfiguration:
         if set(value) != _CONFIG_KEYS:
             raise ValueError("broker configuration has an unexpected field set")
         numeric = (
-            "runner_uid", "runner_gid", "worker_uid", "worker_gid", "scratch_gid"
+            "runner_uid",
+            "runner_gid",
+            "worker_uid",
+            "worker_gid",
+            "scratch_gid",
+            "model_read_gid",
         )
         for key in numeric:
             if type(value[key]) is not int or value[key] < 0:
@@ -148,6 +157,7 @@ class BrokerConfiguration:
             worker_uid=value["worker_uid"],
             worker_gid=value["worker_gid"],
             scratch_gid=value["scratch_gid"],
+            model_read_gid=value["model_read_gid"],
             device_allow=devices,
             read_roots=roots,
             environment_path_allowlist=environment_paths,
@@ -160,6 +170,21 @@ class BrokerConfiguration:
     def runner_groups(self) -> frozenset[int]:
         return frozenset((self.runner_gid, *self.runner_supplementary_gids))
 
+    @property
+    def worker_groups(self) -> frozenset[int]:
+        """Return worker groups only when NSS matches the broker's exact policy."""
+        worker = pwd.getpwuid(self.worker_uid)
+        try:
+            groups = frozenset(os.getgrouplist(worker.pw_name, worker.pw_gid))
+        except (AttributeError, OSError) as error:
+            raise PermissionError("worker supplementary groups cannot be verified") from error
+        expected = frozenset((self.worker_gid, self.model_read_gid))
+        if groups != expected:
+            raise PermissionError(
+                "worker supplementary groups differ from the broker's read-only policy"
+            )
+        return groups
+
     def validate_host_paths(self) -> None:
         """Fail closed unless configured identities and host paths are exact."""
         runner = pwd.getpwuid(self.runner_uid)
@@ -169,19 +194,56 @@ class BrokerConfiguration:
             raise ValueError("configured runner name, UID, and primary group do not agree")
         if worker.pw_gid != self.worker_gid:
             raise ValueError("configured worker UID and primary group do not agree")
+        if (
+            self.model_read_gid <= 0
+            or self.model_read_gid
+            in {self.runner_gid, self.worker_gid, self.scratch_gid}
+        ):
+            raise ValueError("model-read group must be dedicated and non-root")
+        if self.scratch_gid <= 0 or self.scratch_gid in {
+            self.runner_gid,
+            self.worker_gid,
+        }:
+            raise ValueError("scratch group must be dedicated and non-root")
+        try:
+            model_read_group = grp.getgrgid(self.model_read_gid)
+        except KeyError as error:
+            raise ValueError("model-read group is not present on the host") from error
+        if model_read_group.gr_gid != self.model_read_gid:
+            raise ValueError("model-read group ID does not match broker policy")
+        try:
+            account_members = _complete_account_members()
+        except PermissionError:
+            raise
+        except (AttributeError, OSError) as error:
+            raise PermissionError("host group membership cannot be verified") from error
+        for gid, expected_members, label in (
+            (self.runner_gid, {runner.pw_name}, "runner"),
+            (self.worker_gid, {worker.pw_name}, "worker publication"),
+            (self.scratch_gid, {runner.pw_name}, "scratch"),
+            (
+                self.model_read_gid,
+                {runner.pw_name, worker.pw_name},
+                "model-read",
+            ),
+        ):
+            _require_exact_group_membership(
+                gid,
+                expected_members=frozenset(expected_members),
+                account_members=account_members,
+                label=label,
+            )
         _require_runner_group_allowlist(
             runner.pw_name,
             primary_gid=self.runner_gid,
             allowed_gids=self.runner_groups,
         )
         try:
-            worker_groups = frozenset(
-                os.getgrouplist(worker.pw_name, worker.pw_gid)
-            )
-        except (AttributeError, OSError) as error:
-            raise ValueError("worker supplementary groups cannot be verified") from error
-        if worker_groups != frozenset((self.worker_gid,)):
-            raise ValueError("worker account has supplementary groups outside its primary group")
+            self.worker_groups
+        except PermissionError as error:
+            raise ValueError("worker account has supplementary groups outside broker policy") from error
+        if self.model_read_gid not in self.runner_supplementary_gids:
+            raise ValueError("runner is not configured for the private model-read group")
         if self.scratch_gid not in self.runner_groups:
             raise ValueError("runner is not configured for the private scratch group")
         if (
@@ -194,6 +256,7 @@ class BrokerConfiguration:
             or self.worker_gid in self.runner_supplementary_gids
         ):
             raise ValueError("runner must not join the worker's publication group")
+        _require_no_extended_posix_acl_ancestors(self.scratch_root)
         _require_root_directory(self.scratch_root)
         scratch_info = self.scratch_root.lstat()
         if (
@@ -233,9 +296,18 @@ class BrokerConfiguration:
             or not stat.S_ISREG(database_info.st_mode)
         ):
             raise PermissionError("broker database path must be a regular file")
-        SystemdEvidenceLedger(
-            SystemdEvidenceLedger.path_for(self.database_path)
-        ).validate_worker_access(self.worker_gid)
+        evidence_path = SystemdEvidenceLedger.path_for(self.database_path)
+        _require_no_extended_posix_acl_ancestors(evidence_path.parent)
+        _require_root_directory(evidence_path.parent)
+        try:
+            evidence_path.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            _require_no_extended_posix_acl_ancestors(evidence_path)
+        SystemdEvidenceLedger(evidence_path).validate_worker_access(
+            self.worker_gid
+        )
 
 
 @dataclass
@@ -283,12 +355,30 @@ class SystemdAttemptBroker:
     def _open_server_socket(self) -> None:
         path = self.configuration.socket_path
         _require_root_directory(path.parent)
+        _require_no_extended_posix_acl_ancestors(path.parent)
         try:
             existing = path.lstat()
         except FileNotFoundError:
             existing = None
         if existing is not None:
             raise FileExistsError("attempt broker socket path is already in use")
+        os.chown(path.parent, 0, self.configuration.worker_gid)
+        os.chmod(path.parent, 0o750)
+        _require_root_directory(path.parent)
+        _require_no_extended_posix_acl_ancestors(path.parent)
+        parent_info = path.parent.lstat()
+        if (
+            parent_info.st_uid != 0
+            or parent_info.st_gid != self.configuration.worker_gid
+            or stat.S_IMODE(parent_info.st_mode) != 0o750
+        ):
+            raise PermissionError("broker socket directory ownership or mode is invalid")
+        _require_directory_traversal(
+            path.parent,
+            self.configuration.worker_uid,
+            self.configuration.worker_groups,
+            label="configured worker cannot traverse the broker socket directory",
+        )
         server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         server.bind(str(path))
         os.chmod(path, 0o660)
@@ -299,7 +389,7 @@ class SystemdAttemptBroker:
     def _serve_connection(self, connection: socket.socket) -> None:
         with connection:
             try:
-                uid, gid, _pid = _peer_credentials(connection)
+                _pid, uid, gid = _peer_credentials(connection)
                 if uid != self.configuration.worker_uid or gid != self.configuration.worker_gid:
                     raise PermissionError("worker RPC peer has an unauthorized identity")
                 packet, _ancillary, flags, _address = connection.recvmsg(_MAX_PACKET)
@@ -975,7 +1065,11 @@ class SystemdAttemptBroker:
             _json_mapping(request.get("identity"), "identity")
         )
         self._require_identity(identity)
-        if not self.store.attempt_termination_proven(identity.job_id, identity.attempt_id):
+        if not self.store.attempt_termination_proven(
+            identity.job_id,
+            identity.attempt_id,
+            require_current_attempt=False,
+        ):
             raise BackendEvidenceError("recovery cleanup requires durable cgroup-empty proof")
         if not self.store.attempt_recovery_cleanup_authorized(identity):
             raise BackendEvidenceError(
@@ -996,7 +1090,9 @@ class SystemdAttemptBroker:
             )
         with active.lock:
             if not self.store.attempt_termination_proven(
-                identity.job_id, identity.attempt_id
+                identity.job_id,
+                identity.attempt_id,
+                require_current_attempt=False,
             ):
                 raise BackendEvidenceError(
                     "scratch cleanup lost its durable cgroup termination proof"
@@ -1035,7 +1131,7 @@ class SystemdAttemptBroker:
             return active
 
     def _validate_engine_paths(self, argv: list[str]) -> None:
-        paths: list[tuple[Path, bool, bool]] = [(Path(argv[0]), True, True)]
+        paths: list[tuple[Path, bool]] = [(Path(argv[0]), True)]
         for index, item in enumerate(argv[:-1]):
             if item in {
                 "--diffusion-model",
@@ -1048,13 +1144,13 @@ class SystemdAttemptBroker:
                     (
                         Path(argv[index + 1]),
                         False,
-                        item != "-r",
                     )
                 )
-        validated_paths: list[tuple[Path, bool, bool]] = []
-        for path, executable, root_owned in paths:
+        validated_paths: list[tuple[Path, bool]] = []
+        for path, executable in paths:
             if not path.is_absolute():
                 raise PermissionError("engine invocation contains a non-absolute input path")
+            _require_no_symlink_components(path)
             resolved = path.resolve(strict=True)
             allowed = any(
                 resolved.is_relative_to(root.resolve())
@@ -1062,35 +1158,32 @@ class SystemdAttemptBroker:
             )
             if not allowed:
                 raise PermissionError("engine input path is outside broker read roots")
-            validated_paths.append((resolved, executable, root_owned))
+            _require_no_extended_posix_acl_ancestors(resolved)
+            validated_paths.append((resolved, executable))
 
-        for resolved, executable, root_owned in validated_paths:
-            if root_owned:
-                _require_root_owned_ancestors(resolved)
-            parents: list[Path] = []
-            cursor = resolved.parent
-            while True:
-                parents.append(cursor)
-                if cursor == cursor.parent:
-                    break
-                cursor = cursor.parent
-            if any(
-                not _mode_allows(
-                    parent.stat(),
-                    self.configuration.runner_uid,
-                    self.configuration.runner_groups,
-                    execute=True,
-                )
-                for parent in parents
-            ):
-                raise PermissionError("configured runner cannot traverse an engine input directory")
+        for resolved, executable in validated_paths:
+            _require_root_owned_ancestors(resolved)
+            _require_directory_traversal(
+                resolved.parent,
+                self.configuration.runner_uid,
+                self.configuration.runner_groups,
+                label="configured runner cannot traverse an engine input directory",
+            )
+            _require_directory_traversal(
+                resolved.parent,
+                self.configuration.worker_uid,
+                self.configuration.worker_groups,
+                label="configured worker cannot traverse an engine input directory",
+            )
             info = resolved.stat()
             if not stat.S_ISREG(info.st_mode):
                 raise PermissionError("engine input path is not a regular file")
-            if root_owned and (info.st_uid != 0 or info.st_mode & 0o022):
+            if info.st_uid != 0 or info.st_mode & 0o022:
                 raise PermissionError(
                     "engine input must be root-owned and not worker-writable"
                 )
+            if info.st_mode & 0o004:
+                raise PermissionError("private engine input must not be world-readable")
             if not _mode_allows(
                 info,
                 self.configuration.runner_uid,
@@ -1099,6 +1192,13 @@ class SystemdAttemptBroker:
                 execute=executable,
             ):
                 raise PermissionError("configured runner cannot read an engine input")
+            if not _mode_allows(
+                info,
+                self.configuration.worker_uid,
+                self.configuration.worker_groups,
+                read=True,
+            ):
+                raise PermissionError("configured worker cannot read an engine input")
 
     def _validate_engine_environment(self, environment: Mapping[str, str]) -> None:
         """Allow only fixed, protected directories in executable search paths."""
@@ -1110,14 +1210,16 @@ class SystemdAttemptBroker:
             if not value or any(not entry for entry in entries):
                 raise PermissionError("engine environment search path has an empty entry")
             for entry in entries:
-                self._validate_environment_path(entry)
+                self._validate_environment_path(entry, search_variable=name)
 
         rocm_path = environment.get("ROCM_PATH")
         if rocm_path is not None:
             self._validate_environment_path(rocm_path)
             self._validate_rocm_release_marker(Path(rocm_path))
 
-    def _validate_environment_path(self, value: str) -> None:
+    def _validate_environment_path(
+        self, value: str, *, search_variable: str | None = None
+    ) -> None:
         """Recheck one configured search directory immediately before launch."""
         path = Path(value)
         if not path.is_absolute() or str(path) != value:
@@ -1135,11 +1237,237 @@ class SystemdAttemptBroker:
         ):
             raise PermissionError("engine environment search path is not authorized")
         _require_root_directory(path)
+        _require_directory_traversal(
+            path,
+            self.configuration.runner_uid,
+            self.configuration.runner_groups,
+            label="configured runner cannot traverse an engine environment directory",
+        )
+        _require_directory_traversal(
+            path,
+            self.configuration.worker_uid,
+            self.configuration.worker_groups,
+            label="configured worker cannot traverse an engine environment directory",
+        )
+        if search_variable is not None:
+            _require_no_extended_posix_acl_ancestors(resolved)
+            self._validate_environment_search_files(path, search_variable=search_variable)
+
+    def _validate_environment_search_files(
+        self, directory: Path, *, search_variable: str
+    ) -> None:
+        """Check every loader-visible runtime file and directory before launch."""
+        if search_variable not in {"LD_LIBRARY_PATH", "PATH"}:
+            raise ValueError("unsupported engine environment search variable")
+
+        def inspect(candidate: Path, *, inspect_subdirectories: bool) -> None:
+            try:
+                info = candidate.lstat()
+            except OSError as error:
+                raise PermissionError("engine environment search file is unavailable") from error
+            is_symlink = stat.S_ISLNK(info.st_mode)
+            if is_symlink:
+                info = self._resolve_protected_environment_entry(candidate)
+            else:
+                _require_no_extended_posix_acl(candidate)
+            if stat.S_ISDIR(info.st_mode):
+                if not inspect_subdirectories:
+                    return
+                if is_symlink:
+                    raise PermissionError(
+                        "engine runtime search subdirectory symlinks are not allowed"
+                    )
+                if info.st_uid != 0:
+                    raise PermissionError(
+                        "engine runtime search directory must be root-owned"
+                    )
+                if (
+                    info.st_mode & 0o022
+                    or _mode_allows(
+                        info,
+                        self.configuration.worker_uid,
+                        self.configuration.worker_groups,
+                        write=True,
+                    )
+                    or _mode_allows(
+                        info,
+                        self.configuration.runner_uid,
+                        self.configuration.runner_groups,
+                        write=True,
+                    )
+                ):
+                    raise PermissionError(
+                        "engine runtime search directory is worker-writable"
+                    )
+                for uid, groups, label in (
+                    (
+                        self.configuration.runner_uid,
+                        self.configuration.runner_groups,
+                        "runner",
+                    ),
+                    (
+                        self.configuration.worker_uid,
+                        self.configuration.worker_groups,
+                        "worker",
+                    ),
+                ):
+                    if not _mode_allows(
+                        info, uid, groups, read=True, execute=True
+                    ):
+                        raise PermissionError(
+                            f"configured {label} cannot search an engine runtime directory"
+                        )
+                try:
+                    nested = sorted(
+                        candidate.iterdir(), key=lambda item: item.name
+                    )
+                except OSError as error:
+                    raise PermissionError(
+                        "engine runtime subdirectory cannot be inspected"
+                    ) from error
+                for item in nested:
+                    inspect(item, inspect_subdirectories=True)
+                return
+            if not stat.S_ISREG(info.st_mode):
+                raise PermissionError("engine environment search entry is not a regular file")
+            if info.st_uid != 0:
+                raise PermissionError("engine environment search file must be root-owned")
+            if (
+                info.st_mode & 0o022
+                or _mode_allows(
+                    info,
+                    self.configuration.worker_uid,
+                    self.configuration.worker_groups,
+                    write=True,
+                )
+                or _mode_allows(
+                    info,
+                    self.configuration.runner_uid,
+                    self.configuration.runner_groups,
+                    write=True,
+                )
+            ):
+                raise PermissionError(
+                    "engine environment search file is worker-writable"
+                )
+
+            if search_variable == "LD_LIBRARY_PATH":
+                if not _mode_allows(
+                    info,
+                    self.configuration.runner_uid,
+                    self.configuration.runner_groups,
+                    read=True,
+                ):
+                    raise PermissionError(
+                        "configured runner cannot read an engine runtime search file"
+                    )
+                if not _mode_allows(
+                    info,
+                    self.configuration.worker_uid,
+                    self.configuration.worker_groups,
+                    read=True,
+                ):
+                    raise PermissionError(
+                        "configured worker cannot read an engine runtime search file"
+                    )
+            elif info.st_mode & 0o111 and not _mode_allows(
+                info,
+                self.configuration.runner_uid,
+                self.configuration.runner_groups,
+                execute=True,
+            ):
+                raise PermissionError(
+                    "configured runner cannot execute an engine PATH search file"
+                )
+
+        try:
+            candidates = sorted(directory.iterdir(), key=lambda candidate: candidate.name)
+        except OSError as error:
+            raise PermissionError("engine environment search directory cannot be inspected") from error
+        for candidate in candidates:
+            inspect(
+                candidate,
+                inspect_subdirectories=search_variable == "LD_LIBRARY_PATH",
+            )
+
+    def _resolve_protected_environment_entry(self, path: Path) -> os.stat_result:
+        """Resolve symlinks while checking every path component for replacement."""
+        if not path.is_absolute():
+            raise PermissionError("engine environment symlink target is not absolute")
+        current = Path(path.anchor)
+        pending = list(path.parts[1:])
+        symlink_count = 0
+        while pending:
+            component = pending.pop(0)
+            if component in {"", "."}:
+                continue
+            if component == "..":
+                current = current.parent
+                continue
+            entry = current / component
+            try:
+                info = entry.lstat()
+            except OSError as error:
+                raise PermissionError(
+                    "engine environment symlink target cannot be verified"
+                ) from error
+            if stat.S_ISLNK(info.st_mode):
+                symlink_count += 1
+                if symlink_count > 40:
+                    raise PermissionError("engine environment symlink chain is too deep")
+                if info.st_uid != 0:
+                    raise PermissionError("engine environment symlink must be root-owned")
+                try:
+                    target = Path(os.readlink(entry))
+                except OSError as error:
+                    raise PermissionError(
+                        "engine environment symlink cannot be read"
+                    ) from error
+                if target.is_absolute():
+                    current = Path(target.anchor)
+                    pending = [*target.parts[1:], *pending]
+                else:
+                    pending = [*target.parts, *pending]
+                continue
+            _require_no_extended_posix_acl(entry)
+            if stat.S_ISDIR(info.st_mode):
+                sticky_protected = bool(info.st_mode & stat.S_ISVTX)
+                if info.st_uid != 0 or (info.st_mode & 0o022 and not sticky_protected):
+                    raise PermissionError(
+                        "engine environment symlink directory is replaceable"
+                    )
+                if not _mode_allows(
+                    info,
+                    self.configuration.runner_uid,
+                    self.configuration.runner_groups,
+                    execute=True,
+                ) or not _mode_allows(
+                    info,
+                    self.configuration.worker_uid,
+                    self.configuration.worker_groups,
+                    execute=True,
+                ):
+                    raise PermissionError(
+                        "engine environment symlink target directory cannot be traversed"
+                    )
+                current = entry
+                continue
+            return info
+        try:
+            info = current.lstat()
+            if not stat.S_ISLNK(info.st_mode):
+                _require_no_extended_posix_acl(current)
+            return info
+        except OSError as error:
+            raise PermissionError(
+                "engine environment symlink target cannot be verified"
+            ) from error
 
     def _validate_rocm_release_marker(self, rocm_path: Path) -> None:
         marker = rocm_path / ".info" / "version"
         try:
             _require_root_owned_ancestors(marker)
+            _require_no_extended_posix_acl_ancestors(marker)
             info = marker.lstat()
         except OSError as error:
             raise PermissionError("configured ROCm release marker is unavailable") from error
@@ -1153,17 +1481,24 @@ class SystemdAttemptBroker:
             or info.st_size > 256
         ):
             raise PermissionError("configured ROCm release marker is unsafe or unreadable")
-        worker = pwd.getpwuid(self.configuration.worker_uid)
-        try:
-            worker_groups = frozenset(os.getgrouplist(worker.pw_name, worker.pw_gid))
-        except (AttributeError, OSError) as error:
-            raise PermissionError("worker group access to the ROCm marker is unavailable") from error
         if not _mode_allows(
-            info, self.configuration.worker_uid, worker_groups, read=True
+            info, self.configuration.worker_uid, self.configuration.worker_groups, read=True
         ) or not _mode_allows(
             info, self.configuration.runner_uid, self.configuration.runner_groups, read=True
         ):
             raise PermissionError("configured worker or runner cannot read the ROCm marker")
+        _require_directory_traversal(
+            marker.parent,
+            self.configuration.worker_uid,
+            self.configuration.worker_groups,
+            label="configured worker cannot traverse the ROCm release marker directory",
+        )
+        _require_directory_traversal(
+            marker.parent,
+            self.configuration.runner_uid,
+            self.configuration.runner_groups,
+            label="configured runner cannot traverse the ROCm release marker directory",
+        )
         try:
             if not marker.read_text(encoding="utf-8").strip():
                 raise PermissionError("configured ROCm release marker is empty")
@@ -1444,23 +1779,18 @@ def _send(connection: socket.socket, response: Mapping[str, object], *, output_f
 def _write_line(stream, value: Mapping[str, object]) -> None:
     if stream is None:
         raise BrokenPipeError("systemd runner pipe is unavailable")
-    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    if len(raw) > _MAX_PACKET:
-        raise ValueError("runner control message exceeds the protocol limit")
-    stream.write(raw.encode("utf-8") + b"\n")
+    stream.write(encode_json_line(value))
     stream.flush()
 
 
 def _read_line(stream) -> dict[str, object]:
     if stream is None:
         raise EOFError("systemd runner pipe is unavailable")
-    raw = stream.readline(_MAX_PACKET + 1)
-    if not raw or len(raw) > _MAX_PACKET or not raw.endswith(b"\n"):
-        raise EOFError("runner control stream ended or exceeded its limit")
-    return _json_object(raw, "runner control message")
+    return read_json_line(stream)
 
 
 def _json_object(raw: bytes, label: str) -> dict[str, object]:
+    """Decode one non-line-framed JSON object used by the worker socket."""
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1543,6 +1873,182 @@ def _member_of_group(user: pwd.struct_passwd, gid: int) -> bool:
     return gid in groups
 
 
+def _complete_account_members() -> tuple[tuple[str, int], ...]:
+    """Return primary GIDs from an account source that can be checked fully."""
+    if not sys.platform.startswith("linux"):
+        try:
+            return tuple((entry.pw_name, entry.pw_gid) for entry in pwd.getpwall())
+        except (AttributeError, OSError) as error:
+            raise PermissionError("host group membership cannot be verified") from error
+
+    nsswitch = _read_protected_nss_file(Path("/etc/nsswitch.conf"))
+    for database in ("passwd", "group"):
+        if _nss_database_sources(nsswitch, database) != ("files",):
+            raise PermissionError(
+                "protected groups require complete local NSS sources"
+            )
+    initgroups_sources = _nss_database_sources(
+        nsswitch, "initgroups", required=False
+    )
+    if initgroups_sources is not None and initgroups_sources != ("files",):
+        raise PermissionError(
+            "protected groups require complete local NSS sources"
+        )
+    passwd_text = _read_protected_nss_file(Path("/etc/passwd"))
+    return _parse_passwd_primary_groups(passwd_text)
+
+
+def _read_protected_nss_file(path: Path) -> str:
+    """Read a stable, root-owned local NSS file without following its final link."""
+    _require_root_owned_ancestors(path)
+    _require_no_extended_posix_acl_ancestors(path)
+    try:
+        before = path.lstat()
+        if (
+            stat.S_ISLNK(before.st_mode)
+            or not stat.S_ISREG(before.st_mode)
+            or before.st_uid != 0
+            or before.st_mode & 0o022
+        ):
+            raise PermissionError("local NSS policy file must be root-owned and protected")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise PermissionError("local NSS policy file is unavailable") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_mode & 0o022
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise PermissionError("local NSS policy file changed during inspection")
+        content = bytearray()
+        while len(content) <= 64 * 1024 * 1024:
+            chunk = os.read(descriptor, min(65536, 64 * 1024 * 1024 + 1 - len(content)))
+            if not chunk:
+                break
+            content.extend(chunk)
+        if len(content) > 64 * 1024 * 1024:
+            raise PermissionError("local NSS policy file exceeds the verification limit")
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns)
+        ):
+            raise PermissionError("local NSS policy file changed during inspection")
+    except OSError as error:
+        raise PermissionError("local NSS policy file cannot be read") from error
+    finally:
+        os.close(descriptor)
+    try:
+        return content.decode("utf-8")
+    except UnicodeError as error:
+        raise PermissionError("local NSS policy file is not valid UTF-8") from error
+
+
+def _nss_database_sources(
+    content: str, database: str, *, required: bool = True
+) -> tuple[str, ...] | None:
+    """Return one NSS database's source order, excluding bracketed actions."""
+    result: tuple[str, ...] | None = None
+    for raw_line in content.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        name, separator, value = line.partition(":")
+        if name.strip() != database:
+            continue
+        if not separator or result is not None:
+            raise PermissionError("local NSS source declaration is ambiguous")
+        sources: list[str] = []
+        for token in value.split():
+            if token.startswith("[") and token.endswith("]"):
+                continue
+            if "[" in token or "]" in token:
+                raise PermissionError("local NSS source action is malformed")
+            sources.append(token)
+        if not sources:
+            raise PermissionError("local NSS source declaration is empty")
+        result = tuple(sources)
+    if result is None and required:
+        raise PermissionError("local NSS source declaration is missing")
+    return result
+
+
+def _parse_passwd_primary_groups(content: str) -> tuple[tuple[str, int], ...]:
+    """Parse every primary GID from the authoritative local passwd file."""
+    members: list[tuple[str, int]] = []
+    seen_names: set[str] = set()
+    for line_number, raw_line in enumerate(content.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        if len(fields) != 7 or not fields[0] or fields[0] in seen_names:
+            raise PermissionError(
+                f"local passwd record is malformed at line {line_number}"
+            )
+        try:
+            uid = int(fields[2], 10)
+            gid = int(fields[3], 10)
+        except ValueError as error:
+            raise PermissionError(
+                f"local passwd record has invalid IDs at line {line_number}"
+            ) from error
+        if uid < 0 or gid < 0:
+            raise PermissionError(
+                f"local passwd record has negative IDs at line {line_number}"
+            )
+        seen_names.add(fields[0])
+        members.append((fields[0], gid))
+    return tuple(members)
+
+
+def _require_exact_group_membership(
+    gid: int,
+    *,
+    expected_members: frozenset[str],
+    account_members: tuple[tuple[str, int], ...],
+    label: str,
+) -> None:
+    """Require protected groups to contain only their authorized accounts."""
+    try:
+        group = grp.getgrgid(gid)
+    except (KeyError, OSError) as error:
+        raise PermissionError(f"{label} group membership cannot be verified") from error
+    if group.gr_gid != gid:
+        raise PermissionError(f"{label} group identity does not match broker policy")
+    members = set(group.gr_mem)
+    members.update(
+        name for name, primary_gid in account_members if primary_gid == gid
+    )
+    if members != expected_members:
+        raise PermissionError(f"{label} group membership differs from broker policy")
+
+
+def _require_directory_traversal(
+    path: Path,
+    uid: int,
+    gids: frozenset[int],
+    *,
+    label: str,
+) -> None:
+    """Require a service identity to search every directory in one path."""
+    for directory in (path, *path.parents):
+        try:
+            info = directory.stat()
+        except OSError as error:
+            raise PermissionError(label) from error
+        if not stat.S_ISDIR(info.st_mode) or not _mode_allows(
+            info, uid, gids, execute=True
+        ):
+            raise PermissionError(label)
+
+
 def _mode_allows(
     info: os.stat_result,
     uid: int,
@@ -1560,6 +2066,60 @@ def _mode_allows(
     else:
         allowed = info.st_mode & 7
     return allowed & needed == needed
+
+
+def _require_no_extended_posix_acl(path: Path) -> None:
+    """Reject POSIX ACLs where mode-bit checks define the access policy."""
+    getxattr = getattr(os, "getxattr", None)
+    if getxattr is None:
+        if sys.platform != "linux":
+            return
+        raise PermissionError("POSIX ACL state cannot be verified")
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise PermissionError("POSIX ACL state cannot be verified") from error
+    if stat.S_ISLNK(info.st_mode):
+        return
+
+    missing_or_unsupported = {
+        errno.ENODATA,
+        getattr(errno, "ENOATTR", errno.ENODATA),
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+    }
+    attributes = ["system.posix_acl_access"]
+    if stat.S_ISDIR(info.st_mode):
+        attributes.append("system.posix_acl_default")
+    for attribute in attributes:
+        try:
+            getxattr(path, attribute, follow_symlinks=False)
+        except OSError as error:
+            if error.errno in missing_or_unsupported:
+                continue
+            raise PermissionError("POSIX ACL state cannot be verified") from error
+        raise PermissionError("extended POSIX ACLs are not allowed on protected paths")
+
+
+def _require_no_extended_posix_acl_ancestors(path: Path) -> None:
+    for ancestor in reversed(path.parents):
+        _require_no_extended_posix_acl(ancestor)
+    _require_no_extended_posix_acl(path)
+
+
+def _require_no_symlink_components(path: Path) -> None:
+    """Reject engine input paths whose lexical components can be retargeted."""
+    current = Path(path.anchor)
+    for component in path.parts[1:]:
+        if component in {".", ".."}:
+            raise PermissionError("engine input path must be normalized")
+        current /= component
+        try:
+            info = current.lstat()
+        except OSError as error:
+            raise PermissionError("engine input path component cannot be verified") from error
+        if stat.S_ISLNK(info.st_mode):
+            raise PermissionError("engine input path must not contain symlink components")
 
 
 def _require_root_directory(path: Path) -> None:

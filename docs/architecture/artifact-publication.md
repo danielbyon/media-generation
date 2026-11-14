@@ -321,9 +321,11 @@ changes, but do not protect against an adversary controlling the storage host.
 ## 7. Durable batch coordination
 
 `GenerationBatchService` stores a batch manifest and ordered slot rows in the
-same schema-v7 database as T04. It commits each slot's request, stable slot ID,
-T04 idempotency key, attempt budget, and per-slot admission profile and demand
-before admitting a GenerationJob. The T04 service remains the only component
+same SQLite database introduced by T04. That database first used schema
+version 7; the current persistent schema is version 9. The service commits each
+slot's request, stable slot ID, T04 idempotency key, attempt budget, and
+per-slot admission profile and demand before admitting a GenerationJob. The
+T04 service remains the only component
 that admits, executes, retries, recovers, or publishes a single output.
 
 Batch slots run in ordinal order. On resume, a slot first resolves its service

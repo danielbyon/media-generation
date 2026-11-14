@@ -2635,13 +2635,27 @@ END"""
                 )
                 return "acknowledged"
             if row["execution_status"] == "running":
+                current_fence_epoch = int(row["fence_epoch"])
+                attempt_claim_epoch = row["attempt_claim_epoch"]
+                if attempt_claim_epoch is None:
+                    cancellation_fence_epoch = current_fence_epoch + 1
+                else:
+                    attempt_claim_epoch = int(attempt_claim_epoch)
+                    if current_fence_epoch not in {
+                        attempt_claim_epoch,
+                        attempt_claim_epoch + 1,
+                    }:
+                        raise BackendEvidenceError(
+                            "cancellation found an unexpected publication fence epoch"
+                        )
+                    cancellation_fence_epoch = attempt_claim_epoch + 1
                 connection.execute(
                     """UPDATE execution_jobs
-                       SET status = 'canceled', fence_epoch = fence_epoch + 1,
+                       SET status = 'canceled', fence_epoch = ?,
                            retry_eligible = 0,
                            failure_message = 'canceled during adapter invocation',
                            updated_at = ? WHERE job_id = ? AND status = 'running'""",
-                    (timestamp, job_id),
+                    (cancellation_fence_epoch, timestamp, job_id),
                 )
                 connection.execute(
                     "UPDATE generation_jobs SET status = 'failed', updated_at = ? WHERE job_id = ?",
@@ -3085,17 +3099,30 @@ END"""
         with self._connection() as connection:
             return self._attempt_termination_evidence(connection, job_id, attempt_id)
 
-    def attempt_termination_proven(self, job_id: str, attempt_id: str) -> bool:
+    def attempt_termination_proven(
+        self,
+        job_id: str,
+        attempt_id: str,
+        *,
+        require_current_attempt: bool = True,
+    ) -> bool:
         """Return termination proof under the attempt's persisted adapter policy.
 
         ComfyUI attempts accept only validated direct-child observation. A
         containment contract cannot substitute for process-tree evidence.
         Historical adapters retain their trusted contract-or-observation
-        behavior.
+        behavior. Historical systemd cleanup may inspect an exact attempt's
+        cgroup proof after a retry becomes current; this option does not grant
+        publication or resource-release authority.
         """
+        if not isinstance(require_current_attempt, bool):
+            raise ValueError("require_current_attempt must be boolean")
         with self._connection() as connection:
             return self._attempt_termination_proven(
-                connection, job_id, attempt_id
+                connection,
+                job_id,
+                attempt_id,
+                require_current_attempt=require_current_attempt,
             )
 
     def release_quarantined_attempt(
@@ -3173,6 +3200,8 @@ END"""
         connection: sqlite3.Connection,
         job_id: str,
         attempt_id: str,
+        *,
+        require_current_attempt: bool = True,
     ) -> bool:
         direct_child_termination_proven = self._attempt_termination_evidence(
             connection, job_id, attempt_id
@@ -3191,7 +3220,10 @@ END"""
         contract = row["containment_contract"]
         if contract == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT:
             return self._attempt_cgroup_termination_evidence(
-                connection, job_id, attempt_id
+                connection,
+                job_id,
+                attempt_id,
+                require_current_attempt=require_current_attempt,
             )
         return direct_child_termination_proven or (
             isinstance(contract, str)
