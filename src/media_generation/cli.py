@@ -46,6 +46,7 @@ from .candidate import (
 )
 from .service import GenerationService
 from .batch_execution import GenerationBatchService
+from .systemd_attempts import SystemdAttemptRunner
 from .screening import (
     ScreeningConfigurationError,
     ScreeningError,
@@ -212,6 +213,45 @@ def _add_engine_arguments(
     )
 
 
+
+def _add_systemd_attempt_arguments(command: argparse.ArgumentParser) -> None:
+    """Add the fixed broker connection and runner identity for T13 execution."""
+    command.add_argument("--systemd-broker-socket", type=Path)
+    command.add_argument("--systemd-scratch-root", type=Path)
+    command.add_argument("--systemd-runner-uid", type=int)
+    command.add_argument("--systemd-runner-gid", type=int)
+
+
+def _systemd_attempt_runner(
+    options: argparse.Namespace,
+    *,
+    adapter: StableDiffusionCppAdapter | ComfyUIAdapter | None,
+    for_execution: bool,
+) -> SystemdAttemptRunner | None:
+    """Build the broker client only from a complete, typed CLI configuration."""
+    values = (
+        options.systemd_broker_socket,
+        options.systemd_scratch_root,
+        options.systemd_runner_uid,
+        options.systemd_runner_gid,
+    )
+    if all(value is None for value in values):
+        return None
+    if any(value is None for value in values):
+        raise InputValidationError(
+            "all four systemd options must be supplied together"
+        )
+    if for_execution and not isinstance(adapter, StableDiffusionCppAdapter):
+        raise InputValidationError(
+            "systemd execution requires a StableDiffusionCppAdapter"
+        )
+    return SystemdAttemptRunner(
+        options.systemd_broker_socket,
+        scratch_root=options.systemd_scratch_root,
+        runner_uid=options.systemd_runner_uid,
+        runner_gid=options.systemd_runner_gid,
+    )
+
 def _engine_adapter(
     options: argparse.Namespace, output_directory: Path
 ) -> StableDiffusionCppAdapter | ComfyUIAdapter | None:
@@ -256,6 +296,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_admission_arguments(submit)
     _add_engine_arguments(submit)
+    _add_systemd_attempt_arguments(submit)
 
     enqueue = commands.add_parser("enqueue", help="durably admit a generation request")
     enqueue.add_argument("--db", required=True, type=Path)
@@ -270,17 +311,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_admission_arguments(enqueue)
     _add_engine_arguments(enqueue)
+    _add_systemd_attempt_arguments(enqueue)
 
     worker = commands.add_parser("worker", help="execute compatible queued jobs")
     worker.add_argument("--db", required=True, type=Path)
     worker.add_argument("--output-dir", required=True, type=Path)
     worker.add_argument("--limit", type=int, default=1)
     _add_engine_arguments(worker)
+    _add_systemd_attempt_arguments(worker)
 
     cancel = commands.add_parser("cancel", help="fence a queued or active job")
     cancel.add_argument("--db", required=True, type=Path)
     cancel.add_argument("--output-dir", type=Path, default=Path.cwd())
     cancel.add_argument("--job-id", required=True)
+    _add_systemd_attempt_arguments(cancel)
 
     retry = commands.add_parser("retry", help="requeue eligible failed work")
     retry.add_argument("--db", required=True, type=Path)
@@ -290,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     recover = commands.add_parser("recover", help="reconcile interrupted execution")
     recover.add_argument("--db", required=True, type=Path)
     recover.add_argument("--output-dir", required=True, type=Path)
+    _add_systemd_attempt_arguments(recover)
 
     for name, help_text in (
         ("request", "retrieve an immutable request snapshot"),
@@ -385,6 +430,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_run.add_argument("--max-attempts", type=int, default=1)
     _add_batch_admission_arguments(batch_run)
     _add_engine_arguments(batch_run)
+    _add_systemd_attempt_arguments(batch_run)
 
     batch_resume = batch_commands.add_parser(
         "resume", help="resume an existing batch with its pinned execution evidence"
@@ -394,6 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
     batch_resume.add_argument("--batch-id", required=True)
     _add_batch_admission_arguments(batch_resume)
     _add_engine_arguments(batch_resume)
+    _add_systemd_attempt_arguments(batch_resume)
 
     batch_report = batch_commands.add_parser(
         "report", help="read-only execution, publication, and artifact-integrity report"
@@ -509,11 +556,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     requests = None
                 profile, demands = _batch_admission_inputs(options)
                 adapter = _engine_adapter(options, options.output_dir)
+                attempt_runner = _systemd_attempt_runner(
+                    options, adapter=adapter, for_execution=True
+                )
                 service = GenerationService(
                     options.db,
                     options.output_dir,
                     adapter=adapter,
                     admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
                 batches = GenerationBatchService(service)
                 if options.batch_command == "run":
@@ -535,9 +586,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
             adapter = _engine_adapter(options, options.output_dir)
+            attempt_runner = _systemd_attempt_runner(
+                options, adapter=adapter, for_execution=True
+            )
             if adapter is None:
                 service = GenerationService(
-                    options.db, options.output_dir, admission_profile=profile
+                    options.db,
+                    options.output_dir,
+                    admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
             else:
                 service = GenerationService(
@@ -545,6 +602,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     options.output_dir,
                     adapter=adapter,
                     admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
             result = service.submit(
                 options.idempotency_key, request, workload_demand=demand
@@ -556,9 +614,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
             request = _parse_request(options.request_json)
             profile, demand = _admission_inputs(options)
             adapter = _engine_adapter(options, options.output_dir)
+            attempt_runner = _systemd_attempt_runner(
+                options, adapter=adapter, for_execution=False
+            )
+            if attempt_runner is not None and not isinstance(
+                adapter, StableDiffusionCppAdapter
+            ):
+                raise InputValidationError(
+                    "systemd enqueue requires a StableDiffusionCppAdapter"
+                )
             if adapter is None:
                 service = GenerationService(
-                    options.db, options.output_dir, admission_profile=profile
+                    options.db,
+                    options.output_dir,
+                    admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
             else:
                 service = GenerationService(
@@ -566,6 +636,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                     options.output_dir,
                     adapter=adapter,
                     admission_profile=profile,
+                    attempt_runner=attempt_runner,
                 )
             result = service.enqueue(
                 options.idempotency_key,
@@ -586,11 +657,21 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
         if options.command == "worker":
             adapter = _engine_adapter(options, options.output_dir)
+            attempt_runner = _systemd_attempt_runner(
+                options, adapter=adapter, for_execution=True
+            )
             if adapter is None:
-                service = GenerationService(options.db, options.output_dir)
+                service = GenerationService(
+                    options.db,
+                    options.output_dir,
+                    attempt_runner=attempt_runner,
+                )
             else:
                 service = GenerationService(
-                    options.db, options.output_dir, adapter=adapter
+                    options.db,
+                    options.output_dir,
+                    adapter=adapter,
+                    attempt_runner=attempt_runner,
                 )
             report = service.work(limit=options.limit)
             if report["status"] == "resource_busy":
@@ -609,7 +690,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ))
 
         if options.command == "recover":
-            service = GenerationService(options.db, options.output_dir)
+            attempt_runner = _systemd_attempt_runner(
+                options, adapter=None, for_execution=False
+            )
+            service = GenerationService(
+                options.db,
+                options.output_dir,
+                attempt_runner=attempt_runner,
+            )
             report = service.recover()
             if report["status"] == "resource_busy":
                 return _write_error("resource_busy", "local generation resource is busy", 1)
@@ -617,7 +705,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
             return 1 if report["status"] == "attention_required" else 0
 
         if options.command == "cancel":
-            service = GenerationService(options.db, options.output_dir)
+            attempt_runner = _systemd_attempt_runner(
+                options, adapter=None, for_execution=False
+            )
+            service = GenerationService(
+                options.db,
+                options.output_dir,
+                attempt_runner=attempt_runner,
+            )
             _write_json(service.cancel(options.job_id), sys.stdout)
             return 0
 

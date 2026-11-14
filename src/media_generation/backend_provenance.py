@@ -224,13 +224,25 @@ version strings.
 RECORDED_ENVIRONMENT_VALUES = ("HIP_VISIBLE_DEVICES", "HSA_OVERRIDE_GFX_VERSION")
 """Environment names whose values are copied into durable evidence.
 
-Every other allowlisted variable contributes only its name, so credentials and
-host-specific paths never enter the database.
+Every other allowlisted value is covered by the environment digest but is not
+copied into the database, keeping host-specific search paths out of provenance.
 """
 
 
+ENVIRONMENT_BINDING_SCHEMA = "media-generation.engine-environment/v1"
+
+
+def environment_binding_sha256(environment: Mapping[str, str]) -> str:
+    """Fingerprint every effective child variable without recording its value."""
+    payload = {
+        "schema": ENVIRONMENT_BINDING_SCHEMA,
+        "environment": dict(environment),
+    }
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+
+
 def environment_record(environment: Mapping[str, str]) -> dict[str, object]:
-    """Describe one child environment as names plus selected non-sensitive values."""
+    """Describe safe values and bind the complete child environment by digest."""
     return {
         "names": sorted(environment),
         "values": {
@@ -238,6 +250,7 @@ def environment_record(environment: Mapping[str, str]) -> dict[str, object]:
             for name in RECORDED_ENVIRONMENT_VALUES
             if name in environment
         },
+        "sha256": environment_binding_sha256(environment),
     }
 
 
@@ -650,7 +663,9 @@ def _validate_resolved_record_v2(value: object) -> None:
         _string(item, label=f"resolved.argv[{index}]")
 
     environment = _mapping(record["environment"], label="resolved.environment")
-    _exact_keys(environment, {"names", "values"}, label="resolved.environment")
+    environment_keys = set(environment)
+    if environment_keys not in ({"names", "values"}, {"names", "values", "sha256"}):
+        raise BackendEvidenceError("resolved.environment has an unsupported field set")
     names = environment["names"]
     values = _mapping(environment["values"], label="resolved.environment.values")
     if not isinstance(names, list) or any(not isinstance(name, str) or not name for name in names):
@@ -663,6 +678,8 @@ def _validate_resolved_record_v2(value: object) -> None:
         _string(name, label="resolved.environment.values key")
         if not isinstance(item, str):
             raise BackendEvidenceError("resolved.environment.values must contain strings")
+    if "sha256" in environment:
+        _sha256(environment["sha256"], label="resolved.environment.sha256")
 
     basename = _string(record["output_basename"], label="resolved.output_basename")
     if not _OUTPUT_BASENAME.fullmatch(basename):

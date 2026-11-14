@@ -15,13 +15,14 @@ relative filename, observed source identity and timestamps, and import time.
 The source bytes are copied unchanged, including metadata and orientation.
 Later edits to the source file cannot change the stored artifact.
 
-The current schema is `user_version = 7`. A new database creates artifact,
-lineage, publication, execution, backend-evidence, privacy, admission, and
-batch-coordination structures directly in one transaction. An existing
-database reopens through a read-only connection and must match the complete
-current schema exactly. Older, newer, partial, malformed-current, and nonempty
-unversioned databases are rejected without mutation. There is no migration,
-backfill, historical publication repair, or old-job compatibility path.
+The current schema is `user_version = 9`. A new database creates artifact,
+lineage, publication, execution, backend-evidence, privacy, admission,
+batch-coordination, and systemd output-lifecycle structures directly in one
+transaction. An existing database reopens through a read-only connection and
+must match the complete current schema exactly. Older, newer, partial,
+malformed-current, and nonempty unversioned databases are rejected without
+mutation. There is no migration, backfill, historical publication repair, or
+old-job compatibility path.
 
 Every current generation job has an `execution_jobs` sidecar with non-null
 privacy-compliance evidence and exactly one `execution_admissions` row. The
@@ -33,7 +34,7 @@ incompatible. A `not_required` admission is accepted only for the exact bundled
 The store also creates immutable-artifact and writer-epoch triggers. Every
 connection registers the connection-local
 `media_generation_writer_epoch()` function. `BEFORE INSERT/UPDATE` guards on
-current mutation tables require epoch 7. A client that lacks the function, or
+current mutation tables require epoch 8. A client that lacks the function, or
 that reports a different epoch, aborts on its first guarded mutation.
 Validation compares every table, index, trigger definition, singleton resource
 row, execution sidecar, admission row, batch table, and batch slot. Unknown
@@ -158,7 +159,7 @@ The public retry operation may acknowledge an eligible bounded retry while it is
 
 Cancellation of a queued job makes it terminal before any attempt exists. For a
 claimed attempt, cancellation fences the current owner and epoch immediately and
-returns `accepted` while that execution may still be stopping. The heavyweight
+returns `requested` while that execution may still be stopping. The heavyweight
 resource is released only after recovery proves termination and publication
 state is safe. An active attempt may accept cancellation through every precommit
 publication checkpoint because the database artifact/lineage transaction remains
@@ -298,7 +299,7 @@ non-mutation when older, newer, malformed-current, or nonempty unversioned
 databases are rejected. Runtime images exercise the import boundary and full
 decoding. The
 field-by-field publication fault matrix covers allocation through reply loss.
-Focused cancellation tests exercise all 14 precommit checkpoints as accepted and
+Focused cancellation tests exercise all 14 precommit checkpoints as requested and
 all six postcommit checkpoints as `too_late`. Recovery tests cover canceled ready
 journals before and after physical link, repeated convergence, committed-wins
 refusal, retained-final orphan reporting, owner and epoch fences, stale
@@ -320,9 +321,11 @@ changes, but do not protect against an adversary controlling the storage host.
 ## 7. Durable batch coordination
 
 `GenerationBatchService` stores a batch manifest and ordered slot rows in the
-same schema-v7 database as T04. It commits each slot's request, stable slot ID,
-T04 idempotency key, attempt budget, and per-slot admission profile and demand
-before admitting a GenerationJob. The T04 service remains the only component
+same SQLite database introduced by T04. That database first used schema
+version 7; the current persistent schema is version 9. The service commits each
+slot's request, stable slot ID, T04 idempotency key, attempt budget, and
+per-slot admission profile and demand before admitting a GenerationJob. The
+T04 service remains the only component
 that admits, executes, retries, recovers, or publishes a single output.
 
 Batch slots run in ordinal order. On resume, a slot first resolves its service
@@ -375,3 +378,24 @@ Workers coordinate through one SQLite database and one local filesystem. This
 implementation has no distributed scheduling, HTTP service, model download,
 network inference, or model installation. The bundled deterministic adapter is
 CPU-only test infrastructure, not a production model result.
+
+## 8. Systemd runner output and publication
+
+For systemd-contained Stable Diffusion C++ attempts, the worker keeps the
+publisher's existing staging descriptor and publication authority. The runner
+cannot write artifact or publication rows and cannot finalize the job. After
+the broker validates the exact attempt identity and proves the cgroup empty, it
+passes the worker a read-only descriptor for the runner's scratch output. The
+adapter validates that descriptor and streams its bytes into the existing
+staging descriptor; the existing publisher then performs image validation,
+lineage updates, filesystem synchronization, and atomic no-clobber
+publication.
+
+The broker retains the scratch directory until the worker acknowledges
+validation or recovery has fenced publication and reconciled its journal. A
+worker crash before result retrieval cannot use stale scratch output. Recovery
+removes scratch only after it validates the immutable unit identity, durable
+cgroup proof, and publication fence. If output cannot be opened or validated,
+the attempt cannot succeed and no artifact is published. The engine observation
+is required for success, while verified cgroup termination can still release a
+canceled or failed attempt whose observation was lost.

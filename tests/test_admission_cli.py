@@ -7,9 +7,18 @@ from pathlib import Path
 
 import pytest
 
+from media_generation import cli as cli_module
 from media_generation.cli import main
+from media_generation.domain import GenerationRequest
+from media_generation.engine import StableDiffusionCppAdapter
+from media_generation.service import GenerationService, _lease_deadline, _now
+from media_generation.systemd_attempts import (
+    SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
+    SystemdAttemptRunner,
+)
 from test_durable_execution import request
 from test_resource_admission import GIB, inventory_report
+from test_t08_support import build_bundle
 
 
 def _write_json(path: Path, value: object) -> Path:
@@ -84,6 +93,114 @@ def test_cli_admits_and_inspects_one_pinned_capacity_decision(
     assert inspected["admission"]["reason"] == "capacity_fit"
     assert inspected["admission"]["reserved_bytes"] is None
     assert inspected["resource"] is None
+
+
+def test_cli_enqueued_systemd_job_is_claimable_by_matching_worker(
+    tmp_path: Path, capsys, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The enqueue CLI persists the same systemd contract used by its worker."""
+    bundle = build_bundle(tmp_path)
+    inventory, policy, demand = _operator_documents(tmp_path)
+    database = tmp_path / "systemd.sqlite3"
+    services: list[GenerationService] = []
+    service_factory = cli_module.GenerationService
+
+    def capture_service(*args, **kwargs):
+        service = service_factory(*args, **kwargs)
+        services.append(service)
+        return service
+
+    monkeypatch.setattr(cli_module, "GenerationService", capture_service)
+    arguments = [
+        "enqueue",
+        "--db",
+        str(database),
+        "--output-dir",
+        str(tmp_path / "images"),
+        "--idempotency-key",
+        "cli-systemd-admission",
+        "--request-json",
+        GenerationRequest(
+            "A copper fox", seed=73, width=64, height=64
+        ).canonical_json(),
+        "--inventory-report",
+        str(inventory),
+        "--admission-policy",
+        str(policy),
+        "--workload-demand",
+        str(demand),
+        "--engine-candidate",
+        str(bundle.declaration_path),
+        "--engine-trusted-evidence",
+        str(bundle.trusted_evidence_path),
+        "--systemd-broker-socket",
+        str(tmp_path / "broker.sock"),
+        "--systemd-scratch-root",
+        str(tmp_path / "scratch"),
+        "--systemd-runner-uid",
+        "970",
+        "--systemd-runner-gid",
+        "970",
+    ]
+
+    assert main(arguments) == 0
+    enqueued = json.loads(capsys.readouterr().out)
+    assert enqueued["status"] == "queued"
+    assert len(services) == 1
+    service = services[0]
+    assert isinstance(service.adapter, StableDiffusionCppAdapter)
+    assert isinstance(service._attempt_runner, SystemdAttemptRunner)
+    assert service._containment_contract == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+
+    _, configuration_json, _, privacy_json = service._current_privacy_snapshot()
+    claim = service._store.claim_next_execution(
+        attempt_id="att_0123456789abcdef0123456789abcdef",
+        owner_id="worker_0123456789abcdef0123456789abcdef",
+        adapter_id=service.adapter.adapter_id,
+        adapter_configuration_json=configuration_json,
+        privacy_compliance_json=privacy_json,
+        resolved_output_directory=str(service.output_directory),
+        process_contained=True,
+        containment_contract=SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
+        timestamp=_now(),
+        lease_expires_at=_lease_deadline(service._lease),
+        job_id=enqueued["job_id"],
+    )
+    assert claim is not None
+    assert claim.job_id == enqueued["job_id"]
+
+
+def test_cli_rejects_systemd_enqueue_without_engine_candidate(
+    tmp_path: Path, capsys
+) -> None:
+    """A systemd containment contract cannot be persisted for the CPU adapter."""
+    database = tmp_path / "systemd.sqlite3"
+    arguments = [
+        "enqueue",
+        "--db",
+        str(database),
+        "--output-dir",
+        str(tmp_path / "images"),
+        "--idempotency-key",
+        "cli-systemd-without-engine",
+        "--request-json",
+        GenerationRequest(
+            "A copper fox", seed=73, width=64, height=64
+        ).canonical_json(),
+        "--systemd-broker-socket",
+        str(tmp_path / "broker.sock"),
+        "--systemd-scratch-root",
+        str(tmp_path / "scratch"),
+        "--systemd-runner-uid",
+        "970",
+        "--systemd-runner-gid",
+        "970",
+    ]
+
+    assert main(arguments) == 2
+    error = json.loads(capsys.readouterr().err)
+    assert "systemd enqueue requires" in error["error"]["message"]
+    assert not database.exists()
 
 
 def test_cli_claimed_admission_reports_fence_and_lease(
@@ -251,12 +368,15 @@ def test_adapter_failure_details_are_redacted_from_admission_and_cli(
     )
     services: list[GenerationService] = []
 
-    def service_factory(database, output_dir, *, admission_profile=None):
+    def service_factory(
+        database, output_dir, *, admission_profile=None, attempt_runner=None
+    ):
         service = GenerationService(
             database,
             output_dir,
             adapter=SecretFailure(),
             admission_profile=admission_profile,
+            attempt_runner=attempt_runner,
         )
         services.append(service)
         return service

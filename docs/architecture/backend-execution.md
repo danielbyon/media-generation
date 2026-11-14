@@ -629,6 +629,171 @@ numbering, publisher ownership, fence epochs, retry eligibility, or
 no-clobber artifact publication.
 
 
+## Systemd-contained GPU attempts
+
+For a systemd-enabled Stable Diffusion C++ attempt, the worker resolves the
+invocation once and persists its canonical record before dispatch. The broker
+checks the request against that exact record, then starts a fixed attempt
+runner in a transient system service. The runner receives the durable argv,
+environment, and broker-created scratch path. It does not resolve a new
+invocation or choose systemd properties.
+
+The resolved environment record stores variable names and the selected GPU
+override values. A domain-separated SHA-256 also binds every effective
+environment value, including `PATH`, `LD_LIBRARY_PATH`, and `ROCM_PATH`, without
+copying those path values into public provenance. The broker and runner
+recompute the digest before launch. The broker's root-owned
+`environment_path_allowlist` names the exact directories that may appear in
+search-path variables. Empty entries, relative paths, symlinked directories,
+and paths outside that list are rejected. A configured `ROCM_PATH` must also
+contain a readable `.info/version` file.
+
+The runner owns `ProcessSupervisor` and the engine child. It records the
+existing `LaunchFact` after spawn and the existing `ProcessObservation` after
+the engine child is reaped. The broker writes those facts through the normal
+claim-owner and epoch checks while the attempt remains current. The supervisor
+continues to verify the exact argv and environment and stores only bounded,
+privacy-safe stream summaries. The runner itself starts with the private
+attempt directory as its working directory; it starts the engine with `/` as
+its working directory because the durable engine argv contains absolute input
+and output paths. Direct-child execution paths keep their existing evidence
+contract; this design does not infer process-tree containment from their
+observations.
+
+The result keeps six facts separate:
+
+| Fact | Evidence | What it establishes |
+| --- | --- | --- |
+| Launcher exit | `systemd-run` process return code | The systemd client returned. With `--wait`, systemd-run can propagate the service result; that result is the runner's status, not the engine's. See the [systemd-run manual](https://freedesktop.org/software/systemd/man/latest/systemd-run.html). |
+| Runner exit | The matching unit's `MainPID`, `ExecMainCode`, `ExecMainStatus`, and `Result` | The transient service's runner process exited and systemd classified its exit code or signal. |
+| Engine exit | `ProcessObservation` exit code, signal, and reaped-child fields | The exact supervised engine child exited. It does not establish that every cgroup process exited. |
+| Unit identity | Invocation ID, control-group path, boot ID, and cgroup device/inode | The service and cgroup belong to this attempt. Identity alone does not establish termination. |
+| Cgroup termination | `cgroup.events` reports `populated 0` through the descriptor pinned to the validated unit and cgroup | No process remains in that attempt cgroup. |
+| Stream completion | The runner control stream ended with a complete success record | The broker received the runner result without a lost or malformed control message. |
+
+The broker captures the unit invocation ID, control-group path, boot ID, and
+cgroup device/inode before accepting engine evidence. `RemainAfterExit=yes`
+keeps the completed service available until the broker explicitly stops it.
+The broker opens `cgroup.events` after validating those identities and keeps
+that descriptor through `StopUnit` and the empty check. After receiving a
+runner completion record, it waits until the matching unit reports `MainPID=0`
+and a terminal `ExecMainCode` before it stops the unit and samples
+`cgroup.events`. On cancellation or worker loss, it stops the unit first and
+then verifies that same runner exit before recording cgroup emptiness. The
+broker saves the unit result and exit status before `StopUnit`, because systemd
+may garbage-collect the completed unit afterward. If systemd removes the unit
+or cgroup path before the descriptor is pinned, termination is unproven.
+If the pinned event reports an empty cgroup, the broker durably records the
+proof even when systemd has since removed the unit name or cgroup path. Once
+the proof is durable, later unit garbage collection does not invalidate it. A
+worker or host restart loses an unpersisted descriptor; recovery then needs new
+independently verified evidence or keeps capacity quarantined.
+
+`systemd-run --pipe` connects the transient service's standard streams to the
+broker's launcher pipes. The worker communicates with the broker over its
+authenticated local socket; worker loss alone leaves the launch pipes open
+because the broker owns them. The broker's disconnect watcher fences the
+attempt and stops its exact unit. If the broker or runner loses a pipe endpoint,
+writes may fail with `EPIPE` or `SIGPIPE`; an incomplete control stream cannot
+stand in for engine evidence. The broker treats that result as incomplete and
+uses cgroup proof for cleanup. A worker that dies before it receives a result
+cannot publish the scratch image.
+
+Success requires all of the following: a valid engine observation with exit
+code zero and no signal; successful launcher and unit results; a complete
+runner stream; validated image bytes; verified cgroup-empty evidence; and
+current publication authority. The worker passes the broker's read-only output
+descriptor to the adapter's existing `stream_systemd_execution` method. That
+method validates the image and copies it into the publisher's original staging
+descriptor. The existing publication transaction remains the only path that
+creates the artifact and commits the job.
+
+Cancellation and worker-loss recovery use termination evidence independently
+of engine success evidence. The worker fences publication, the broker stops
+the exact authenticated unit, and recovery waits for the whole cgroup to empty.
+Recovery reconciles or revokes incomplete publication rows before applying the
+existing resource and admission checks. A missing engine observation prevents
+success; it does not by itself prove that a GPU process survived. Verified
+cgroup termination and safe publication state can release capacity for a
+canceled or failed attempt. Uncertain unit identity, missing cgroup proof, or
+unreconciled publication keeps the resource quarantined.
+
+The system service runs under the configured non-root runner UID and primary
+GID. Its supplementary groups are an exact allowlist: the GPU `render` and
+`video` groups when required by the configured device nodes, the private
+scratch group, and the read-only model/runtime group. The broker checks the
+runner's NSS memberships against that allowlist. The worker has its own primary
+publication group and only the read-only model/runtime group as a supplementary
+group; it never joins the scratch or GPU groups. The broker checks the worker's
+NSS memberships exactly. The shared read group relies on ordinary owner/group
+mode bits because broker validation does not evaluate named POSIX ACL entries.
+The mirrored runtime and model tree therefore has root-owned directories with
+group traversal/read permissions and root-owned read-only files. The engine
+executable is group-readable and executable so the runner can launch it; this
+also gives the worker execute permission on that file, but no GPU device or
+scratch access.
+
+Before launch, the broker inspects each direct entry in the configured `PATH`
+and `LD_LIBRARY_PATH` directories. It fails closed if an entry cannot be
+inspected, is a special file, targets a non-root-owned file, or is writable by
+the group, world, worker, or runner. Every symlink hop and directory in a
+target path must also be root-owned and nonreplaceable. Runtime libraries must
+be readable by both services, and executable `PATH` entries must be executable
+by the runner. Private engine and model inputs cannot be world-readable.
+
+The broker allowlists the required GPU device nodes, model and input read
+roots, scratch directory, and runner executable, then supplies fixed
+`User=`, `Group=`, supplementary-group, device, filesystem, and kill-policy
+properties. The runner has no database access. The root broker opens the
+configured SQLite database to persist launch and engine-observation facts. It
+also maintains a root-owned evidence ledger in a dedicated protected
+directory at
+`<deployment root>/systemd-evidence/<database directory>-<database filename>.systemd-evidence.sqlite3`.
+For the APEX database, the path is
+`/var/lib/media-generation-v9/systemd-evidence/db-jobs.sqlite3.systemd-evidence.sqlite3`.
+The broker stores each
+immutable unit identity and cgroup-empty proof in this ledger, then mirrors the
+facts into the job database. The job database may be writable by the worker,
+so its copy alone is never accepted as proof of containment or termination.
+The ledger is owned by root, readable by the configured worker group, and not
+writable by that group. The directory is also outside the worker-writable
+database directory, so the worker cannot create or replace SQLite sidecars.
+The worker opens it read-only and requires its identity and termination records
+to match before resource release. Missing or conflicting ledger data fails
+closed.
+
+The root-owned broker is the systemd authorization boundary. It invokes
+`systemd-run --system` as root, so the system manager authorizes the broker's
+root credentials; polkit does not give this root process a narrow per-property
+allowlist. The worker receives no general systemd management privilege. A
+unit-name prefix only limits the namespace. The broker also checks peer
+credentials, exact request fields, claim and epoch, the durable resolved
+invocation, and live unit properties; it constructs every transient-unit
+property itself. The broker executable, its root-owned configuration, and
+the protected socket directory must not be writable by the worker.
+
+Broker configuration, runner executable, socket, scratch root, and database
+paths must sit beneath root-owned, nonreplaceable directory chains. The broker
+rejects symlinked or worker-owned ancestors and writable ancestors without a
+root-owned sticky bit. The sidecar ledger needs the same protected parent
+directory as the database, with root ownership and read access for the worker
+group. APEX must provide those paths and the required worker, runner,
+ROCm, model-read, GPU-device, model, scratch, database, and ledger access before
+qualification. Implementation does not apply host permission changes.
+Approving the broker software does not authorize installing it or changing
+systemd or host permissions on APEX. The owner must authorize the installation,
+service configuration, identities, directories, and device access. Until then,
+the APEX backend remains unqualified.
+
+Published image staging files use mode `0600`. The runner is intentionally not
+a member of the worker publication group, so the current broker cannot read a
+published artifact used as an engine `-r` reference. Do not solve this by
+adding the runner to the worker group or broadening every artifact's mode. A
+reference-conditioned APEX run remains blocked until a separately reviewed
+per-attempt read-only input handoff gives the runner only the selected input.
+The deployment manifest covers model/runtime access and reference-free runs;
+it does not claim the reference-conditioned path is qualified.
+
 ## Pre-dispatch refusals
 
 An adapter prepares and resolves the execution before it marks the attempt as
@@ -668,6 +833,11 @@ format and dimensions through a no-follow file handle before copying bytes into
 the publisher's already-open staging descriptor. The existing publisher then
 performs its normal full-image validation, filesystem synchronization, lineage
 insertion, and no-clobber publication.
+
+The C++ engine subprocess starts in `/`. glibc resolves an empty RUNPATH
+component against the current directory ([GNU libc source](https://sourceware.org/pipermail/libc-stable/2017-January/000518.html)),
+so writable attempt scratch is outside that library search. The adapter resolves
+model, reference, and output paths before building the engine arguments.
 
 The adapter removes the scratch directory in `finally` after success or failure.
 The service also removes it if publication fails after resolution but before

@@ -232,7 +232,7 @@ def test_crash_then_cancel_before_reconcile_converges_without_artifact(
                 preserved = (final, final.stat().st_dev, final.stat().st_ino, final.read_bytes())
 
     canceled = service_at(tmp_path).cancel(queued.job_id)
-    assert canceled["outcome"] == "accepted"
+    assert canceled["outcome"] == "requested"
     service_at(tmp_path).recover()
     service_at(tmp_path).recover()
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
@@ -521,7 +521,7 @@ def test_canceled_external_publication_without_termination_proof_quarantines_res
     queued = _admit(service, "external-cancel", request(), max_attempts=2)
     service.work()
 
-    assert canceled[0]["outcome"] == "accepted"
+    assert canceled[0]["outcome"] == "requested"
     assert service_at(tmp_path).recover()["status"] == "attention_required"
     snapshot = service_at(tmp_path).get_provenance(queued.job_id)
     assert snapshot["status"] == "canceled"
@@ -684,7 +684,7 @@ def test_canceled_ready_publication_reports_retained_final_as_orphan(
     retained_stat = retained.stat()
     retained_bytes = retained.read_bytes()
 
-    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "requested"
     assert service_at(tmp_path).recover()["status"] == "canceled"
     report = service_at(tmp_path).recover()
 
@@ -736,7 +736,7 @@ def test_canceled_allocated_attempt_reconciliation_finalizes_attempt_and_resourc
             "canceled-allocation", request(), max_attempts=2
         )
     crash_worker(tmp_path, checkpoint="stage_written", external=external)
-    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "requested"
 
     report = service_at(tmp_path).reconcile()
 
@@ -767,7 +767,7 @@ def test_canceled_allocated_attempt_reconciliation_reports_failed_finalization(
         "canceled-finalization-failure", request(), max_attempts=2
     )
     crash_worker(tmp_path, checkpoint="stage_written")
-    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+    assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "requested"
 
     service = service_at(tmp_path)
     monkeypatch.setattr(service._store, "fail_execution", lambda *args, **kwargs: False)
@@ -816,7 +816,7 @@ def test_live_ready_cancellation_finalizes_before_recovery(
         if name != "ready_committed":
             final = next((tmp_path / "images").glob("*.png"))
             preserved.append((final, final.stat().st_ino, final.read_bytes()))
-        assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+        assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "requested"
 
     service = _admitted_service_at(
         tmp_path,
@@ -930,7 +930,7 @@ def test_cancel_after_reconciliation_snapshot_cannot_restore_retry(
         reconciliation = pool.submit(service.reconcile)
         try:
             assert snapshot_read.wait(10), "reconciliation did not reach finalization"
-            assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "accepted"
+            assert service_at(tmp_path).cancel(queued.job_id)["outcome"] == "requested"
             canceled = service.get_provenance(queued.job_id)
             assert canceled["status"] == "canceled"
             assert canceled["execution"]["retry_eligible"] is False
