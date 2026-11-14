@@ -418,8 +418,16 @@ def _install_valid_broker_host_mocks(
 ) -> BrokerConfiguration:
     if configuration is None:
         configuration = _broker_configuration(tmp_path)
-    runner = SimpleNamespace(pw_name="engine-runner", pw_gid=configuration.runner_gid)
-    worker = SimpleNamespace(pw_name="generation-worker", pw_gid=configuration.worker_gid)
+    runner = SimpleNamespace(
+        pw_name="engine-runner",
+        pw_uid=configuration.runner_uid,
+        pw_gid=configuration.runner_gid,
+    )
+    worker = SimpleNamespace(
+        pw_name="generation-worker",
+        pw_uid=configuration.worker_uid,
+        pw_gid=configuration.worker_gid,
+    )
     groups = {
         configuration.runner_gid: {runner.pw_name},
         configuration.worker_gid: {worker.pw_name},
@@ -538,6 +546,39 @@ def test_broker_validates_shared_read_group_and_scratch_root_0710(
 ) -> None:
     configuration = _install_valid_broker_host_mocks(tmp_path, monkeypatch)
     configuration.validate_host_paths()
+
+
+@pytest.mark.parametrize("substituted_account", ("runner", "worker"))
+def test_broker_rejects_nss_account_uid_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    substituted_account: str,
+) -> None:
+    configuration = _install_valid_broker_host_mocks(tmp_path, monkeypatch)
+    runner_uid = configuration.runner_uid + (
+        1 if substituted_account == "runner" else 0
+    )
+    worker_uid = configuration.worker_uid + (
+        1 if substituted_account == "worker" else 0
+    )
+    runner = SimpleNamespace(
+        pw_name="engine-runner",
+        pw_uid=runner_uid,
+        pw_gid=configuration.runner_gid,
+    )
+    worker = SimpleNamespace(
+        pw_name="generation-worker",
+        pw_uid=worker_uid,
+        pw_gid=configuration.worker_gid,
+    )
+    monkeypatch.setattr(
+        broker_module.pwd,
+        "getpwuid",
+        lambda uid: runner if uid == configuration.runner_uid else worker,
+    )
+
+    with pytest.raises(ValueError, match="NSS account UID"):
+        configuration.validate_host_paths()
 
 
 @pytest.mark.parametrize(
@@ -1359,8 +1400,16 @@ def test_broker_rejects_runner_database_groups_outside_allowlist(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configuration = _broker_configuration(tmp_path)
-    runner = SimpleNamespace(pw_name="engine-runner", pw_gid=configuration.runner_gid)
-    worker = SimpleNamespace(pw_name="generation-worker", pw_gid=configuration.worker_gid)
+    runner = SimpleNamespace(
+        pw_name="engine-runner",
+        pw_uid=configuration.runner_uid,
+        pw_gid=configuration.runner_gid,
+    )
+    worker = SimpleNamespace(
+        pw_name="generation-worker",
+        pw_uid=configuration.worker_uid,
+        pw_gid=configuration.worker_gid,
+    )
     group_members = {
         configuration.runner_gid: [runner.pw_name],
         configuration.worker_gid: [worker.pw_name],
@@ -1407,8 +1456,16 @@ def test_broker_rejects_worker_supplementary_groups(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     configuration = _broker_configuration(tmp_path)
-    runner = SimpleNamespace(pw_name="engine-runner", pw_gid=configuration.runner_gid)
-    worker = SimpleNamespace(pw_name="generation-worker", pw_gid=configuration.worker_gid)
+    runner = SimpleNamespace(
+        pw_name="engine-runner",
+        pw_uid=configuration.runner_uid,
+        pw_gid=configuration.runner_gid,
+    )
+    worker = SimpleNamespace(
+        pw_name="generation-worker",
+        pw_uid=configuration.worker_uid,
+        pw_gid=configuration.worker_gid,
+    )
     group_members = {
         configuration.runner_gid: [runner.pw_name],
         configuration.worker_gid: [worker.pw_name],

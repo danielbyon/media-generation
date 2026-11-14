@@ -1,8 +1,8 @@
 # APEX T13 broker deployment proposal
 
 This file records a host-specific deployment proposal for T13. It is not an
-installation record. No account, group, directory, permission, unit, or device
-change is authorized by approval of the software design.
+installation record. The owner has authorized the isolated APEX installation;
+execution still waits for the NSS identity checks and final technical review.
 
 ## 1. Read-only host facts
 
@@ -42,44 +42,55 @@ candidate was previously evaluated `READY` at its original paths; that result
 does not qualify a copied or path-rewritten mirror. The mirror declaration
 must be evaluated again with its trusted evidence before it can be selected.
 
-The GPU nodes are `root:render` (`/dev/kfd` and
-`/dev/dri/renderD128`, GID 990) and `root:video` (`/dev/dri/card1`, GID 44),
-all mode `0660`. The proposed `/srv/media-generation` mirror and
+The proposed GPU allowlist contains only `/dev/kfd` and
+`/dev/dri/renderD128`; both are `root:render`, GID 990, mode `0660`. APEX also
+has `/dev/dri/card1` as `root:video`, GID 44, mode `0660`. That node and GID 44
+are excluded from this proposal because no need has been demonstrated. The
+proposed `/srv/media-generation` mirror and
 `/run/media-generation` directory do not exist. `/srv` is `root:root 0755`;
 `/run` is `root:root 0755`. UIDs 970 and 972 and GIDs 970 through 973 were
 free at the latest check. UID 973 belongs to the existing `sshd` account with
 primary GID 65534; that UID is not part of this proposal. GIDs 990 and 44
-already exist. Recheck each UID and GID separately, along with device modes,
-immediately before any owner-authorized provisioning.
+already exist. Recheck each UID and GID separately, along with the two approved
+device modes, immediately before any owner-authorized provisioning. Keep the
+runner out of GID 44; do not change the existing `daniel` membership.
 
 The current `/etc/nsswitch.conf` uses `passwd: files systemd sss` and
-`group: files systemd sss`. The Linux broker requires complete local `files`
-sources for both databases and for an explicit `initgroups` source. It reads
-the protected `/etc/passwd` file directly to include every primary GID;
+`group: files systemd sss`. The Linux broker requires complete membership
+evidence, including every primary GID. Its current verifier reads the protected
+`/etc/passwd` file and refuses startup when NSS adds other sources, because
 `getpwall()` can return a partial list without reporting an enumeration error.
-The current APEX NSS policy therefore blocks broker startup. The owner must
-authorize either a reviewed NSS policy change or a separate, verifiable
-identity-enumeration design. No NSS configuration was changed.
+
+A read-only check on 2026-11-13 found `libnss_sss.so.2` installed,
+`sssd.service` enabled but inactive, no `/etc/sssd/sssd.conf`, and no `sssctl`
+command. `getent -s sss passwd` and `getent -s sss group` each exited zero with
+no entries. The `systemd` source also returned no entries during enumeration,
+while keyed lookups still resolved its synthetic `root` and `nobody` records.
+Those empty enumerations do not establish complete membership. No scoped
+identity check has been established for this NSS configuration, so broker
+startup and APEX qualification remain blocked. Do not change
+`/etc/nsswitch.conf` or relax the membership checks. A reviewed identity design
+must prove complete protected-group membership before deployment.
 
 The proposed service accounts are not installed, so effective access has not
 been tested under UIDs 970 and 972. The owner checks in section 6 cover model,
 runtime, ROCm marker, GPU, and socket access after the identities are approved.
 
-The existing `daniel` account is a member of both GID 44 and GID 990 and keeps
-that access. No existing account or device permission is changed by this
-proposal. Broker admission covers only its own attempts, so real-engine
-qualification must confirm that no unrelated inference workload is competing
-for the GPU.
+The existing `daniel` account is a member of GID 44 and GID 990 and keeps that
+access. This proposal adds the runner to GID 990 only; it does not add the
+runner to GID 44 or change any existing account or device permission. Broker
+admission covers only its own attempts, so real-engine qualification must
+confirm that no unrelated inference workload is competing for the GPU.
 
 ## 2. Identities and access policy
 
 | Name | ID | Membership and access |
 | --- | ---: | --- |
-| `media-generation-runner` user and primary group | UID/GID 970 | Supplementary GIDs 44 (`video`), 971 (scratch), 973 (model/runtime read), and 990 (`render`). No GID 972. |
+| `media-generation-runner` user and primary group | UID/GID 970 | Supplementary GIDs 971 (scratch), 973 (model/runtime read), and 990 (`render`). No GID 44 or 972. |
 | `media-generation-scratch` group | GID 971 | Runner only. The broker creates each attempt directory as `root:media-generation-scratch 2770`. |
 | `media-generation-worker` user and primary group | UID/GID 972 | Supplementary GID 973 only. No GPU or scratch groups. Owns the worker database and publication output. |
 | `media-generation-model-read` group | GID 973 | Runner and worker only. Read/traverse access to the immutable candidate mirror. |
-| Existing `video` and `render` groups | GIDs 44 and 990 | Add the runner for GPU access. Preserve the existing `daniel` membership; these shared host groups are not private access boundaries. |
+| Existing `render` group | GID 990 | Add the runner for `/dev/kfd` and `/dev/dri/renderD128`. Do not add the runner to GID 44 (`video`) or change existing membership. |
 
 The broker requires the runner's actual NSS groups to be a subset of its
 configured list and the worker's actual groups to equal `{972, 973}`. It also
@@ -126,15 +137,14 @@ the proposed APEX layout; the broker refuses unknown or missing fields.
   "runner_executable": "/opt/media-generation/t13/venv/bin/media-generation-attempt-runner",
   "runner_uid": 970,
   "runner_gid": 970,
-  "runner_supplementary_gids": [44, 971, 973, 990],
+  "runner_supplementary_gids": [971, 973, 990],
   "worker_uid": 972,
   "worker_gid": 972,
   "scratch_gid": 971,
   "model_read_gid": 973,
   "device_allow": [
     "/dev/kfd",
-    "/dev/dri/renderD128",
-    "/dev/dri/card1"
+    "/dev/dri/renderD128"
   ],
   "read_roots": [
     "/srv/media-generation/candidates/t08-qwen-image-edit-2511-apex-draft-r1/runtime",
@@ -269,7 +279,7 @@ It sets these properties on every attempt:
 | Property | Value |
 | --- | --- |
 | `User`, `Group` | `970`, `970` |
-| `SupplementaryGroups` | `44 971 973 990` |
+| `SupplementaryGroups` | `971 973 990` |
 | `RemainAfterExit`, `KillMode`, `Delegate` | `yes`, `control-group`, `no` |
 | `NoNewPrivileges`, `ProtectSystem`, `ProtectHome` | `yes`, `strict`, `read-only` |
 | `PrivateDevices`, `DevicePolicy` | `no`, `closed` |
@@ -277,25 +287,27 @@ It sets these properties on every attempt:
 | `CapabilityBoundingSet` | Empty |
 | `RestrictSUIDSGID`, `ProtectKernelTunables`, `ProtectControlGroups`, `RestrictNamespaces` | `yes` |
 | `UMask` | `0077` |
-| `DeviceAllow` | `/dev/kfd rw`, `/dev/dri/renderD128 rw`, `/dev/dri/card1 rw` |
+| `DeviceAllow` | `/dev/kfd rw`, `/dev/dri/renderD128 rw` |
 
 The runner service starts in its scratch directory. Its `ProcessSupervisor`
 launches the engine with `/` as its current directory and passes absolute
 scratch, model, and output paths. This keeps writable scratch out of the
 engine's dynamic-loader search through an empty path entry.
 
-## 6. Owner-only installation and verification sequence
+## 6. Owner-authorized installation and verification sequence
 
-The installation commands require separate owner authorization. The service
-unit passed `systemd-analyze verify` with systemd 259.9 in an isolated temporary
-root containing a stub broker executable. No unit was installed or started.
+The owner has authorized the isolated installation described here. Do not run
+these commands until the NSS identity checks and final technical review pass.
+The service unit passed `systemd-analyze verify` with systemd 259.9 in an
+isolated temporary root containing a stub broker executable. No unit was
+installed or started.
 
 1. Before creating users or groups, run this read-only preflight. It checks
    the assigned numeric IDs, preserves UID 973 for `sshd`, verifies the
-   existing GPU groups, and stops if NSS cannot provide complete local
-   identity records. The current `files systemd sss` configuration fails the
-   NSS check; do not continue until the owner authorizes a verified identity
-   source.
+   approved `render` group, and stops if NSS cannot provide complete identity
+   records. The current `files systemd sss` configuration fails the check.
+   Keep deployment blocked until a reviewed identity source proves complete
+   protected-group membership without changing global NSS policy.
 
    ```sh
    set -eu
@@ -313,7 +325,6 @@ root containing a stub broker executable. No unit was installed or started.
            exit 1
        fi
    done
-   test "$(getent group 44 | cut -d: -f1)" = video
    test "$(getent group 990 | cut -d: -f1)" = render
    python3 - <<'PY'
    from pathlib import Path
@@ -341,13 +352,13 @@ root containing a stub broker executable. No unit was installed or started.
    if "initgroups" in entries and entries["initgroups"] != ["files"]:
        raise SystemExit("initgroups NSS source must be exactly files")
    PY
-   stat -c '%n %u:%g %a' /dev/kfd /dev/dri/renderD128 /dev/dri/card1 /srv /run
+   stat -c '%n %u:%g %a' /dev/kfd /dev/dri/renderD128 /srv /run
    namei -l /home/daniel/ai/qualification-runs/t08-20261031T045433Z/runtime/sd-cpp-hip-b13a482-develvenv/bin/sd-cli
    namei -l /home/daniel/ai/qualification-runs/t08-20261031T045433Z/inputs/models
    namei -l /home/daniel/ai/hf-repos/qwen-image-components/split_files/vae
    ```
 
-2. After the owner authorizes the identities and the preflight passes, create
+2. After the NSS and technical gates pass and the preflight succeeds, create
    the four groups and the two non-login accounts. UID 973 remains assigned to
    `sshd`; GID 973 is the model-read group.
 
@@ -361,7 +372,7 @@ root containing a stub broker executable. No unit was installed or started.
        --home-dir /nonexistent --shell /usr/sbin/nologin media-generation-runner
    useradd --system --uid 972 --gid 972 --no-create-home \
        --home-dir /nonexistent --shell /usr/sbin/nologin media-generation-worker
-   usermod --append --groups 44,971,973,990 media-generation-runner
+   usermod --append --groups 971,973,990 media-generation-runner
    usermod --append --groups 973 media-generation-worker
 
    test "$(id -u media-generation-runner)" = 970
@@ -372,7 +383,7 @@ root containing a stub broker executable. No unit was installed or started.
    test "$(getent group media-generation-model-read | cut -d: -f3)" = 973
    runner_groups=$(id -G media-generation-runner | tr ' ' '\n' | sort -n | paste -sd ' ' -)
    worker_groups=$(id -G media-generation-worker | tr ' ' '\n' | sort -n | paste -sd ' ' -)
-   test "$runner_groups" = '44 970 971 973 990'
+   test "$runner_groups" = '970 971 973 990'
    test "$worker_groups" = '972 973'
    id -G daniel | tr ' ' '\n' | grep -qx 44
    id -G daniel | tr ' ' '\n' | grep -qx 990
@@ -385,9 +396,9 @@ root containing a stub broker executable. No unit was installed or started.
 
    Before T07 evaluation, run this read-only check as root. It rejects
    named/default ACLs and world-readable private files, then checks effective
-   traversal, read, and write access under each service identity. It checks all
-   three GPU nodes for the runner and confirms the worker can neither read nor
-   write them.
+   traversal, read, and write access under each service identity. It checks the
+   two approved GPU nodes for the runner and confirms the worker can neither
+   read nor write them.
 
    ```sh
    set -eu
@@ -430,7 +441,7 @@ root containing a stub broker executable. No unit was installed or started.
            -exec sh -eu -c 'for item do test -r "$item"; test ! -w "$item"; done' sh {} +
    done
    runuser -u media-generation-runner -- test -x "$engine"
-   for device in /dev/kfd /dev/dri/renderD128 /dev/dri/card1; do
+   for device in /dev/kfd /dev/dri/renderD128; do
        runuser -u media-generation-runner -- test -r "$device"
        runuser -u media-generation-runner -- test -w "$device"
        if runuser -u media-generation-worker -- test -r "$device" \
@@ -454,7 +465,8 @@ root containing a stub broker executable. No unit was installed or started.
    start, run `systemd-analyze verify
    /etc/systemd/system/media-generation-systemd-broker.service`. Do not grant
    broad systemd or sudo permissions to the worker.
-7. After separate authorization to start the service, run these checks. They
+7. After the technical gate passes and the owner-authorized installation has
+   proceeded, run these checks. They
    prove the worker can reach the socket and `nobody` cannot traverse or
    connect. The broker also rejects any peer whose `SO_PEERCRED` UID/GID is not
    972/972.
@@ -513,25 +525,21 @@ or archive only the exact service unit/configuration and package path after
 checking their identities. Leave the service accounts and groups in place
 until an owner confirms that no retained files or evidence use those IDs.
 
-## 7. Authorization still required
+## 7. Qualification status and remaining gates
 
-The owner must separately authorize runner UID/GID 970, scratch GID 971,
-worker UID/GID 972, and model-read GID 973. The existing `sshd` account uses
-UID 973 and must remain unchanged. Authorization is also required for the
-service accounts, protected candidate mirror and rewritten T07 declaration,
-isolated package installation, fresh schema-v9 database and ledger, broker
-configuration and unit, socket path, scratch path, and runner membership in
-the existing `video` and `render` groups. Approval of PR #56 or this proposal
-does not authorize those host changes. No broker service has been installed
-or started, no original model/runtime permissions were changed, and no
-real-engine inference or destructive fault injection was run.
+The owner has authorized the isolated installation. No accounts, groups,
+directories, permissions, units, or device settings have been changed. UID 973
+remains assigned to `sshd`; the proposed model-read GID is 973. The NSS
+identity source and final technical review remain unresolved, so provisioning
+is blocked. The runner membership in this proposal is limited to GIDs 970,
+971, 973, and 990. It does not include GID 44, and the unit does not allow
+`/dev/dri/card1`.
 
-The present `passwd` and `group` NSS source lists include `systemd` and `sss`.
-The owner must approve a complete identity source before provisioning. A
-files-only NSS change affects host-wide account and group lookups; it requires
-separate review and authorization. If that is not acceptable, a scoped source
-that can prove complete `systemd` and SSSD membership must be designed and
-reviewed before broker startup.
+The current `passwd` and `group` NSS source lists include `systemd` and `sss`.
+Changing `/etc/nsswitch.conf` is excluded by the current instructions and would
+change host-wide account and group lookups. No scoped source has been shown to
+prove complete membership for these providers. Keep broker startup and APEX
+qualification blocked until a reviewed design provides that evidence.
 
 Reference-conditioned inference additionally needs an approved per-attempt
 read-only reference handoff. The current `0600` publication files remain

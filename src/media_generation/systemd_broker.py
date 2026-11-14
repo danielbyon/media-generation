@@ -190,6 +190,10 @@ class BrokerConfiguration:
         runner = pwd.getpwuid(self.runner_uid)
         primary_group = grp.getgrgid(self.runner_gid)
         worker = pwd.getpwuid(self.worker_uid)
+        if runner.pw_uid != self.runner_uid:
+            raise ValueError("NSS account UID does not match runner configuration")
+        if worker.pw_uid != self.worker_uid:
+            raise ValueError("NSS account UID does not match worker configuration")
         if runner.pw_gid != self.runner_gid or primary_group.gr_gid != self.runner_gid:
             raise ValueError("configured runner name, UID, and primary group do not agree")
         if worker.pw_gid != self.worker_gid:
