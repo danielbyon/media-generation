@@ -1021,11 +1021,19 @@ def test_broker_authenticates_worker_socket_peer(
     try:
         client.send(b"request")
         broker._serve_connection(server)
-        response = json.loads(client.recv(4096))
+        if authorized:
+            response = json.loads(client.recv(4096))
+            assert response.get("ok") is True
+        else:
+            try:
+                response_packet = client.recv(4096)
+            except ConnectionResetError:
+                response_packet = b""
+            if response_packet:
+                assert json.loads(response_packet).get("ok") is False
     finally:
         client.close()
 
-    assert (response.get("ok") is True) is authorized
     assert len(validation_calls) == int(authorized)
 
 
