@@ -1521,6 +1521,14 @@ def test_exited_launcher_can_bind_loaded_runner_and_clean_only_after_cgroup_proo
             cgroup_directory.stat().st_ino,
         )
         assert bound == [observed]
+        # The temporary cgroup.events fixture is a regular file, which Linux
+        # epoll rejects. Keep the real populated-state read path while using
+        # select(), which accepts this filesystem-backed test descriptor.
+        monkeypatch.setattr(
+            broker_module.selectors,
+            "DefaultSelector",
+            broker_module.selectors.SelectSelector,
+        )
         assert broker._cleanup_failed_containment_setup(
             ExitedLauncher(), observed, events_fd
         )
