@@ -707,14 +707,18 @@ that the runner or worker could reach through this new group traversal.
 
 ### Step 4. Exact package build and installation
 
-The final review handoff bundle is prepared outside Git at
-`/var/tmp/media-generation-apex-install`. It contains `SOURCE_SHA`, the exact
-wheel built from that clean reviewed commit, the Pillow wheel, broker
+The historical handoff bundle at `/var/tmp/media-generation-apex-install`
+records the APEX installed source SHA
+`3bc8041b332f7fcf1e0873ac2cb526625b6456ee`; keep it unchanged. Prepare the
+replacement final review bundle at
+`/var/tmp/media-generation-apex-install-reviewed`. It contains `SOURCE_SHA`,
+the exact wheel built from that clean reviewed commit, the Pillow wheel, broker
 configuration, systemd unit, runtime file manifest, symlink manifest, source
-loader map, raw loader output, source Python-alias output, and `SHA256SUMS`. The package wheel is built with
-Python 3.14.4 from a clean Git archive of `SOURCE_SHA`. Do not rebuild it during
-installation: compare the bundle's source SHA and checksum-manifest SHA with
-the final review handoff, then verify every bundled file with `sha256sum -c`.
+loader map, raw loader output, source Python-alias output, and `SHA256SUMS`.
+Build the package wheel with Python 3.14.4 from a clean Git archive of
+`SOURCE_SHA`. Do not rebuild it during installation. Compare the bundle's
+source SHA and checksum-manifest SHA with the final review handoff, then verify
+every bundled file with `sha256sum -c`.
 The Pillow artifact is
 `pillow-13.0.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl`,
 SHA-256 `e91c2b1cbeae768c98752e67e717e283d68dae45717b41f2d91eaee648e37b7d`,
@@ -727,7 +731,7 @@ with the value in the final review handoff before copying it to APEX:
 ```sh
 set -eu
 worktree=/Users/daniel/Projects/media-generation-t13-issue14-safe-cancellation
-bundle=/var/tmp/media-generation-apex-install
+bundle=/var/tmp/media-generation-apex-install-reviewed
 test -d "$bundle" && test ! -L "$bundle"
 test -f "$bundle/SOURCE_SHA" && test ! -L "$bundle/SOURCE_SHA"
 test -f "$bundle/SHA256SUMS" && test ! -L "$bundle/SHA256SUMS"
