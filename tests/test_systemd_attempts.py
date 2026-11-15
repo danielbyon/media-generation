@@ -4213,6 +4213,101 @@ def test_post_fence_cgroup_evidence_is_idempotent_and_does_not_create_engine_obs
     assert store.cancel_execution(claim.job_id, _now()) == "acknowledged"
 
 
+def test_cancellation_acknowledgment_requires_persisted_sqlite_mirror(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    publication_root = tmp_path / "cancellation-publication-root"
+    publication_root.mkdir()
+    publication_root_stat = publication_root.stat()
+    publication_id = "pub_cancellation_mirror_missing"
+    store.create_publication(
+        {
+            "publication_id": publication_id,
+            "artifact_id": "art_cancellation_mirror_missing",
+            "root": str(publication_root),
+            "root_dev": publication_root_stat.st_dev,
+            "root_ino": publication_root_stat.st_ino,
+            "root_token": "test-root-token",
+            "stage_name": f".{publication_id}.stage",
+            "state": "allocated",
+            "job_id": claim.job_id,
+            "attempt_id": claim.attempt_id,
+            "sources_json": "[]",
+            "created_at": _now(),
+        },
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+    )
+    assert store.publication_authority_current(publication_id) is True
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    store._systemd_evidence_ledger.record_termination(
+        identity, evidence, timestamp=_now()
+    )
+    assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    assert store.attempt_termination_mirror_persisted(
+        claim.job_id, claim.attempt_id
+    ) is False
+
+    resource_before_acknowledgment = store.resource_snapshot()
+    assert resource_before_acknowledgment["state"] != "available"
+    with pytest.raises(BackendEvidenceError, match="authority is stale"):
+        store.mark_execution_observed(
+            job_id=claim.job_id,
+            attempt_id=claim.attempt_id,
+            owner_id=claim.owner_id,
+            claim_epoch=claim.claim_epoch,
+            record=_observed(claim.attempt_id),
+            timestamp=_now(),
+        )
+
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is False
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert store.publication_authority_current(publication_id) is False
+    store.abandon_publication(publication_id, "cancellation fenced publication")
+    assert store.resource_snapshot() == resource_before_acknowledgment
+    assert store.attempt_recovery_cleanup_authorized(identity) is True
+
+
+def test_cancellation_acknowledgment_accepts_matching_sqlite_mirror_idempotently(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    store.record_attempt_termination_evidence(
+        identity, evidence, timestamp=_now()
+    )
+    assert store.attempt_termination_mirror_persisted(
+        claim.job_id, claim.attempt_id
+    ) is True
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is True
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is True
+    assert store.cancel_execution(claim.job_id, _now()) == "acknowledged"
+
+
 def test_cancellation_fence_rejects_late_engine_observation_writer(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4674,6 +4769,11 @@ def test_root_ledger_proof_survives_failed_job_database_mirror(
     assert store.attempt_termination_mirror_persisted(
         claim.job_id, claim.attempt_id
     ) is False
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is False
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
 
 
 def _quarantine_canceled_systemd_attempt(store, claim) -> None:
@@ -4728,6 +4828,10 @@ def test_zero_row_sqlite_termination_mirror_write_is_not_acknowledged(
 
     assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
     assert _termination_mirror(store, claim.job_id, claim.attempt_id) is None
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is False
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
     with store._connection() as connection:
         cancellation = connection.execute(
             """SELECT state FROM execution_cancellations
@@ -4853,6 +4957,13 @@ def test_failed_sqlite_mirror_blocks_recovery_until_broker_reconciles_it(
     recovered = service.recover()
     assert broker_calls == [claim.attempt_id, claim.attempt_id]
     assert _termination_mirror(store, claim.job_id, claim.attempt_id) is not None
+    assert store.attempt_termination_mirror_persisted(
+        claim.job_id, claim.attempt_id
+    ) is True
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is True
+    assert store.cancel_execution(claim.job_id, _now()) == "acknowledged"
     with store._connection() as connection:
         lifecycle = connection.execute(
             """SELECT cleanup_state, cleanup_validated FROM systemd_output_lifecycle
@@ -4911,9 +5022,70 @@ def test_conflicting_sqlite_and_root_termination_proofs_fail_closed(
     with pytest.raises(BackendEvidenceError, match="stored systemd containment"):
         store.attempt_termination_proven(claim.job_id, claim.attempt_id)
     with pytest.raises(BackendEvidenceError, match="stored systemd containment"):
+        store.acknowledge_execution_cancellation(
+            claim.job_id, claim.attempt_id, timestamp=_now()
+        )
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    with pytest.raises(BackendEvidenceError, match="stored systemd containment"):
         store.release_quarantined_attempt(
             claim.job_id, claim.attempt_id, timestamp=_now()
         )
+
+
+def test_concurrent_cancellation_and_termination_recording_preserve_proof(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    start = threading.Barrier(3)
+    outcomes: list[tuple[str, object]] = []
+    errors: list[BaseException] = []
+
+    def cancel() -> None:
+        try:
+            start.wait()
+            outcomes.append(
+                ("cancel", store.cancel_execution(claim.job_id, _now()))
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    def record_termination() -> None:
+        try:
+            start.wait()
+            store.record_attempt_termination_evidence(
+                identity, evidence, timestamp=_now()
+            )
+            outcomes.append(("termination", "recorded"))
+        except BaseException as error:
+            errors.append(error)
+
+    cancel_thread = threading.Thread(target=cancel)
+    termination_thread = threading.Thread(target=record_termination)
+    cancel_thread.start()
+    termination_thread.start()
+    start.wait()
+    cancel_thread.join(timeout=10)
+    termination_thread.join(timeout=10)
+
+    assert cancel_thread.is_alive() is False
+    assert termination_thread.is_alive() is False
+    assert errors == []
+    assert dict(outcomes) == {"cancel": "requested", "termination": "recorded"}
+    assert store.attempt_termination_mirror_persisted(
+        claim.job_id, claim.attempt_id
+    ) is True
+    assert store.acknowledge_execution_cancellation(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is True
+    assert store.cancel_execution(claim.job_id, _now()) == "acknowledged"
 
 
 def test_systemd_evidence_ledger_rejects_worker_owned_or_writable_files() -> None:

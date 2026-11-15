@@ -1,5 +1,7 @@
 # APEX T13 broker deployment proposal
 
+Sections 1 through 6 describe a first-time installation. Their commands assume `/var/tmp/media-generation-package` and `/opt/media-generation/venv` are absent. The owner installed the application from source revision `3bc8041b332f7fcf1e0873ac2cb526625b6456ee`; preserve that installation and use Section 7 for an upgrade.
+
 This manifest defines the isolated APEX installation under
 `/opt/media-generation`. The owner authorized this permanent root and the
 isolated installation. The parent-directory change may proceed only after the
@@ -1623,27 +1625,230 @@ and groups in place until the owner confirms that no retained files or evidence
 use those IDs. Remove the empty configuration directory only after checking it
 contains no unrelated file.
 
-## 7. Qualification status and remaining gates
+## 7. Upgrade an existing installation
 
-The owner has authorized the isolated installation, the trusted-workstation
-security model, and the parent-directory mode change after audit. No accounts,
-groups, directories, permissions, units, or device settings have been changed.
-UID 973 remains assigned to `sshd`; the proposed model-read GID is 973. The
-`/opt/media-generation` contents and effective-access audit remain incomplete
-because the unprivileged SSH account cannot traverse the current `0700`
-directory. Provisioning remains gated on the owner's sudo-backed audit and
-final ChatGPT review. The runner membership in this proposal is limited to
-GIDs 970, 971, 973, and 990. It does not include GID 44, and the unit does not
-allow `/dev/dri/card1`.
+This procedure prepares a candidate beside the installed application and keeps activation under the owner's control. It has not been run on APEX. The document does not authorize a host change. The owner must first complete the source review and approve the candidate revision and bundle hashes.
 
-The current `passwd` and `group` NSS source lists include `systemd` and `sss`.
-Changing `/etc/nsswitch.conf` is excluded. The approved broker policy relies on
-keyed service-account lookups and live kernel process credentials; it does not
-claim global group exclusivity. APEX remains `UNVERIFIED` until the exact
-candidate mirror, service identity and access checks, native Linux tests, and
+### Existing installation and expected service contract
+
+The existing application was installed from source revision `3bc8041b332f7fcf1e0873ac2cb526625b6456ee`. Preserve `/opt/media-generation/venv`, `/var/tmp/media-generation-package`, the schema-v9 job database, the artifact database, the root evidence ledger, the candidate mirror, and all scratch and publication data.
+
+The previously reviewed installation bundle records these hashes for the broker configuration and unit:
+
+| File | Expected SHA-256 |
+| --- | --- |
+| `/etc/media-generation/broker.json` | `8e93c5f78217522b0271d2af63149cc69178389a496ca1bab9465381a9be07c0` |
+| `/etc/systemd/system/media-generation-systemd-broker.service` | `ee4c154521729d1ea510895c6c6a5628bf11232016589efbde993b242977719f` |
+
+The expected old broker entry point is `/opt/media-generation/venv/bin/media-generation-systemd-broker`. The broker configuration points `runner_executable` at `/opt/media-generation/venv/bin/media-generation-attempt-runner`. The root broker runs as `root`; the attempt runner runs as UID/GID `970:970` with supplementary GIDs `971,973,990`. The worker remains UID/GID `972:972` with supplementary GID `973`. The only allowed GPU devices remain `/dev/kfd` and `/dev/dri/renderD128`.
+
+The owner must compare the active files with the hashes and paths above before proceeding. The owner must also inspect the loaded unit, every drop-in, live process credentials, ACLs, symlinks, mount state, and file ownership. Stop if the active unit has an unexpected fragment path, drop-in, `ExecStart`, service identity, broker configuration, or permission. Do not infer the current host state from this document or from the previous installation report.
+
+The application database remains schema version 9. The candidate source must continue to report `_CURRENT_SCHEMA_VERSION = 9`. The upgrade must not run a migration, copy a database, restore a database snapshot, or change the artifact or ledger paths.
+
+### Read-only preflight
+
+Set `EXPECTED_SOURCE_SHA` to the exact commit approved after source review. Set `BUNDLE` to the exact replacement bundle path reported with that commit. Do not substitute a branch name or a manually chosen revision.
+
+The proposed revision-specific destinations are:
+
+| Purpose | Proposed path |
+| --- | --- |
+| Host-side bundle copy | `/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}` |
+| Candidate application environment | `/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}/venv` |
+| Versioned candidate configuration and unit | `/etc/media-generation/releases/${EXPECTED_SOURCE_SHA}` |
+| Preserved active configuration and unit | `/etc/media-generation/rollback/3bc8041b332f7fcf1e0873ac2cb526625b6456ee` |
+
+These paths are proposed names. Inspect each parent with `namei -l`, `stat`, `getfacl`, and `findmnt` first. Reject a symlink, unexpected owner or mode, unexpected ACL, mount, or existing revision destination. Do not reuse or overwrite a destination left by an earlier attempt. Preserve any partial candidate for inspection.
+
+Before copying the bundle, verify its provenance and all payload checksums:
+
+```sh
+set -euf
+: "${BUNDLE:?set to the reviewed replacement bundle}"
+: "${EXPECTED_SOURCE_SHA:?set to the reviewed commit}"
+: "${EXPECTED_SUMS_SHA:?set to the reviewed SHA256SUMS hash}"
+PACKAGE_STAGE="/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}"
+CANDIDATE_RELEASE="/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}"
+CONFIG_RELEASE="/etc/media-generation/releases/${EXPECTED_SOURCE_SHA}"
+test -d "$BUNDLE"
+test ! -L "$BUNDLE"
+test -f "$BUNDLE/SOURCE_SHA"
+test ! -L "$BUNDLE/SOURCE_SHA"
+test -f "$BUNDLE/SHA256SUMS"
+test ! -L "$BUNDLE/SHA256SUMS"
+test "$(cat "$BUNDLE/SOURCE_SHA")" = "$EXPECTED_SOURCE_SHA"
+case "$EXPECTED_SOURCE_SHA" in
+  (*[!0-9a-f]*|'') exit 1 ;;
+esac
+test "${#EXPECTED_SOURCE_SHA}" -eq 40
+test "$(sha256sum "$BUNDLE/SHA256SUMS" | cut -d' ' -f1)" = "$EXPECTED_SUMS_SHA"
+test -z "$(find "$BUNDLE" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
+expected_files=$(awk '{print $2}' "$BUNDLE/SHA256SUMS" | LC_ALL=C sort)
+actual_files=$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort)
+test "$expected_files" = "$actual_files"
+(cd "$BUNDLE" && sha256sum -c SHA256SUMS)
+for destination in "$PACKAGE_STAGE" "$CANDIDATE_RELEASE" "$CONFIG_RELEASE"; do
+  test ! -e "$destination"
+  test ! -L "$destination"
+done
+```
+
+`SOURCE_SHA` must match `EXPECTED_SOURCE_SHA` and its digest must appear in
+`SHA256SUMS`. The filename comparison covers every regular payload except the
+checksum file itself.
+
+Compare the `SHA256SUMS` digest and every payload digest with the independently reviewed handoff record. Verify the wheel, Pillow wheel, `broker.json`, unit, runtime inventories, Python alias inventory, loader map, and source-loader report. Require the bundle's `broker.json` to point to `${EXPECTED_SOURCE_SHA}/venv/bin/media-generation-attempt-runner`. Require the bundled unit's `ExecStart` and `RequiresMountsFor` to name the same candidate release path. Stop on any other difference or hash mismatch.
+
+Validate the path-bound deployment payloads before staging them:
+
+```python
+import json
+import sys
+from pathlib import Path
+
+bundle = Path(sys.argv[1])
+source_sha = sys.argv[2]
+candidate_venv = f"/opt/media-generation/releases/{source_sha}/venv"
+configuration = json.loads((bundle / "broker.json").read_text())
+unit = (bundle / "media-generation-systemd-broker.service").read_text()
+
+assert configuration["runner_executable"] == (
+    f"{candidate_venv}/bin/media-generation-attempt-runner"
+)
+assert configuration["runner_uid"] == 970
+assert configuration["runner_gid"] == 970
+assert configuration["runner_supplementary_gids"] == [971, 973, 990]
+assert configuration["worker_uid"] == 972
+assert configuration["worker_gid"] == 972
+assert configuration["device_allow"] == ["/dev/kfd", "/dev/dri/renderD128"]
+assert f"ExecStart={candidate_venv}/bin/media-generation-systemd-broker " \
+    "/etc/media-generation/broker.json" in unit
+assert candidate_venv in unit.split("RequiresMountsFor=", 1)[1].split("\n[", 1)[0]
+assert "/opt/media-generation/venv/bin/" not in unit
+```
+
+Run it with `/usr/bin/python3.14 - BUNDLE EXPECTED_SOURCE_SHA`. A failure means the bundle does not select the reviewed candidate or it changed a protected identity or device boundary.
+
+Confirm the active unit and broker file are regular root-owned files, have no unexpected ACLs, and match the hashes above. Require `DropInPaths` to be empty and the loaded `ExecStart` to match the unit file. Check all service identities and supplementary groups with both keyed account lookups and live process credentials. Check that the worker cannot read runner scratch or access either GPU device, and that the runner cannot write worker publication output.
+
+Check the installed venv without modifying it. Require Python 3.14.4, root ownership, no group or world write permission, the expected `lib64 -> lib` link, and the documented console-script permissions. Record a sorted file hash inventory and symlink inventory before candidate installation. Record `pip list --format=json` and `pip check` output for the existing environment.
+
+Verify that the model and runtime mirror still matches the pinned runtime inventories and has fresh T07 `READY` evidence. Check every path component, runtime library, model input, scratch directory, database directory, ledger directory, and approved device using the actual runner and worker accounts. Do not change permissions on the original model tree, the runtime source, or existing databases to make a check pass.
+
+Inspect broker and worker state before stopping anything. Confirm the loaded broker unit and its `MainPID`, identify the worker's actual launcher, and inspect active attempt units and cgroups. Do not use `pkill` or stop an unrelated GPU process. Run the following check as the worker with the installed venv's Python. It opens the schema-v9 database read-only, checks its integrity and idle state, and prints a logical database digest for the rollback check.
+
+```python
+import hashlib
+import sqlite3
+import sys
+from pathlib import Path
+
+database = Path(sys.argv[1]).resolve()
+uri = f"{database.as_uri()}?mode=ro"
+with sqlite3.connect(uri, uri=True) as connection:
+    connection.execute("PRAGMA query_only = ON")
+    assert connection.execute("PRAGMA user_version").fetchone() == (9,)
+    assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    assert connection.execute(
+        "SELECT state FROM execution_resource WHERE id = 1"
+    ).fetchone() == ("available",)
+    checks = (
+        "SELECT count(*) FROM execution_jobs "
+        "WHERE status IN ('running', 'ambiguous')",
+        "SELECT count(*) FROM execution_attempts "
+        "WHERE status IN ('running', 'ambiguous')",
+        "SELECT count(*) FROM execution_cancellations WHERE state = 'requested'",
+        "SELECT count(*) FROM artifact_publications "
+        "WHERE state IN ('allocated', 'ready')",
+    )
+    assert all(connection.execute(query).fetchone() == (0,) for query in checks)
+    snapshot = "\n".join(connection.iterdump()).encode()
+    print(hashlib.sha256(snapshot).hexdigest())
+```
+
+Run it as `media-generation-worker` with `/opt/media-generation/venv/bin/python` and `/var/lib/media-generation-v9/db/jobs.sqlite3`. Require success and zero counts. If the resource is claimed or quarantined, an attempt is active or ambiguous, a cancellation is still requested, or a publication is incomplete, stop and use the existing recovery path before considering an upgrade. Record logical integrity digests for any separate artifact database and the root evidence ledger using their own read-only SQLite schemas. Compare them again before rollback. Any unexplained change blocks rollback.
+
+Measure free space on both `/var/tmp` and `/opt`. Include the copied bundle, the new venv, the versioned configuration, and temporary build or install files in the estimate. Require enough free space for two copies of the larger of the bundle or the installed venv. Keep all preflight output and hashes outside the Git repository.
+
+### Candidate installation and qualification
+
+Copy the reviewed bundle into `/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}` only after verifying that the destination and its parent are safe and the destination does not exist. Set the new directory to `root:root 0700`. Verify its complete `SHA256SUMS` again after copying. Leave `/var/tmp/media-generation-package` untouched.
+
+Create `/opt/media-generation/releases` only if the owner has verified that it is absent. If it already exists, inspect its owner, mode, ACLs, and contents before using it. Create a new `/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}` directory with owner `root`, group `media-generation-model-read`, and mode `0710`. Stop if that exact release path exists or is a symlink. Do not change the owner or mode of `/opt/media-generation` or the existing `venv`.
+
+Create the candidate venv at `/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}/venv` with `/usr/bin/python3.14 -m venv --copies`. Install only the two bundled wheels with `--no-index --no-deps`, then run `pip check`. Do not install build tools or resolve dependencies from the network. Record Python and pip versions, package metadata, console-script hashes, ownership, modes, and symlinks. Require the candidate venv's `lib64 -> lib` link and verify both console scripts are root-owned regular files whose shebangs name the candidate venv. Run read-only imports and candidate checks as the worker and runner accounts.
+
+Require the candidate venv to be `root:root 0755`. Create `/etc/media-generation/releases` only if the owner has verified that it is absent. If it exists, inspect it before use. Create `/etc/media-generation/releases/${EXPECTED_SOURCE_SHA}` as `root:root 0700`. Keep the candidate `broker.json` and systemd unit there. Require owner `root`, mode `0600` for the configuration, and mode `0644` for the unit. Run `systemd-analyze verify` on the candidate unit. Compared with the existing approved bundle, the broker configuration may change only `runner_executable`; the unit may change only `ExecStart` and the matching `RequiresMountsFor` entry. Keep all other broker values, identities, device allowlists, read roots, systemd restrictions, and writable paths unchanged. The active unit remains a root-owned regular file with mode `0644` and no unexpected ACLs.
+
+After candidate installation, repeat the old venv's file hash and symlink inventories. They must match the pre-install inventories exactly. Verify the current systemd unit, broker configuration, database, ledger, candidate mirror, artifacts, and scratch data still have their preflight hashes or read-only state. Do not clean up a failed candidate automatically.
+
+This phase qualifies only the offline package and filesystem layout. It does not start the broker or run inference.
+
+### Owner-controlled activation
+
+Keep installation and activation separate. The owner must review the candidate bundle hashes, install results, database report, permissions, and rollback state, then explicitly approve activation for `EXPECTED_SOURCE_SHA` in an interactive session.
+
+Immediately before activation, repeat the active-unit and database checks. Stop if any worker, broker, runner, or transient attempt unit is active. Stop the worker through the exact launcher identified during preflight. Stop the broker only after confirming that no attempt requires cancellation, recovery, or cgroup termination. Require the broker unit to be inactive with `MainPID=0`, no active attempt cgroups, no unresolved publications, no requested cancellation, and an available resource row. If any process or state is uncertain, leave the active configuration unchanged and retain quarantine.
+
+Before replacing either active file, create the revision-specific rollback directory. Require it to be absent or verify that an existing copy matches the original installation hashes. Copy the active broker configuration and unit there without replacing existing backups. Verify the backup hashes and permissions. The original venv remains in place at `/opt/media-generation/venv`.
+
+Install the candidate configuration to a temporary regular file on the same filesystem as `/etc/media-generation/broker.json`, verify its hash and mode, then atomically rename it over the active configuration. Repeat for `/etc/systemd/system/media-generation-systemd-broker.service`, with mode `0644`. Do not use symlinks. Keep the broker stopped until both files have passed hash, owner, mode, path, and `systemd-analyze verify` checks. If either replacement is interrupted or fails, do not start the service; restore and verify the original pair from the rollback directory.
+
+Run `systemctl daemon-reload`, inspect `systemctl show` and `systemctl cat`, and verify the loaded fragment, absence of drop-ins, exact `ExecStart`, unit identity, systemd restrictions, and mount requirements. The owner makes a second explicit decision before manually starting the broker. Do not enable it at boot. Check broker health, socket permissions, unauthorized-account rejection, service credentials, database and ledger boundaries, runner access to the two allowed GPU devices, and model/runtime readability. Do not run real-engine inference as part of offline startup verification.
+
+### Rollback conditions
+
+The old venv, old broker configuration, and old systemd unit form the rollback set. Restore them only as a matched set after confirming that no old or candidate broker, worker, runner, or attempt cgroup remains active. Verify that the schema is still version 9, no migration ran, the database and root ledger are consistent, and the original config and unit hashes match the recorded values. Restore the pair, run `systemctl daemon-reload`, verify the loaded old executable/configuration pair, and start the old broker manually only after another owner decision.
+
+Do not restore a database snapshot, reset claim epochs, clear cancellation records, or restore publication authority. Roll back to the old application only if the candidate has not claimed or executed an attempt and has not changed durable execution, cancellation, publication, or termination evidence. If a candidate attempt started, if evidence changed, or if the before/after state cannot prove those facts, keep the broker stopped, preserve all data, retain GPU quarantine where required, and recover with the reviewed candidate. The old application predates later lifecycle corrections and is not a safe rollback target after it would need to interpret state produced by the candidate.
+
+Never remove the candidate venv, package copy, rollback files, database, ledger, scratch, artifacts, or candidate mirror automatically. Preserve partial state for review when a check fails. If rollback preconditions are not proven, report that rollback is unavailable and request an owner recovery decision.
+
+### Qualification and acceptance stages
+
+Record each stage separately:
+
+1. Candidate package installation and offline integrity checks.
+2. Service-account and filesystem qualification.
+3. Broker startup and restricted-socket qualification.
+4. Controlled negative and fault tests in an approved quiet GPU window.
+5. Real-engine GPU qualification against the exact candidate and T07-ready model/runtime mirror.
+6. Owner acceptance of the replacement installation.
+
+Passing stages 1 through 3 does not qualify real-engine execution. Do not run disruptive fault injection or accept the replacement installation until its reviewed source, bundle, deployment procedure, and APEX evidence have been inspected.
+
+## 8. Qualification status and remaining gates
+
+The statements in this section that described an unprovisioned host were
+recorded before the first installation and are not current-state claims. The
+owner later reported that installation from source revision
+`3bc8041b332f7fcf1e0873ac2cb526625b6456ee` succeeded, that
+`/opt/media-generation/venv` and `/var/tmp/media-generation-package` exist, and
+that the installed venv permission diagnostics passed, including the
+root-owned `lib64 -> lib` link. This task did not inspect APEX live. Section 7
+requires a new host-side preflight before any upgrade step; the earlier
+statements that no installation changes had occurred or that provisioning was
+still blocked must not be used to infer current state.
+
+The last recorded inventory said UID 973 was assigned to `sshd`, while the
+proposed model-read GID was 973. Revalidate both keyed account and group
+lookups, live service credentials, and effective access during the Section 7
+preflight. The proposed runner supplementary GIDs remain 970, 971, 973, and
+990. They do not include GID 44, and the unit does not allow `/dev/dri/card1`.
+
+The last reported `passwd` and `group` NSS source lists included `systemd` and
+`sss`. This task did not inspect the current file, and no NSS change is proposed.
+The broker policy relies on keyed service-account lookups and live kernel
+process credentials; it does not claim global group exclusivity. Section 7
+rechecks those identities and credentials without requiring global account or
+group enumeration. This candidate remains `UNVERIFIED` on APEX until its exact
+protected mirror, service identity and access checks, native Linux tests, and
 non-disruptive real-engine qualification are complete.
 
 Reference-conditioned inference additionally needs an approved per-attempt
-read-only reference handoff. The current `0600` publication files remain
-worker-only; APEX must not be marked ready for edit/reference workloads until
-that gap is closed and tested.
+read-only reference handoff. The earlier deployment report recorded the
+publication files as mode `0600` and worker-only; verify their current ownership
+and access during the Section 7 preflight. APEX must not be marked ready for
+edit/reference workloads until the reference handoff gap is closed and tested.

@@ -2889,10 +2889,11 @@ END"""
     def acknowledge_execution_cancellation(
         self, job_id: str, attempt_id: str, *, timestamp: str
     ) -> bool:
-        """Acknowledge a fenced cancellation only after validated termination."""
+        """Acknowledge a fenced cancellation after its termination evidence is durable."""
         with self._connection(transaction=True) as connection:
             attempt = connection.execute(
-                "SELECT claim_epoch FROM execution_attempts WHERE job_id = ? AND attempt_id = ?",
+                """SELECT claim_epoch, containment_contract FROM execution_attempts
+                   WHERE job_id = ? AND attempt_id = ?""",
                 (job_id, attempt_id),
             ).fetchone()
             if attempt is None:
@@ -2919,6 +2920,13 @@ END"""
                 or row["current_attempt_id"] != attempt_id
                 or row["job_status"] != "canceled"
                 or not self._attempt_termination_proven(connection, job_id, attempt_id)
+                or (
+                    attempt["containment_contract"]
+                    == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                    and not self._attempt_cgroup_termination_mirror_persisted(
+                        connection, job_id, attempt_id
+                    )
+                )
             ):
                 return bool(row is not None and row["state"] == "acknowledged")
             updated = connection.execute(
