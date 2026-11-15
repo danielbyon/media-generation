@@ -511,8 +511,48 @@ for pid in os.listdir("/proc"):
 PY
     echo "--- open files and mappings ---"
     command -v lsof >/dev/null 2>&1 || { echo "lsof is required for a complete open-file audit" >&2; exit 1; }
+    verify_lsof_exclusion() {
+        excluded_mountpoint=$1
+        expected_fstype=$2
+        if ! actual_target=$(findmnt --mountpoint "$excluded_mountpoint" \
+            --noheadings --output TARGET 2>&1); then
+            printf "%s\\n" "$actual_target" >&2
+            echo "cannot verify lsof exclusion mount $excluded_mountpoint" >&2
+            exit 1
+        fi
+        if ! actual_fstype=$(findmnt --mountpoint "$excluded_mountpoint" \
+            --noheadings --output FSTYPE 2>&1); then
+            printf "%s\\n" "$actual_fstype" >&2
+            echo "cannot verify lsof exclusion filesystem $excluded_mountpoint" >&2
+            exit 1
+        fi
+        if [ "$actual_target" != "$excluded_mountpoint" ] || \
+            [ "$actual_fstype" != "$expected_fstype" ]; then
+            printf "unexpected lsof exclusion mount: expected %s (%s), found %s (%s)\\n" \
+                "$excluded_mountpoint" "$expected_fstype" "$actual_target" "$actual_fstype" >&2
+            exit 1
+        fi
+        case "$excluded_mountpoint" in
+            "$root"|"$root"/*)
+                echo "lsof exclusion lies inside the audited root: $excluded_mountpoint" >&2
+                exit 1
+                ;;
+        esac
+        case "$root" in
+            "$excluded_mountpoint"|"$excluded_mountpoint"/*)
+                echo "the audited root lies inside an lsof exclusion: $root" >&2
+                exit 1
+                ;;
+        esac
+        echo "verified lsof exclusion mount: $actual_target ($actual_fstype), outside $root"
+    }
+    verify_lsof_exclusion /run/user/1000/doc fuse.portal
+    verify_lsof_exclusion /run/user/1000/gvfs fuse.gvfsd-fuse
     lsof_status=0
-    lsof_output=$(lsof +D "$root" 2>&1) || lsof_status=$?
+    lsof_output=$(lsof \
+        -e /run/user/1000/doc \
+        -e /run/user/1000/gvfs \
+        +D "$root" 2>&1) || lsof_status=$?
     case "$lsof_status" in
         0) printf "%s\\n" "$lsof_output";;
         1)
@@ -540,10 +580,18 @@ shows no existing ACL entry or numeric owner/group that would give the new
 service IDs access, and identifies no dependent service or executable. Review
 every child path's group mode, ACL, and symlink target to determine whether GID
 973 traversal would expose it. If any access effect or dependency is unclear,
-stop and leave the parent unchanged. On this APEX, `lsof +D` returns status 1
-with empty output when there are no open files; the audit accepts only that
-exact no-match result. Any diagnostic output with status 1, or any higher
-status, makes the audit incomplete. Rollback restores this audited baseline.
+stop and leave the parent unchanged. On APEX, `lsof +D` produced diagnostics
+while traversing the user's FUSE mounts at `/run/user/1000/doc` and
+`/run/user/1000/gvfs`. `findmnt` identified them as `fuse.portal` and
+`fuse.gvfsd-fuse`. The owner reran the scan with exclusions for those exact
+mounts; it emitted no warnings, reported no matching files, and returned
+status 1. The audit verifies each mount's exact target and filesystem type
+immediately before the scan. It rejects either mount if missing, replaced, or
+inside the audited root, and rejects the root if it falls inside an excluded
+mount. The `+D` scan therefore still covers all of `/opt/media-generation`.
+Status 0 output remains in the report for owner review. Status 1 is accepted
+only with empty output; diagnostics or any higher status make the audit
+incomplete. Rollback restores this audited baseline.
 A complete report ends with exactly one `APEX_OPT_AUDIT_COMPLETE` line. Step 3
 checks that marker before accepting the report.
 
