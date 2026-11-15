@@ -747,7 +747,13 @@ class GenerationService:
             return self._resource_result("attention_required")
         if attempt.get("containment_contract") != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT:
             return self._resource_result("attention_required")
-        if not self._store.attempt_termination_proven(job_id, attempt_id):
+        try:
+            mirror_persisted = self._store.attempt_termination_mirror_persisted(
+                job_id, attempt_id
+            )
+        except Exception:
+            return self._resource_result("attention_required")
+        if not mirror_persisted:
             claim_epoch = attempt.get("claim_epoch")
             if (
                 self._attempt_runner is None
@@ -766,8 +772,16 @@ class GenerationService:
                 )
             except (OSError, RuntimeError, ValueError):
                 return self._resource_result("attention_required")
-            if not self._store.attempt_termination_proven(job_id, attempt_id):
+            try:
+                mirror_persisted = (
+                    self._store.attempt_termination_mirror_persisted(
+                        job_id, attempt_id
+                    )
+                )
+            except Exception:
                 return self._resource_result("attention_required")
+        if not mirror_persisted:
+            return self._resource_result("attention_required")
         records = [
             record
             for record in self._store.publications(str(self.output_directory))
@@ -791,6 +805,18 @@ class GenerationService:
                 )
         report = self._publication.reconcile()
         if report.get("status") == "attention_required":
+            resource = self._store.resource_snapshot()
+            quarantine_is_only_issue = (
+                resource.get("state") == "quarantined"
+                and resource.get("job_id") == job_id
+                and resource.get("attempt_id") == attempt_id
+                and report.get("resource_state") == "quarantined"
+                and report.get("resource_reason") == resource.get("reason")
+                and report.get("publication_status") == "complete"
+            )
+            if not quarantine_is_only_issue:
+                return self._resource_result("attention_required")
+        elif report.get("status") != "complete":
             return self._resource_result("attention_required")
         identity = self._store.attempt_containment_identity(job_id, attempt_id)
         if identity is None or self._attempt_runner is None:

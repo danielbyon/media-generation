@@ -2092,6 +2092,160 @@ END"""
                 (identity.attempt_id, identity.job_id, identity_hash, timestamp),
             )
 
+    def bind_attempt_containment_for_termination(
+        self, identity: AttemptUnitIdentity, *, timestamp: str
+    ) -> None:
+        """Persist a verified unit identity after its claim has been fenced.
+
+        This records only the immutable containment identity and scratch
+        lifecycle needed to save termination evidence or retry cleanup. It
+        does not restore claim authority or authorize launch or publication.
+        """
+        _require_systemd_broker_process()
+        if not isinstance(identity, AttemptUnitIdentity):
+            raise TypeError("identity must be an AttemptUnitIdentity")
+        identity_json = backend_canonical_json(identity.to_mapping())
+        identity_hash = identity_digest(identity)
+        with self._connection(transaction=True) as connection:
+            row = connection.execute(
+                """SELECT attempts.owner_id, attempts.claim_epoch,
+                          attempts.containment_contract, attempts.process_contained,
+                          attempts.status AS attempt_status,
+                          jobs.status AS job_status, jobs.fence_epoch,
+                          jobs.current_attempt_id, backend.resolved_digest,
+                          backend.state AS backend_state,
+                          resource.state AS resource_state,
+                          resource.job_id AS resource_job_id,
+                          resource.attempt_id AS resource_attempt_id,
+                          resource.owner_id AS resource_owner_id
+                   FROM execution_attempts AS attempts
+                   JOIN execution_jobs AS jobs ON jobs.job_id = attempts.job_id
+                   JOIN backend_executions AS backend
+                     ON backend.attempt_id = attempts.attempt_id
+                   JOIN execution_resource AS resource ON resource.id = 1
+                   WHERE attempts.job_id = ? AND attempts.attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if row is None:
+                raise BackendEvidenceError(
+                    "termination identity does not match a current attempt"
+                )
+            fenced = (
+                row["job_status"] in {"canceled", "ambiguous", "failed"}
+                or int(row["fence_epoch"]) > identity.claim_epoch
+            )
+            if (
+                row["job_status"] == "succeeded"
+                or not fenced
+                or row["current_attempt_id"] != identity.attempt_id
+                or row["owner_id"] != identity.owner_id
+                or row["claim_epoch"] != identity.claim_epoch
+                or row["containment_contract"]
+                != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                or row["process_contained"] != 1
+                or row["attempt_status"] not in {"running", "canceled", "failed"}
+                or row["resolved_digest"] != identity.resolved_digest
+                or row["backend_state"] != "resolved"
+                or row["resource_state"] not in {"claimed", "quarantined"}
+                or row["resource_job_id"] != identity.job_id
+                or row["resource_attempt_id"] != identity.attempt_id
+                or row["resource_owner_id"] != identity.owner_id
+            ):
+                raise BackendEvidenceError(
+                    "termination identity does not match the fenced resolved attempt"
+                )
+            prior = connection.execute(
+                "SELECT identity_json, identity_digest FROM execution_containment "
+                "WHERE job_id = ? AND attempt_id = ?",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if prior is not None and (
+                prior["identity_json"] != identity_json
+                or prior["identity_digest"] != identity_hash
+            ):
+                raise BackendEvidenceError(
+                    "attempt is already bound to another systemd invocation"
+                )
+            self._systemd_evidence_ledger.bind_identity(identity)
+            if prior is None:
+                connection.execute(
+                    """INSERT INTO execution_containment
+                       (attempt_id,job_id,identity_json,identity_digest,
+                        termination_json,termination_at,created_at)
+                       VALUES (?,?,?,?,NULL,NULL,?)""",
+                    (
+                        identity.attempt_id,
+                        identity.job_id,
+                        identity_json,
+                        identity_hash,
+                        timestamp,
+                    ),
+                )
+            lifecycle = connection.execute(
+                """SELECT identity_digest FROM systemd_output_lifecycle
+                   WHERE job_id = ? AND attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if lifecycle is not None and lifecycle["identity_digest"] != identity_hash:
+                raise BackendEvidenceError(
+                    "systemd output lifecycle identifies another invocation"
+                )
+            if lifecycle is None:
+                connection.execute(
+                    """INSERT INTO systemd_output_lifecycle
+                       (attempt_id,job_id,identity_digest,stream_complete,
+                        cleanup_state,cleanup_validated,created_at,cleanup_at)
+                       VALUES (?,?,?,0,'active',NULL,?,NULL)""",
+                    (identity.attempt_id, identity.job_id, identity_hash, timestamp),
+                )
+
+    def reconcile_attempt_containment_for_termination(
+        self, job_id: str, attempt_id: str, *, timestamp: str
+    ) -> AttemptUnitIdentity | None:
+        """Repair the job-database mirror from root evidence after fencing.
+
+        A broker crash can leave the root ledger committed before the SQLite
+        identity and output-lifecycle rows. Recovery may restore those rows
+        only for the same fenced attempt. A root-ledger proof, when present,
+        is then copied idempotently into SQLite without restoring execution
+        or publication authority.
+        """
+        _require_systemd_broker_process()
+        identity = self.attempt_containment_identity(job_id, attempt_id)
+        if identity is None:
+            return None
+        identity_json = backend_canonical_json(identity.to_mapping())
+        identity_hash = identity_digest(identity)
+        with self._connection() as connection:
+            mirror = connection.execute(
+                """SELECT containment.identity_json, containment.identity_digest,
+                          lifecycle.identity_digest AS lifecycle_identity_digest
+                   FROM execution_containment AS containment
+                   LEFT JOIN systemd_output_lifecycle AS lifecycle
+                     ON lifecycle.job_id = containment.job_id
+                    AND lifecycle.attempt_id = containment.attempt_id
+                   WHERE containment.job_id = ? AND containment.attempt_id = ?""",
+                (job_id, attempt_id),
+            ).fetchone()
+        if mirror is not None and (
+            mirror["identity_json"] != identity_json
+            or mirror["identity_digest"] != identity_hash
+            or mirror["lifecycle_identity_digest"] not in {None, identity_hash}
+        ):
+            raise BackendEvidenceError(
+                "SQLite containment mirror conflicts with the root evidence ledger"
+            )
+        if mirror is None or mirror["lifecycle_identity_digest"] is None:
+            self.bind_attempt_containment_for_termination(
+                identity, timestamp=timestamp
+            )
+        evidence = self._systemd_evidence_ledger.read_termination(identity)
+        if evidence is not None:
+            self.record_attempt_termination_evidence(
+                identity, evidence, timestamp=timestamp
+            )
+        return self.attempt_containment_identity(job_id, attempt_id)
+
     def record_systemd_stream_complete(
         self,
         identity: AttemptUnitIdentity,
@@ -2386,15 +2540,50 @@ END"""
         """Return the validated immutable service identity, if it was bound."""
         with self._connection() as connection:
             row = connection.execute(
-                """SELECT identity_json, identity_digest, resolved_digest
-                   FROM execution_containment
-                   JOIN backend_executions USING (attempt_id)
-                   WHERE execution_containment.job_id = ?
-                     AND execution_containment.attempt_id = ?""",
+                """SELECT containment.identity_json, containment.identity_digest,
+                          containment.job_id AS containment_job_id,
+                          attempts.owner_id, attempts.claim_epoch,
+                          attempts.containment_contract, attempts.process_contained,
+                          backend.resolved_digest
+                   FROM execution_attempts AS attempts
+                   JOIN backend_executions AS backend
+                     ON backend.attempt_id = attempts.attempt_id
+                   LEFT JOIN execution_containment AS containment
+                     ON containment.attempt_id = attempts.attempt_id
+                   WHERE attempts.job_id = ? AND attempts.attempt_id = ?""",
                 (job_id, attempt_id),
             ).fetchone()
         if row is None:
+            ledger_identity = self._systemd_evidence_ledger.read_identity(
+                job_id, attempt_id
+            )
+            if ledger_identity is not None:
+                raise BackendEvidenceError(
+                    "root systemd identity has no matching durable attempt"
+                )
             return None
+        ledger_identity = self._systemd_evidence_ledger.read_identity(
+            job_id, attempt_id
+        )
+        if row["containment_job_id"] is None:
+            if ledger_identity is None:
+                return None
+            if (
+                row["containment_contract"]
+                != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+                or row["process_contained"] != 1
+                or ledger_identity.owner_id != row["owner_id"]
+                or ledger_identity.claim_epoch != row["claim_epoch"]
+                or ledger_identity.resolved_digest != row["resolved_digest"]
+            ):
+                raise BackendEvidenceError(
+                    "root systemd identity does not match the durable attempt"
+                )
+            return ledger_identity
+        if row["containment_job_id"] != job_id:
+            raise BackendEvidenceError(
+                "stored systemd identity is bound to another job"
+            )
         try:
             identity = AttemptUnitIdentity.from_mapping(
                 json.loads(str(row["identity_json"]))
@@ -2410,11 +2599,10 @@ END"""
             raise BackendEvidenceError(
                 "stored systemd attempt identity is malformed"
             ) from error
-        ledger_identity = self._systemd_evidence_ledger.read_identity(
-            job_id, attempt_id
-        )
         if ledger_identity is None:
-            return None
+            raise BackendEvidenceError(
+                "stored systemd identity is missing from the root evidence ledger"
+            )
         if ledger_identity != identity:
             raise BackendEvidenceError(
                 "stored systemd identity differs from the root evidence ledger"
@@ -2497,6 +2685,16 @@ END"""
         identity_json = backend_canonical_json(identity.to_mapping())
         proof_json = backend_canonical_json(evidence.to_mapping())
         identity_hash = identity_digest(identity)
+        with self._connection() as connection:
+            containment = connection.execute(
+                """SELECT identity_json, identity_digest FROM execution_containment
+                   WHERE job_id = ? AND attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+        if containment is None:
+            self.bind_attempt_containment_for_termination(
+                identity, timestamp=timestamp
+            )
         with self._connection(transaction=True) as connection:
             row = connection.execute(
                 """SELECT containment.identity_json, containment.identity_digest,
@@ -2532,15 +2730,27 @@ END"""
             self._systemd_evidence_ledger.record_termination(
                 identity, evidence, timestamp=timestamp
             )
-            if row["termination_json"] is not None:
-                return
-            connection.execute(
-                """UPDATE execution_containment
-                   SET termination_json = ?, termination_at = ?
-                   WHERE job_id = ? AND attempt_id = ?
-                     AND termination_json IS NULL""",
-                (proof_json, timestamp, identity.job_id, identity.attempt_id),
-            )
+            if row["termination_json"] is None:
+                mirrored = connection.execute(
+                    """UPDATE execution_containment
+                       SET termination_json = ?, termination_at = ?
+                       WHERE job_id = ? AND attempt_id = ?
+                         AND termination_json IS NULL""",
+                    (proof_json, timestamp, identity.job_id, identity.attempt_id),
+                )
+                if mirrored.rowcount != 1:
+                    raise BackendEvidenceError(
+                        "SQLite termination mirror was not updated"
+                    )
+            mirrored_proof = connection.execute(
+                """SELECT termination_json FROM execution_containment
+                   WHERE job_id = ? AND attempt_id = ?""",
+                (identity.job_id, identity.attempt_id),
+            ).fetchone()
+            if mirrored_proof is None or mirrored_proof["termination_json"] != proof_json:
+                raise BackendEvidenceError(
+                    "SQLite termination mirror does not contain the root proof"
+                )
             cancellation = connection.execute(
                 """SELECT state, attempt_id FROM execution_cancellations
                    WHERE job_id = ? AND claim_epoch = ?""",
@@ -3094,6 +3304,24 @@ END"""
             ) from error
         return True
 
+    def _attempt_cgroup_termination_mirror_persisted(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Return whether SQLite stores the exact proof held by the root ledger."""
+        if not self._attempt_cgroup_termination_evidence(
+            connection, job_id, attempt_id
+        ):
+            return False
+        row = connection.execute(
+            """SELECT termination_json FROM execution_containment
+               WHERE job_id = ? AND attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+        return row is not None and row["termination_json"] is not None
+
     def termination_evidence_proven(self, job_id: str, attempt_id: str) -> bool:
         """Read whether the exact engine child has a durable exit observation."""
         with self._connection() as connection:
@@ -3125,6 +3353,19 @@ END"""
                 require_current_attempt=require_current_attempt,
             )
 
+    def attempt_termination_mirror_persisted(
+        self,
+        job_id: str,
+        attempt_id: str,
+    ) -> bool:
+        """Check that SQLite mirrors the root-ledger cgroup proof."""
+        with self._connection() as connection:
+            return self._attempt_cgroup_termination_mirror_persisted(
+                connection,
+                job_id,
+                attempt_id,
+            )
+
     def release_quarantined_attempt(
         self, job_id: str, attempt_id: str, *, timestamp: str
     ) -> bool:
@@ -3153,7 +3394,9 @@ END"""
                 or row["current_attempt_id"] != attempt_id
                 or row["attempt_status"] not in {"failed", "canceled"}
                 or row["containment_contract"] != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
-                or not self._attempt_termination_proven(connection, job_id, attempt_id)
+                or not self._attempt_cgroup_termination_mirror_persisted(
+                    connection, job_id, attempt_id
+                )
             ):
                 return False
             if connection.execute(
@@ -4280,9 +4523,19 @@ END"""
                     connection, job_id, attempt_id
                 )
             )
-            validated_termination_proven = self._attempt_termination_proven(
-                connection, job_id, attempt_id
-            )
+            if (
+                attempt["containment_contract"]
+                == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
+            ):
+                validated_termination_proven = (
+                    self._attempt_cgroup_termination_mirror_persisted(
+                        connection, job_id, attempt_id
+                    )
+                )
+            else:
+                validated_termination_proven = self._attempt_termination_proven(
+                    connection, job_id, attempt_id
+                )
             if prelaunch_proven:
                 effective_termination_proven = True
             elif not termination_proven:

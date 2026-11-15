@@ -41,3 +41,13 @@ jobs:
         run: make clean-dry-run
       - name: Verify installed console script directly
         run: media-generation --help
+
+  apex-manifest-root-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14.4"
+      - name: Run the deployment manifest fixture matrix as root
+        run: sudo "$(command -v python3)" tests/apex_venv_permissions_root.py

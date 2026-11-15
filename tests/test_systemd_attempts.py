@@ -1404,6 +1404,291 @@ def test_unit_disappearance_before_cgroup_pin_is_not_termination_proof(
     assert store.attempt_termination_proven(claim.job_id, claim.attempt_id) is False
 
 
+def test_exited_launcher_can_bind_loaded_runner_and_clean_only_after_cgroup_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    cgroup_directory = tmp_path / "system.slice" / identity.unit_name
+    cgroup_directory.mkdir(parents=True)
+    (cgroup_directory / "cgroup.events").write_text(
+        "populated 0\nfrozen 0\n", encoding="ascii"
+    )
+    expected_kernel_path = f"/sys/fs/cgroup{identity.cgroup_path}"
+    properties = {
+        "LoadState": "loaded",
+        "InvocationID": identity.invocation_id,
+        "ControlGroup": identity.cgroup_path,
+        "User": str(identity.runner_uid),
+        "Group": str(identity.runner_gid),
+        "KillMode": "control-group",
+        "Delegate": "no",
+        "RemainAfterExit": "yes",
+        "DevicePolicy": "closed",
+        "ProtectSystem": "strict",
+        "ProtectHome": "read-only",
+        "NoNewPrivileges": "yes",
+        "MainPID": "0",
+        "ExecMainPID": "4901",
+        "ExecMainCode": "1",
+        "ExecMainStatus": "1",
+        "Result": "exit-code",
+    }
+    events: list[str] = []
+    bound: list[AttemptUnitIdentity] = []
+
+    class Store:
+        def bind_attempt_containment(self, observed, *, timestamp):
+            bound.append(observed)
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return bound[0] if bound else None
+
+    class ExitedLauncher:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self) -> int:
+            return 1
+
+        def wait(self, *, timeout: float) -> int:
+            return 1
+
+        def wait(self, *, timeout: float) -> int:
+            events.append("launcher_reaped")
+            return 1
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        runner_uid=identity.runner_uid,
+        runner_gid=identity.runner_gid,
+        runner_supplementary_gids=(2302, 2303, 2304),
+        empty_timeout_seconds=0.1,
+    )
+    broker.store = Store()
+    broker._remove_scratch = lambda _attempt: events.append("scratch_removed")
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: properties)
+    monkeypatch.setattr(broker_module, "_boot_id", lambda: identity.boot_id)
+    monkeypatch.setattr(
+        broker_module,
+        "_require_process_credentials",
+        lambda *_args, **_kwargs: pytest.fail("an exited runner has no live credentials"),
+    )
+    original_open = os.open
+    original_stat = os.stat
+
+    def open_cgroup(path, flags, *args, **kwargs):
+        if os.fspath(path) == expected_kernel_path:
+            path = cgroup_directory
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(broker_module.os, "open", open_cgroup)
+    monkeypatch.setattr(
+        broker_module.os,
+        "stat",
+        lambda path, *args, **kwargs: original_stat(
+            cgroup_directory if os.fspath(path) == expected_kernel_path else path,
+            *args,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda _store, observed, _fd: events.append("empty_proof")
+        or CgroupTerminationEvidence(
+            identity=observed,
+            populated=0,
+            observed_monotonic_ns=987654321,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    observed, events_fd = broker._wait_for_containment(
+        ExitedLauncher(),
+        identity.unit_name,
+        identity.job_id,
+        identity.attempt_id,
+        identity.owner_id,
+        identity.claim_epoch,
+        identity.resolved_digest,
+    )
+    try:
+        assert observed.unit_name == identity.unit_name
+        assert observed.invocation_id == identity.invocation_id
+        assert (observed.cgroup_device, observed.cgroup_inode) == (
+            cgroup_directory.stat().st_dev,
+            cgroup_directory.stat().st_ino,
+        )
+        assert bound == [observed]
+        assert broker._cleanup_failed_containment_setup(
+            ExitedLauncher(), observed, events_fd
+        )
+    finally:
+        os.close(events_fd)
+
+    assert events == ["empty_proof", "launcher_reaped", "scratch_removed"]
+
+
+def test_exited_launcher_can_bind_a_still_running_service_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    cgroup_directory = tmp_path / "system.slice" / identity.unit_name
+    cgroup_directory.mkdir(parents=True)
+    (cgroup_directory / "cgroup.events").write_text(
+        "populated 1\nfrozen 0\n", encoding="ascii"
+    )
+    properties = {
+        "LoadState": "loaded",
+        "InvocationID": identity.invocation_id,
+        "ControlGroup": identity.cgroup_path,
+        "User": str(identity.runner_uid),
+        "Group": str(identity.runner_gid),
+        "KillMode": "control-group",
+        "Delegate": "no",
+        "RemainAfterExit": "yes",
+        "DevicePolicy": "closed",
+        "ProtectSystem": "strict",
+        "ProtectHome": "read-only",
+        "NoNewPrivileges": "yes",
+        "MainPID": "4901",
+        "ExecMainPID": "4901",
+        "ExecMainCode": "0",
+        "ExecMainStatus": "0",
+        "Result": "success",
+    }
+    bound: list[AttemptUnitIdentity] = []
+    credential_checks: list[int] = []
+
+    class Store:
+        def bind_attempt_containment(self, observed, *, timestamp):
+            bound.append(observed)
+
+    class ExitedLauncher:
+        def poll(self) -> int:
+            return 1
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        runner_uid=identity.runner_uid,
+        runner_gid=identity.runner_gid,
+        runner_supplementary_gids=(2302, 2303, 2304),
+    )
+    broker.store = Store()
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: properties)
+    monkeypatch.setattr(broker_module, "_boot_id", lambda: identity.boot_id)
+    monkeypatch.setattr(
+        broker_module,
+        "_require_process_credentials",
+        lambda pid, **_kwargs: credential_checks.append(pid),
+    )
+    expected_kernel_path = f"/sys/fs/cgroup{identity.cgroup_path}"
+    original_open = os.open
+
+    def open_cgroup(path, flags, *args, **kwargs):
+        if os.fspath(path) == expected_kernel_path:
+            path = cgroup_directory
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(broker_module.os, "open", open_cgroup)
+
+    observed, events_fd = broker._wait_for_containment(
+        ExitedLauncher(),
+        identity.unit_name,
+        identity.job_id,
+        identity.attempt_id,
+        identity.owner_id,
+        identity.claim_epoch,
+        identity.resolved_digest,
+    )
+    try:
+        assert observed.invocation_id == identity.invocation_id
+        assert bound == [observed]
+        assert credential_checks == [4901]
+        assert broker_module._read_populated(events_fd) == 1
+    finally:
+        os.close(events_fd)
+
+
+def test_launcher_exit_without_bound_containment_retains_scratch_and_never_stops_by_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    scratch = configuration.scratch_root / identity.attempt_id
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    stop_calls: list[str] = []
+
+    class Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
+
+    class Pipe:
+        def close(self) -> None:
+            pass
+
+    class ExitedLauncher:
+        stdin = Pipe()
+        stdout = Pipe()
+        stderr = Pipe()
+
+        def poll(self) -> int:
+            return 1
+
+        def wait(self, *, timeout: float) -> int:
+            return 1
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._create_attempt_scratch = lambda _attempt: scratch.mkdir(mode=0o700)
+    monkeypatch.setattr(broker_module, "backend_digest", lambda _record: identity.resolved_digest)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
+    monkeypatch.setattr(broker_module, "_start_systemd_run", lambda *_args: ExitedLauncher())
+    monkeypatch.setattr(
+        broker_module,
+        "_stop_unit",
+        lambda unit: stop_calls.append(unit) or True,
+    )
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(scratch),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    with pytest.raises((RuntimeError, BackendEvidenceError)):
+        broker._execute(object(), request)
+
+    assert stop_calls == []
+    assert scratch.is_dir()
+
+
 def test_populated_cgroup_event_is_not_termination_proof(tmp_path) -> None:
     event_path = tmp_path / "cgroup.events"
     event_path.write_text("populated 1\nfrozen 0\n", encoding="ascii")
@@ -1907,6 +2192,453 @@ def test_systemd_command_uses_only_fixed_runner_and_broker_properties(
     assert command[-2:] == ["--", str(configuration.runner_executable)]
 
 
+@pytest.mark.parametrize("failure", ("nonzero", "timeout", "oserror"))
+def test_systemd_unit_lookup_failure_is_not_reported_as_absence(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    def fail_lookup(*_args, **_kwargs):
+        if failure == "nonzero":
+            return SimpleNamespace(returncode=1, stdout="")
+        if failure == "timeout":
+            raise broker_module.subprocess.TimeoutExpired("systemctl show", 3)
+        raise OSError("systemctl is unavailable")
+
+    monkeypatch.setattr(broker_module.subprocess, "run", fail_lookup)
+
+    with pytest.raises(BackendEvidenceError, match="unit state cannot be verified"):
+        broker_module._unit_properties(_identity().unit_name)
+
+
+def test_systemd_unit_lookup_reports_only_explicit_not_found_as_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        broker_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout="LoadState=not-found\n"
+        ),
+    )
+
+    assert broker_module._unit_properties(_identity().unit_name) is None
+
+
+def test_systemd_unit_lookup_accepts_loaded_state_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    properties = "LoadState=loaded\nInvocationID=0123456789abcdef0123456789abcdef\n"
+    calls: list[list[str]] = []
+
+    def show(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=properties)
+
+    monkeypatch.setattr(broker_module.subprocess, "run", show)
+
+    assert broker_module._unit_properties(_identity().unit_name) == {
+        "LoadState": "loaded",
+        "InvocationID": "0123456789abcdef0123456789abcdef",
+    }
+    assert "--property=LoadState" in calls[0]
+
+
+@pytest.mark.parametrize("stdout", ["", "LoadState=masked\n", "LoadState=error\n"])
+def test_systemd_unit_lookup_rejects_incomplete_or_unusable_load_state(
+    monkeypatch: pytest.MonkeyPatch, stdout: str
+) -> None:
+    monkeypatch.setattr(
+        broker_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=stdout),
+    )
+
+    with pytest.raises(BackendEvidenceError, match="unit state cannot be verified"):
+        broker_module._unit_properties(_identity().unit_name)
+
+
+@pytest.mark.parametrize(
+    ("loaded_state", "prior_identity", "expected_error"),
+    [
+        (True, False, "unit name already exists"),
+        (False, False, "unit state cannot be verified"),
+        (False, True, "already has a bound systemd invocation"),
+    ],
+    ids=["preexisting-unit", "unit-lookup-failure", "prior-invocation"],
+)
+def test_existing_or_unverifiable_attempt_unit_blocks_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loaded_state: bool,
+    prior_identity: bool,
+    expected_error: str,
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    starts: list[str] = []
+    scratch_creations: list[str] = []
+
+    class Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return identity if prior_identity else None
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._create_attempt_scratch = lambda _attempt: scratch_creations.append("created")
+    monkeypatch.setattr(
+        broker_module, "backend_digest", lambda _record: identity.resolved_digest
+    )
+    if loaded_state:
+        monkeypatch.setattr(
+            broker_module,
+            "_unit_properties",
+            lambda _unit: {"LoadState": "loaded"},
+        )
+    else:
+        def lookup_failure(_unit):
+            raise BackendEvidenceError("systemd unit state cannot be verified")
+
+        monkeypatch.setattr(broker_module, "_unit_properties", lookup_failure)
+    monkeypatch.setattr(
+        broker_module,
+        "_start_systemd_run",
+        lambda *_args: starts.append("started"),
+    )
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(configuration.scratch_root / identity.attempt_id),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    with pytest.raises(BackendEvidenceError, match=expected_error):
+        broker._execute(object(), request)
+
+    assert starts == []
+    assert scratch_creations == []
+    assert not (configuration.scratch_root / identity.attempt_id).exists()
+
+
+@pytest.mark.parametrize("replacement", [None, "different-invocation", "different-cgroup"])
+def test_bound_stop_refuses_disappeared_or_replaced_attempt_unit(
+    monkeypatch: pytest.MonkeyPatch, replacement: str | None
+) -> None:
+    identity = _identity()
+    properties = None
+    if replacement == "different-invocation":
+        properties = {
+            "InvocationID": "d" * 32,
+            "ControlGroup": identity.cgroup_path,
+        }
+    elif replacement == "different-cgroup":
+        properties = {
+            "InvocationID": identity.invocation_id,
+            "ControlGroup": "/system.slice/reused.service",
+        }
+    stop_calls: list[str] = []
+    broker = object.__new__(SystemdAttemptBroker)
+    monkeypatch.setattr(broker_module, "_boot_id", lambda: identity.boot_id)
+    monkeypatch.setattr(
+        broker_module, "_unit_properties", lambda _unit: properties
+    )
+    monkeypatch.setattr(
+        broker_module, "_stop_unit", lambda unit: stop_calls.append(unit) or True
+    )
+    events_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert broker._stop_bound_unit(identity, events_fd) is False
+    finally:
+        os.close(events_fd)
+
+    assert stop_calls == []
+
+
+def test_duplicate_execute_is_rejected_before_second_systemd_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    scratch = configuration.scratch_root / identity.attempt_id
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    start_names: list[str] = []
+    stop_names: list[str] = []
+    containment_started = threading.Event()
+    release_containment = threading.Event()
+    second_done = threading.Event()
+    first_done = threading.Event()
+    results: dict[str, object] = {}
+    real_thread = threading.Thread
+
+    class Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
+
+    class Pipe:
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def flush(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class Process:
+        def __init__(self) -> None:
+            self.stdin = Pipe()
+            self.stdout = Pipe()
+
+        def wait(self, timeout: float) -> int:
+            return 0
+
+        def terminate(self) -> None:
+            pass
+
+    class Monitor:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout: float) -> None:
+            pass
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._create_attempt_scratch = lambda _attempt: scratch.mkdir(mode=0o700)
+    def wait_for_containment(*_args):
+        containment_started.set()
+        assert release_containment.wait(2)
+        return (
+            identity,
+            os.open(tmp_path / "pinned-events", os.O_RDONLY | os.O_CREAT, 0o600),
+        )
+
+    broker._wait_for_containment = wait_for_containment
+    monkeypatch.setattr(broker_module, "backend_digest", lambda _record: identity.resolved_digest)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(broker_module, "_read_populated", lambda _fd: 1)
+    monkeypatch.setattr(broker_module, "_unit_identity_live", lambda _identity: True)
+
+    def start_systemd_run(*_args):
+        start_names.append(threading.current_thread().name)
+        return Process()
+
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
+    monkeypatch.setattr(broker_module, "_start_systemd_run", start_systemd_run)
+    monkeypatch.setattr(broker_module, "_write_line", lambda *_args: None)
+    monkeypatch.setattr(
+        broker_module,
+        "_read_line",
+        lambda _stream: {
+            "operation": "runner_error",
+            "runner_exit_code": None,
+            "error_code": "runner_failed",
+        },
+    )
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: stop_names.append(threading.current_thread().name)
+        or True,
+    )
+    monkeypatch.setattr(
+        broker,
+        "_wait_for_runner_exit",
+        lambda observed, *, timeout: {
+            "InvocationID": observed.invocation_id,
+            "ControlGroup": observed.cgroup_path,
+            "MainPID": "0",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "7",
+            "Result": "exit-code",
+        },
+    )
+    monkeypatch.setattr(broker_module, "_wait_cgroup_empty", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda _store, observed, _fd: CgroupTerminationEvidence(
+            identity=observed,
+            populated=0,
+            observed_monotonic_ns=987654321,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    monkeypatch.setattr(broker_module.threading, "Thread", Monitor)
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(scratch),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    def execute(label: str, done: threading.Event) -> None:
+        try:
+            results[label] = broker._execute(worker, request)
+        except Exception as error:  # The duplicate is expected to be rejected.
+            results[label] = error
+        finally:
+            done.set()
+
+    first = real_thread(target=execute, args=("first", first_done), name="first")
+    first.start()
+    assert containment_started.wait(2)
+    second = real_thread(
+        target=execute, args=("second", second_done), name="second"
+    )
+    second.start()
+    try:
+        assert second_done.wait(2)
+    finally:
+        release_containment.set()
+    assert first_done.wait(2)
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    completed = [result for result in results.values() if isinstance(result, tuple)]
+    rejected = [result for result in results.values() if isinstance(result, Exception)]
+    assert len(completed) == 1
+    assert len(rejected) == 1
+    assert len(start_names) == 1
+    assert len(stop_names) == 2
+    assert stop_names == [start_names[0], start_names[0]]
+    worker.close()
+    peer.close()
+
+
+def test_duplicate_active_attempt_is_rejected_before_start_or_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    scratch = configuration.scratch_root / identity.attempt_id
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    launches: list[str] = []
+    stops: list[str] = []
+
+    class Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
+
+    class Launcher:
+        stdin = None
+        stdout = None
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    broker._active = {identity.attempt_id: SimpleNamespace(identity=identity)}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._create_attempt_scratch = lambda _attempt: scratch.mkdir(mode=0o700)
+    broker._wait_for_containment = lambda *_args: (
+        identity,
+        os.open(tmp_path / "unused-events", os.O_RDONLY | os.O_CREAT, 0o600),
+    )
+    monkeypatch.setattr(broker_module, "backend_digest", lambda _record: identity.resolved_digest)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
+    monkeypatch.setattr(broker_module, "_read_populated", lambda _fd: 1)
+    monkeypatch.setattr(broker_module, "_unit_identity_live", lambda _identity: True)
+    monkeypatch.setattr(
+        broker_module,
+        "_start_systemd_run",
+        lambda *_args: launches.append("started") or Launcher(),
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_stop_unit",
+        lambda unit: stops.append(unit) or True,
+    )
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(scratch),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    with pytest.raises(BackendEvidenceError, match="already has a broker session"):
+        broker._execute(object(), request)
+
+    assert launches == []
+    assert stops == []
+    assert not scratch.exists()
+
+
 @pytest.mark.parametrize(
     ("operation", "runner_status_available", "reported_exit_code", "expected_exit_code", "expected_error"),
     [
@@ -1943,6 +2675,9 @@ def test_broker_waits_for_runner_exit_before_cgroup_proof_and_starts_watcher_onc
                 "resolved": resolved,
                 "resolved_digest": identity.resolved_digest,
             }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
 
     class _Pipe:
         def write(self, value: bytes) -> int:
@@ -2023,7 +2758,11 @@ def test_broker_waits_for_runner_exit_before_cgroup_proof_and_starts_watcher_onc
         }
     )
     monkeypatch.setattr(broker_module, "_read_line", lambda _stream: control_message)
-    monkeypatch.setattr(broker_module, "_stop_unit", lambda _unit: events.append("stop"))
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: events.append("stop") or True,
+    )
     monkeypatch.setattr(
         broker_module,
         "_wait_cgroup_empty",
@@ -2054,7 +2793,12 @@ def test_broker_waits_for_runner_exit_before_cgroup_proof_and_starts_watcher_onc
         "runner_gid": identity.runner_gid,
     }
 
-    response, output_fd = broker._execute(object(), request)
+    worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        response, output_fd = broker._execute(worker, request)
+    finally:
+        worker.close()
+        peer.close()
 
     assert output_fd is None
     assert response["termination_evidence"] is not None
@@ -2127,6 +2871,9 @@ def test_broker_rejects_changed_resolved_environment_before_unit_start(
                 "resolved": resolved,
                 "resolved_digest": resolved_digest,
             }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
 
     broker = object.__new__(SystemdAttemptBroker)
     broker.configuration = SimpleNamespace(
@@ -2210,6 +2957,9 @@ def test_broker_rejects_unsafe_library_search_path_entries(
                 "resolved": resolved,
                 "resolved_digest": resolved_digest,
             }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
 
     broker = object.__new__(SystemdAttemptBroker)
     broker.configuration = SimpleNamespace(
@@ -2666,25 +3416,31 @@ def test_prepare_returns_scratch_path_without_creating_directory(tmp_path) -> No
     assert not (configuration.scratch_root / claim.attempt_id).exists()
 
 
-def test_worker_disconnect_fences_and_stops_exact_live_attempt(monkeypatch) -> None:
+@pytest.mark.parametrize("worker_end", ["eof", "extra-data"])
+def test_worker_disconnect_signals_loss_and_stops_exact_live_attempt(
+    monkeypatch, worker_end: str
+) -> None:
     identity = _identity()
     events: list[tuple[object, ...]] = []
-
-    class _Store:
-        def fence_attempt_for_recovery(self, job_id, attempt_id, *, timestamp):
-            events.append(("fence", job_id, attempt_id))
-            return {"job_id": job_id, "attempt_id": attempt_id}
-
     broker = object.__new__(SystemdAttemptBroker)
-    broker.store = _Store()
     monkeypatch.setattr(
-        broker_module, "_stop_unit", lambda unit: events.append(("stop", unit))
+        broker,
+        "_stop_bound_unit",
+        lambda observed, _fd: events.append(("stop", observed.unit_name)) or True,
     )
     worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-    peer.close()
+    if worker_end == "eof":
+        peer.close()
+    else:
+        peer.sendall(b"unexpected-extra-data")
     lost = threading.Event()
     stop = threading.Event()
-    active = type("Active", (), {"identity": identity})()
+    active = SimpleNamespace(
+        identity=identity,
+        lock=threading.RLock(),
+        done=threading.Event(),
+        cgroup_events_fd=os.open("/dev/null", os.O_RDONLY),
+    )
     monitor = threading.Thread(
         target=broker._watch_worker_disconnect,
         args=(worker, active, lost, stop),
@@ -2696,15 +3452,627 @@ def test_worker_disconnect_fences_and_stops_exact_live_attempt(monkeypatch) -> N
         stop.set()
         monitor.join(timeout=1)
         worker.close()
+        if peer.fileno() >= 0:
+            peer.close()
+        os.close(active.cgroup_events_fd)
 
     assert not monitor.is_alive()
+    assert lost.is_set()
+    assert events == [("stop", identity.unit_name)]
+
+
+def test_worker_disconnect_fences_and_ends_launcher_when_unit_stop_fails() -> None:
+    identity = _identity()
+    events: list[str] = []
+
+    class Store:
+        def fence_attempt_for_recovery(self, job_id, attempt_id, *, timestamp):
+            assert (job_id, attempt_id) == (identity.job_id, identity.attempt_id)
+            events.append("publication_fenced")
+
+    class Launcher:
+        def terminate(self) -> None:
+            events.append("launcher_terminated")
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.store = Store()
+    broker._stop_bound_unit = lambda *_args: (
+        events.append("unit_stop_failed") or False
+    )
+    worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    peer.close()
+    active = SimpleNamespace(
+        identity=identity,
+        process=Launcher(),
+        lock=threading.RLock(),
+        done=threading.Event(),
+        lost_fenced=threading.Event(),
+        cgroup_events_fd=os.open("/dev/null", os.O_RDONLY),
+    )
+    lost = threading.Event()
+    stop = threading.Event()
+    monitor = threading.Thread(
+        target=broker._watch_worker_disconnect,
+        args=(worker, active, lost, stop),
+    )
+    monitor.start()
+    try:
+        assert lost.wait(2)
+        monitor.join(timeout=1)
+    finally:
+        stop.set()
+        monitor.join(timeout=1)
+        worker.close()
+        os.close(active.cgroup_events_fd)
+
+    assert not monitor.is_alive()
+    assert active.lost_fenced.is_set()
     assert events == [
-        ("fence", identity.job_id, identity.attempt_id),
-        ("stop", identity.unit_name),
+        "publication_fenced",
+        "unit_stop_failed",
+        "launcher_terminated",
     ]
 
 
-def _claimed_systemd_attempt(tmp_path):
+def test_execute_fences_worker_eof_once_and_returns_no_success_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    fences: list[tuple[str, str]] = []
+    stops: list[AttemptUnitIdentity] = []
+
+    class Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
+
+        def fence_attempt_for_recovery(self, job_id, attempt_id, *, timestamp):
+            fences.append((job_id, attempt_id))
+
+    class Pipe:
+        def close(self) -> None:
+            pass
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def flush(self) -> None:
+            pass
+
+    class Launcher:
+        stdin = Pipe()
+        stdout = Pipe()
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._validate_engine_environment = lambda _environment: None
+    broker._create_attempt_scratch = lambda _attempt: configuration.scratch_root.joinpath(
+        identity.attempt_id
+    ).mkdir(mode=0o700)
+    broker._wait_for_containment = lambda *_args: (
+        identity,
+        os.open("/dev/null", os.O_RDONLY),
+    )
+    broker._stop_bound_unit = lambda observed, _fd: stops.append(observed) or True
+    broker._wait_for_runner_exit = lambda *_args, **_kwargs: pytest.fail(
+        "worker EOF must fence and stop before runner-exit success handling"
+    )
+    monkeypatch.setattr(
+        broker_module, "backend_digest", lambda _record: identity.resolved_digest
+    )
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(broker_module, "_start_systemd_run", lambda *_args: Launcher())
+    monkeypatch.setattr(broker_module, "_read_populated", lambda _fd: 1)
+    monkeypatch.setattr(broker_module, "_unit_identity_live", lambda _identity: True)
+    monkeypatch.setattr(
+        broker_module,
+        "_read_line",
+        lambda _stream: {
+            "operation": "complete",
+            "runner_exit_code": 0,
+            "engine_observation": None,
+            "stream_complete": True,
+        },
+    )
+    monkeypatch.setattr(broker_module, "_wait_cgroup_empty", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda _store, observed, _fd: CgroupTerminationEvidence(
+            identity=observed,
+            populated=0,
+            observed_monotonic_ns=987654321,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    peer.close()
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(
+            configuration.scratch_root / identity.attempt_id
+        ),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    try:
+        response, output_fd = broker._execute(worker, request)
+    finally:
+        worker.close()
+        peer.close()
+
+    assert output_fd is None
+    assert response["error_code"] == "worker_connection_lost"
+    assert response["termination_evidence"] is not None
+    assert fences == [(identity.job_id, identity.attempt_id)]
+    assert stops
+    assert all(stopped_identity == identity for stopped_identity in stops)
+
+
+@pytest.mark.parametrize(
+    ("close_before_reply", "send_fails", "expected_fences"),
+    [(True, False, 1), (False, False, 0), (False, True, 1)],
+    ids=[
+        "eof-before-reply-is-loss",
+        "close-after-reply-is-normal",
+        "send-failure-fences-attempt",
+    ],
+)
+def test_broker_execute_reply_arbitrates_worker_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    close_before_reply: bool,
+    send_fails: bool,
+    expected_fences: int,
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    fences: list[tuple[str, str]] = []
+
+    class Store:
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
+
+        def fence_attempt_for_recovery(self, job_id, attempt_id, *, timestamp):
+            fences.append((job_id, attempt_id))
+
+    class Pipe:
+        def close(self) -> None:
+            pass
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def flush(self) -> None:
+            pass
+
+    class Launcher:
+        stdin = Pipe()
+        stdout = Pipe()
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._validate_engine_environment = lambda _environment: None
+    broker._create_attempt_scratch = lambda _attempt: configuration.scratch_root.joinpath(
+        identity.attempt_id
+    ).mkdir(mode=0o700)
+    broker._wait_for_containment = lambda *_args: (
+        identity,
+        os.open("/dev/null", os.O_RDONLY),
+    )
+    broker._stop_bound_unit = lambda *_args: True
+    monkeypatch.setattr(
+        broker_module, "backend_digest", lambda _record: identity.resolved_digest
+    )
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(broker_module, "_start_systemd_run", lambda *_args: Launcher())
+    monkeypatch.setattr(broker_module, "_read_populated", lambda _fd: 1)
+    monkeypatch.setattr(broker_module, "_unit_identity_live", lambda _identity: True)
+    monkeypatch.setattr(
+        broker_module,
+        "_read_line",
+        lambda _stream: {
+            "operation": "complete",
+            "runner_exit_code": 0,
+            "engine_observation": None,
+            "stream_complete": True,
+        },
+    )
+    monkeypatch.setattr(
+        broker_module, "_wait_cgroup_empty", lambda *_args, **_kwargs: True
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda _store, observed, _fd: CgroupTerminationEvidence(
+            identity=observed,
+            populated=0,
+            observed_monotonic_ns=987654321,
+            observed_at=datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+    def wait_for_runner_exit(*_args, **_kwargs):
+        if close_before_reply:
+            peer.close()
+        return {
+            "InvocationID": identity.invocation_id,
+            "ControlGroup": identity.cgroup_path,
+            "MainPID": "0",
+            "ExecMainCode": "1",
+            "ExecMainStatus": "0",
+            "Result": "success",
+        }
+
+    broker._wait_for_runner_exit = wait_for_runner_exit
+    monkeypatch.setattr(
+        broker_module,
+        "_peer_credentials",
+        lambda _connection: (1234, configuration.worker_uid, configuration.worker_gid),
+    )
+    monkeypatch.setattr(
+        broker_module, "_require_process_credentials", lambda *_args, **_kwargs: None
+    )
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(configuration.scratch_root / identity.attempt_id),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+    monkeypatch.setattr(
+        broker_module,
+        "_validated_request",
+        lambda _packet: ("execute", request),
+    )
+    peer.sendall(b"execute")
+    if send_fails:
+        def fail_reply_send(_connection, _response, **_kwargs):
+            peer.close()
+            raise BrokenPipeError("worker disconnected during reply")
+
+        monkeypatch.setattr(broker_module, "_send", fail_reply_send)
+
+    try:
+        broker._serve_connection(worker)
+        if not close_before_reply and not send_fails:
+            response = json.loads(peer.recv(4096).decode("utf-8"))
+            assert response["error_code"] is None
+            peer.close()
+    finally:
+        worker.close()
+        peer.close()
+
+    assert fences == [(identity.job_id, identity.attempt_id)] * expected_fences
+
+
+def test_fenced_attempt_accepts_termination_only_containment_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+
+    with pytest.raises(BackendEvidenceError):
+        store.bind_attempt_containment(identity, timestamp=_now())
+
+    bind_for_termination = getattr(
+        store, "bind_attempt_containment_for_termination", None
+    )
+    assert callable(bind_for_termination), (
+        "fenced attempts need a termination-only containment identity writer"
+    )
+    bind_for_termination(identity, timestamp=_now())
+
+    assert store.attempt_containment_identity(claim.job_id, claim.attempt_id) == identity
+    assert store._systemd_evidence_ledger.read_identity(
+        claim.job_id, claim.attempt_id
+    ) == identity
+    assert not store.assert_attempt_authority(
+        claim.job_id,
+        claim.attempt_id,
+        claim.owner_id,
+        claim.claim_epoch,
+    )
+    assert store.get_backend_execution(claim.job_id, claim.attempt_id)["state"] == "resolved"
+
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    store.record_attempt_termination_evidence(identity, evidence, timestamp=_now())
+    assert store.attempt_termination_proven(
+        claim.job_id, claim.attempt_id, require_current_attempt=False
+    )
+    assert store.cancel_execution(claim.job_id, _now()) == "acknowledged"
+    assert store.fail_execution(
+        claim.job_id,
+        claim.attempt_id,
+        "canceled during containment startup",
+        _now(),
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="canceled",
+        termination_proven=True,
+    )
+    pending = store.pending_systemd_output_cleanups(attempt_id=claim.attempt_id)
+    assert len(pending) == 1
+    assert pending[0].identity == identity
+    assert pending[0].validated is False
+
+
+def test_termination_only_binding_accepts_quarantined_canceled_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert store.fail_execution(
+        claim.job_id,
+        claim.attempt_id,
+        "cancellation recovery awaits containment evidence",
+        _now(),
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="canceled",
+        termination_proven=False,
+    )
+    assert store.resource_snapshot()["state"] == "quarantined"
+
+    store.bind_attempt_containment_for_termination(identity, timestamp=_now())
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    store.record_attempt_termination_evidence(identity, evidence, timestamp=_now())
+
+    assert store.attempt_containment_identity(claim.job_id, claim.attempt_id) == identity
+    assert store.attempt_termination_proven(
+        claim.job_id, claim.attempt_id, require_current_attempt=False
+    )
+    assert store.resource_snapshot()["state"] == "quarantined"
+    assert not store.assert_attempt_authority(
+        claim.job_id,
+        claim.attempt_id,
+        claim.owner_id,
+        claim.claim_epoch,
+    )
+
+
+@pytest.mark.parametrize("proof_already_recorded", [False, True])
+def test_quarantine_recovery_reconciles_root_ledger_only_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    proof_already_recorded: bool,
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+
+    # This is the crash boundary after the root ledger commit and before the
+    # worker database mirrors the identity and lifecycle rows.
+    ledger = store._systemd_evidence_ledger
+    ledger.bind_identity(identity)
+    if proof_already_recorded:
+        ledger.record_termination(identity, evidence, timestamp=_now())
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert store.fail_execution(
+        claim.job_id,
+        claim.attempt_id,
+        "recovery after a partial root-ledger commit",
+        _now(),
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="canceled",
+        termination_proven=False,
+    )
+
+    assert store.attempt_containment_identity(claim.job_id, claim.attempt_id) == identity
+    stopped: list[AttemptUnitIdentity] = []
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.store = store
+    broker._active_for = lambda _identity: None
+
+    def stop_and_record(observed: AttemptUnitIdentity):
+        assert observed == identity
+        stopped.append(observed)
+        if not proof_already_recorded:
+            store.record_attempt_termination_evidence(
+                observed, evidence, timestamp=_now()
+            )
+        return evidence
+
+    broker._stop_and_record = stop_and_record
+    assert broker._cancel(
+        {
+            "job_id": claim.job_id,
+            "attempt_id": claim.attempt_id,
+            "owner_id": claim.owner_id,
+            "claim_epoch": claim.claim_epoch,
+        }
+    ) == {"ok": True, "outcome": "acknowledged"}
+    assert store.attempt_containment_identity(claim.job_id, claim.attempt_id) == identity
+    assert store.attempt_termination_proven(
+        claim.job_id, claim.attempt_id, require_current_attempt=False
+    )
+    assert stopped == ([] if proof_already_recorded else [identity])
+    assert store.resource_snapshot()["state"] == "quarantined"
+
+
+def test_cancel_during_containment_startup_remains_requested() -> None:
+    identity = _identity()
+
+    class Store:
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return None
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.store = Store()
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+    }
+
+    assert broker._cancel(request) == {"ok": True, "outcome": "requested"}
+
+
+@pytest.mark.parametrize(
+    ("close_before_monitor_stop", "expected_lost"),
+    [(True, True), (False, False)],
+    ids=["eof-before-finalization-is-loss", "eof-after-finalization-is-normal-close"],
+)
+def test_disconnect_monitor_finalization_arbitrates_eof_without_late_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    close_before_monitor_stop: bool,
+    expected_lost: bool,
+) -> None:
+    identity = _identity()
+    events: list[tuple[object, ...]] = []
+    select_entered = threading.Event()
+    release_select = threading.Event()
+    stopped = threading.Event()
+    worker, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    real_select = broker_module.select.select
+    real_thread = threading.Thread
+
+    class StopSignal:
+        def __init__(self) -> None:
+            self.first_poll = True
+
+        def wait(self, timeout: float | None = None) -> bool:
+            if self.first_poll:
+                self.first_poll = False
+                return False
+            return stopped.wait(timeout)
+
+        def is_set(self) -> bool:
+            return stopped.is_set()
+
+        def set(self) -> None:
+            stopped.set()
+
+    class Store:
+        def fence_attempt_for_recovery(self, job_id, attempt_id, *, timestamp):
+            events.append(("fence", job_id, attempt_id))
+
+    active = SimpleNamespace(identity=identity, lock=threading.RLock())
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.store = Store()
+    monkeypatch.setattr(
+        broker_module,
+        "_stop_unit",
+        lambda unit: events.append(("stop", unit)),
+    )
+
+    def controlled_select(readable, writable, exceptional, timeout=None):
+        if threading.current_thread().name == "delayed-disconnect-monitor":
+            select_entered.set()
+            assert release_select.wait(2)
+            return [worker], [], []
+        return real_select(readable, writable, exceptional, timeout)
+
+    monkeypatch.setattr(broker_module.select, "select", controlled_select)
+    lost = threading.Event()
+    stop = StopSignal()
+    monitor = real_thread(
+        target=broker._watch_worker_disconnect,
+        args=(worker, active, lost, stop),
+        name="delayed-disconnect-monitor",
+    )
+    monitor.start()
+    try:
+        assert select_entered.wait(2)
+        if close_before_monitor_stop:
+            peer.close()
+        broker._stop_worker_disconnect_monitor(worker, active, lost, stop)
+        if not close_before_monitor_stop:
+            peer.close()
+        release_select.set()
+        monitor.join(timeout=2)
+    finally:
+        release_select.set()
+        if peer.fileno() >= 0:
+            peer.close()
+        worker.close()
+
+    assert not monitor.is_alive()
+    assert lost.is_set() is expected_lost
+    assert events == []
+
+
+def _claimed_systemd_attempt(tmp_path, *, return_service: bool = False):
     bundle = build_bundle(tmp_path)
     service = _service(tmp_path, bundle)
     SystemdEvidenceLedger.path_for(service.database_path).parent.mkdir(
@@ -2763,6 +4131,8 @@ def _claimed_systemd_attempt(tmp_path):
         runner_uid=2301,
         runner_gid=2301,
     )
+    if return_service:
+        return service._store, claim, identity, service
     return service._store, claim, identity
 
 
@@ -2819,6 +4189,9 @@ def test_post_fence_cgroup_evidence_is_idempotent_and_does_not_create_engine_obs
 
     store.record_attempt_termination_evidence(
         identity, evidence, timestamp=_now()
+    )
+    assert _termination_mirror(store, claim.job_id, claim.attempt_id) == (
+        store_module.backend_canonical_json(evidence.to_mapping())
     )
     store.record_attempt_termination_evidence(
         identity, evidence, timestamp=_now()
@@ -3290,6 +4663,249 @@ def test_root_ledger_proof_survives_failed_job_database_mirror(
         )
 
     assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    assert store.attempt_termination_mirror_persisted(
+        claim.job_id, claim.attempt_id
+    ) is False
+
+
+def _quarantine_canceled_systemd_attempt(store, claim) -> None:
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert store.fail_execution(
+        claim.job_id,
+        claim.attempt_id,
+        "cgroup termination awaits durable proof reconciliation",
+        _now(),
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="canceled",
+        termination_proven=False,
+    )
+    assert store.resource_snapshot()["state"] == "quarantined"
+
+
+def _termination_mirror(store, job_id: str, attempt_id: str) -> str | None:
+    with store._connection() as connection:
+        row = connection.execute(
+            """SELECT termination_json FROM execution_containment
+               WHERE job_id = ? AND attempt_id = ?""",
+            (job_id, attempt_id),
+        ).fetchone()
+    return None if row is None else row["termination_json"]
+
+
+def test_zero_row_sqlite_termination_mirror_write_is_not_acknowledged(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    _quarantine_canceled_systemd_attempt(store, claim)
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    with store._connection(transaction=True) as connection:
+        connection.execute(
+            """CREATE TRIGGER ignore_termination_mirror
+               BEFORE UPDATE OF termination_json ON execution_containment
+               BEGIN SELECT RAISE(IGNORE); END"""
+        )
+
+    with pytest.raises(BackendEvidenceError, match="SQLite termination mirror"):
+        store.record_attempt_termination_evidence(
+            identity, evidence, timestamp=_now()
+        )
+
+    assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    assert _termination_mirror(store, claim.job_id, claim.attempt_id) is None
+    with store._connection() as connection:
+        cancellation = connection.execute(
+            """SELECT state FROM execution_cancellations
+               WHERE job_id = ? AND attempt_id = ?""",
+            (claim.job_id, claim.attempt_id),
+        ).fetchone()
+    assert cancellation["state"] == "requested"
+    assert store.release_quarantined_attempt(
+        claim.job_id, claim.attempt_id, timestamp=_now()
+    ) is False
+    assert store.resource_snapshot()["state"] == "quarantined"
+
+
+def test_root_only_termination_proof_cannot_release_capacity_in_fail_execution(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    store._systemd_evidence_ledger.record_termination(
+        identity, evidence, timestamp=_now()
+    )
+    assert store.cancel_execution(claim.job_id, _now()) == "requested"
+
+    assert store.fail_execution(
+        claim.job_id,
+        claim.attempt_id,
+        "root proof awaits SQLite mirror",
+        _now(),
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="canceled",
+        termination_proven=True,
+    )
+
+    assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    assert store.attempt_termination_mirror_persisted(
+        claim.job_id, claim.attempt_id
+    ) is False
+    assert store.resource_snapshot()["state"] == "quarantined"
+
+
+def test_failed_sqlite_mirror_blocks_recovery_until_broker_reconciles_it(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity, service = _claimed_systemd_attempt(
+        tmp_path, return_service=True
+    )
+    store.bind_attempt_containment(identity, timestamp=_now())
+    _quarantine_canceled_systemd_attempt(store, claim)
+    evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    store._systemd_evidence_ledger.record_termination(
+        identity, evidence, timestamp=_now()
+    )
+    with store._connection(transaction=True) as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_termination_mirror
+               BEFORE UPDATE OF termination_json ON execution_containment
+               BEGIN SELECT RAISE(ABORT, 'simulated mirror failure'); END"""
+        )
+
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    runner.store = store
+    service._attempt_runner = runner
+    service.output_directory.mkdir(parents=True, exist_ok=True)
+    with service._publication._locked(publishing=True):
+        pass
+    publication_report = service._publication.reconcile()
+    assert publication_report["status"] == "attention_required"
+    assert publication_report["publication_status"] == "complete"
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.store = store
+    broker._active_for = lambda _identity: None
+    broker_calls: list[str] = []
+
+    def cancel_through_broker(
+        *, job_id: str, attempt_id: str, owner_id: str, claim_epoch: int
+    ) -> str:
+        broker_calls.append(attempt_id)
+        try:
+            response = broker._cancel(
+                {
+                    "job_id": job_id,
+                    "attempt_id": attempt_id,
+                    "owner_id": owner_id,
+                    "claim_epoch": claim_epoch,
+                }
+            )
+        except sqlite3.DatabaseError as error:
+            raise RuntimeError("broker_operation_failed") from error
+        return str(response["outcome"])
+
+    runner.cancel_attempt = cancel_through_broker
+
+    assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    assert service.recover()["status"] == "attention_required"
+    assert broker_calls == [claim.attempt_id]
+    assert store.resource_snapshot()["state"] == "quarantined"
+    assert _termination_mirror(store, claim.job_id, claim.attempt_id) is None
+    with store._connection() as connection:
+        cancellation = connection.execute(
+            """SELECT state FROM execution_cancellations
+               WHERE job_id = ? AND attempt_id = ?""",
+            (claim.job_id, claim.attempt_id),
+        ).fetchone()
+    assert cancellation["state"] == "requested"
+
+    with store._connection(transaction=True) as connection:
+        connection.execute("DROP TRIGGER reject_termination_mirror")
+
+    recovered = service.recover()
+    assert broker_calls == [claim.attempt_id, claim.attempt_id]
+    assert _termination_mirror(store, claim.job_id, claim.attempt_id) is not None
+    with store._connection() as connection:
+        lifecycle = connection.execute(
+            """SELECT cleanup_state, cleanup_validated FROM systemd_output_lifecycle
+               WHERE job_id = ? AND attempt_id = ?""",
+            (claim.job_id, claim.attempt_id),
+        ).fetchone()
+    assert recovered["status"] == "recovered", (recovered, dict(lifecycle))
+    assert store.resource_snapshot()["state"] == "available"
+    assert _termination_mirror(store, claim.job_id, claim.attempt_id) is not None
+    with store._connection() as connection:
+        cancellation = connection.execute(
+            """SELECT state FROM execution_cancellations
+               WHERE job_id = ? AND attempt_id = ?""",
+            (claim.job_id, claim.attempt_id),
+        ).fetchone()
+    assert cancellation["state"] == "acknowledged"
+
+
+def test_conflicting_sqlite_and_root_termination_proofs_fail_closed(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    _quarantine_canceled_systemd_attempt(store, claim)
+    root_evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654321,
+        observed_at=_now(),
+    )
+    conflicting_evidence = CgroupTerminationEvidence(
+        identity=identity,
+        populated=0,
+        observed_monotonic_ns=987654322,
+        observed_at=_now(),
+    )
+    store._systemd_evidence_ledger.record_termination(
+        identity, root_evidence, timestamp=_now()
+    )
+    with store._connection(transaction=True) as connection:
+        connection.execute(
+            """UPDATE execution_containment
+               SET termination_json = ?, termination_at = ?
+               WHERE job_id = ? AND attempt_id = ?""",
+            (
+                store_module.backend_canonical_json(
+                    conflicting_evidence.to_mapping()
+                ),
+                _now(),
+                claim.job_id,
+                claim.attempt_id,
+            ),
+        )
+
+    with pytest.raises(BackendEvidenceError, match="stored systemd containment"):
+        store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    with pytest.raises(BackendEvidenceError, match="stored systemd containment"):
+        store.release_quarantined_attempt(
+            claim.job_id, claim.attempt_id, timestamp=_now()
+        )
 
 
 def test_systemd_evidence_ledger_rejects_worker_owned_or_writable_files() -> None:
@@ -3475,12 +5091,18 @@ def test_control_only_runner_can_recover_but_cannot_claim_execution(
 
 
 @pytest.mark.parametrize(
-    ("stored_identity", "cgroup_empty", "launcher_reaped", "cleaned"),
+    (
+        "stored_identity",
+        "cgroup_empty",
+        "launcher_reaped",
+        "cleaned",
+        "stop_succeeded",
+    ),
     [
-        (True, True, True, True),
-        (False, True, True, False),
-        (True, False, True, False),
-        (True, True, False, False),
+        (True, True, True, True, True),
+        (False, True, True, False, True),
+        (True, False, True, False, False),
+        (True, True, False, False, True),
     ],
 )
 def test_setup_failure_scratch_cleanup_requires_identity_termination_and_reap(
@@ -3490,6 +5112,7 @@ def test_setup_failure_scratch_cleanup_requires_identity_termination_and_reap(
     cgroup_empty: bool,
     launcher_reaped: bool,
     cleaned: bool,
+    stop_succeeded: bool,
 ) -> None:
     identity = _identity()
     events: list[str] = []
@@ -3502,9 +5125,14 @@ def test_setup_failure_scratch_cleanup_requires_identity_termination_and_reap(
     )
     broker._remove_scratch = lambda _attempt: events.append("scratch_removed")
     monkeypatch.setattr(
-        broker_module,
-        "_stop_unit",
-        lambda _unit: events.append("unit_stopped"),
+        broker,
+        "_wait_for_runner_exit",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: events.append("unit_stopped") or stop_succeeded,
     )
     monkeypatch.setattr(
         broker_module,
@@ -3514,7 +5142,7 @@ def test_setup_failure_scratch_cleanup_requires_identity_termination_and_reap(
     monkeypatch.setattr(
         broker_module,
         "_record_pinned_empty_event",
-        lambda _store, _identity, _fd: events.append("proof_recorded"),
+        lambda _store, _identity, _fd: events.append("proof_recorded") or object(),
     )
 
     class Launcher:
@@ -3539,9 +5167,542 @@ def test_setup_failure_scratch_cleanup_requires_identity_termination_and_reap(
     assert result is cleaned
     assert ("proof_recorded" in events) is (stored_identity and cgroup_empty)
     assert ("scratch_removed" in events) is cleaned
+    assert ("unit_stopped" in events) is (stored_identity and not cgroup_empty)
     if cleaned:
         assert events.index("proof_recorded") < events.index("scratch_removed")
         assert events.index("launcher_waited") < events.index("scratch_removed")
+
+
+def test_setup_cleanup_stops_local_unit_when_identity_binding_was_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    events: list[str] = []
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(empty_timeout_seconds=0.1)
+    broker.store = SimpleNamespace(
+        attempt_containment_identity=lambda _job, _attempt: None
+    )
+    broker._remove_scratch = lambda _attempt: events.append("scratch_removed")
+    monkeypatch.setattr(
+        broker,
+        "_wait_for_runner_exit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BackendEvidenceError("runner exit unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: events.append("unit_stopped") or True,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_wait_cgroup_empty",
+        lambda _fd, timeout: events.append("cgroup_empty") or True,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda *_args: pytest.fail(
+            "unbound containment cannot produce durable termination proof"
+        ),
+    )
+
+    class Launcher:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            events.append("launcher_reaped")
+            return 1
+
+    events_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert not broker._cleanup_failed_containment_setup(
+            Launcher(), identity, events_fd
+        )
+    finally:
+        os.close(events_fd)
+
+    assert events == ["unit_stopped", "cgroup_empty", "launcher_reaped"]
+
+
+def test_containment_binding_failure_preserves_pinned_identity_for_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    unit = identity.unit_name
+    cgroup = identity.cgroup_path
+    expected_cgroup_directory = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
+    fixture_cgroup = tmp_path / "cgroup"
+    fixture_cgroup.mkdir()
+
+    class Store:
+        def bind_attempt_containment(self, observed, *, timestamp):
+            assert observed.job_id == identity.job_id
+            raise BackendEvidenceError("cancellation fenced the claim")
+
+    class Launcher:
+        def poll(self) -> None:
+            return None
+
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = Store()
+    properties = {
+        "InvocationID": identity.invocation_id,
+        "ControlGroup": cgroup,
+        "MainPID": "4321",
+        "ExecMainPID": "4321",
+        "ExecMainCode": "0",
+        "ExecMainStatus": "0",
+        "Result": "success",
+    }
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: properties)
+    monkeypatch.setattr(broker_module, "_validate_unit_policy", lambda *_args: None)
+    monkeypatch.setattr(
+        broker_module, "_require_process_credentials", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(broker_module, "_boot_id", lambda: identity.boot_id)
+    real_open = os.open
+
+    def fixture_open(path, flags, mode=0o777, *, dir_fd=None):
+        if path == expected_cgroup_directory:
+            return real_open(fixture_cgroup, flags, mode)
+        if path == "cgroup.events" and dir_fd is not None:
+            return real_open("/dev/null", os.O_RDONLY)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(broker_module.os, "open", fixture_open)
+
+    with pytest.raises(BackendEvidenceError) as raised:
+        broker._wait_for_containment(
+            Launcher(),
+            unit,
+            identity.job_id,
+            identity.attempt_id,
+            identity.owner_id,
+            identity.claim_epoch,
+            identity.resolved_digest,
+        )
+
+    observed = getattr(raised.value, "identity", None)
+    events_fd = getattr(raised.value, "events_fd", None)
+    try:
+        assert observed is not None
+        assert observed.job_id == identity.job_id
+        assert isinstance(events_fd, int)
+        assert os.fstat(events_fd).st_ino != 0
+    finally:
+        if isinstance(events_fd, int):
+            os.close(events_fd)
+
+
+def test_execute_recovers_fenced_containment_binding_with_termination_only_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    configuration = _broker_configuration(tmp_path)
+    configuration.scratch_root.mkdir()
+    scratch = configuration.scratch_root / identity.attempt_id
+    resolved = {
+        "attempt_id": identity.attempt_id,
+        "argv": ["/engine"],
+        "environment": environment_record({}),
+    }
+    events: list[str] = []
+
+    class Store:
+        fenced = True
+        bound_identity = None
+        termination_proven = False
+
+        def get_backend_execution(self, _job_id, _attempt_id):
+            return {
+                "state": "resolved",
+                "resolved": resolved,
+                "resolved_digest": identity.resolved_digest,
+            }
+
+        def bind_attempt_containment_for_termination(self, observed, *, timestamp):
+            assert self.fenced
+            self.bound_identity = observed
+            events.append("termination_only_bound")
+
+        def attempt_containment_identity(self, _job_id, _attempt_id):
+            return self.bound_identity
+
+        def attempt_termination_proven(self, _job_id, _attempt_id):
+            return self.termination_proven
+
+    class Pipe:
+        def close(self) -> None:
+            pass
+
+        def write(self, value: bytes) -> int:
+            return len(value)
+
+        def flush(self) -> None:
+            pass
+
+    class Launcher:
+        stdin = Pipe()
+        stdout = Pipe()
+        stderr = Pipe()
+
+        def wait(self, *, timeout: float) -> int:
+            events.append("launcher_reaped")
+            return 1
+
+    store = Store()
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = configuration
+    broker.store = store
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    broker._require_current_claim = lambda *_args: None
+    broker._validate_engine_paths = lambda _argv: None
+    broker._validate_engine_environment = lambda _environment: None
+    broker._create_attempt_scratch = lambda _attempt: scratch.mkdir(mode=0o700)
+
+    def reject_normal_bind(*_args):
+        fd = os.open("/dev/null", os.O_RDONLY)
+        raise broker_module._ContainmentBindingFailure(identity, fd)
+
+    broker._wait_for_containment = reject_normal_bind
+    broker._wait_for_runner_exit = lambda *_args, **_kwargs: (
+        events.append("runner_exit_observed") or {}
+    )
+    broker._stop_bound_unit = lambda *_args: pytest.fail(
+        "verified runner exit needs no extra StopUnit"
+    )
+    def remove_scratch(attempt: str) -> None:
+        events.append("scratch_removed")
+        (configuration.scratch_root / attempt).rmdir()
+
+    broker._remove_scratch = remove_scratch
+    monkeypatch.setattr(broker_module, "backend_digest", lambda _record: identity.resolved_digest)
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        broker_module, "_start_systemd_run", lambda *_args: Launcher()
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_wait_cgroup_empty",
+        lambda *_args, **_kwargs: events.append("cgroup_empty") or True,
+    )
+
+    def record_termination(observed_store, observed_identity, _events_fd):
+        assert observed_store is store
+        assert observed_identity == identity
+        store.termination_proven = True
+        events.append("termination_recorded")
+        return object()
+
+    monkeypatch.setattr(
+        broker_module, "_record_pinned_empty_event", record_termination
+    )
+    request = {
+        "job_id": identity.job_id,
+        "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id,
+        "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest,
+        "resolved_record": resolved,
+        "argv": ["/engine"],
+        "environment": {},
+        "scratch_directory": str(scratch),
+        "runner_uid": identity.runner_uid,
+        "runner_gid": identity.runner_gid,
+    }
+
+    with pytest.raises(BackendEvidenceError, match="durably bound"):
+        broker._execute(object(), request)
+
+    assert store.bound_identity == identity
+    assert store.termination_proven
+    assert events == [
+        "termination_only_bound",
+        "runner_exit_observed",
+        "cgroup_empty",
+        "termination_recorded",
+        "launcher_reaped",
+        "scratch_removed",
+    ]
+    assert not scratch.exists()
+
+
+def test_setup_cleanup_retains_durable_proof_when_stop_fails_but_cgroup_empties(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    events: list[str] = []
+    empty_observations = iter((False, True))
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(empty_timeout_seconds=0.1)
+    broker.store = SimpleNamespace(
+        attempt_containment_identity=lambda _job, _attempt: identity
+    )
+    broker._remove_scratch = lambda _attempt: events.append("scratch_removed")
+    monkeypatch.setattr(
+        broker,
+        "_wait_for_runner_exit",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_wait_cgroup_empty",
+        lambda _fd, timeout: events.append("cgroup_checked")
+        or next(empty_observations),
+    )
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: events.append("stop_failed") or False,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda _store, _identity, _fd: events.append("empty_proof") or object(),
+    )
+
+    class Launcher:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            events.append("launcher_reaped")
+            return 1
+
+    events_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert broker._cleanup_failed_containment_setup(
+            Launcher(), identity, events_fd
+        )
+    finally:
+        os.close(events_fd)
+
+    assert events == [
+        "cgroup_checked",
+        "stop_failed",
+        "cgroup_checked",
+        "empty_proof",
+        "launcher_reaped",
+        "scratch_removed",
+    ]
+
+
+def test_initially_empty_cgroup_is_not_proof_until_runner_exit_or_unit_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    events: list[str] = []
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(empty_timeout_seconds=0.1)
+    broker.store = SimpleNamespace(
+        attempt_containment_identity=lambda _job, _attempt: identity
+    )
+    broker._remove_scratch = lambda _attempt: events.append("scratch_removed")
+    monkeypatch.setattr(
+        broker,
+        "_wait_for_runner_exit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BackendEvidenceError("runner exit state is unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: events.append("stop_unverified") or False,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_wait_cgroup_empty",
+        lambda _fd, timeout: events.append("cgroup_was_empty") or True,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda *_args: pytest.fail("unbound cgroup emptiness must not be recorded"),
+    )
+
+    class Launcher:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            events.append("launcher_reaped")
+            return 1
+
+    events_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert not broker._cleanup_failed_containment_setup(
+            Launcher(), identity, events_fd
+        )
+    finally:
+        os.close(events_fd)
+
+    assert events == ["stop_unverified", "launcher_reaped"]
+
+
+def test_completed_unit_stop_allows_empty_cgroup_proof_without_runner_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = _identity()
+    events: list[str] = []
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(empty_timeout_seconds=0.1)
+    broker.store = SimpleNamespace(
+        attempt_containment_identity=lambda _job, _attempt: identity
+    )
+    broker._remove_scratch = lambda _attempt: events.append("scratch_removed")
+    monkeypatch.setattr(
+        broker,
+        "_wait_for_runner_exit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            BackendEvidenceError("runner exit state is unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        broker,
+        "_stop_bound_unit",
+        lambda _identity, _fd: events.append("stop_completed") or True,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_wait_cgroup_empty",
+        lambda _fd, timeout: events.append("cgroup_empty") or True,
+    )
+    monkeypatch.setattr(
+        broker_module,
+        "_record_pinned_empty_event",
+        lambda *_args: events.append("termination_recorded") or object(),
+    )
+
+    class Launcher:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            events.append("launcher_reaped")
+            return 1
+
+    events_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        assert broker._cleanup_failed_containment_setup(
+            Launcher(), identity, events_fd
+        )
+    finally:
+        os.close(events_fd)
+
+    assert events == [
+        "stop_completed",
+        "cgroup_empty",
+        "termination_recorded",
+        "launcher_reaped",
+        "scratch_removed",
+    ]
+
+
+def test_failed_setup_scratch_cleanup_failure_stays_pending_for_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    store, claim, identity = _claimed_systemd_attempt(tmp_path)
+    store.bind_attempt_containment(identity, timestamp=_now())
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(empty_timeout_seconds=0.1)
+    broker.store = store
+    monkeypatch.setattr(
+        broker,
+        "_wait_for_runner_exit",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def fail_scratch_removal(_attempt: str) -> None:
+        raise OSError("simulated interrupted scratch cleanup")
+
+    broker._remove_scratch = fail_scratch_removal
+    monkeypatch.setattr(
+        broker_module, "_wait_cgroup_empty", lambda _fd, timeout: True
+    )
+
+    def record_empty(_store, observed, _fd):
+        evidence = CgroupTerminationEvidence(
+            identity=observed,
+            populated=0,
+            observed_monotonic_ns=987654321,
+            observed_at=_now(),
+        )
+        store.record_attempt_termination_evidence(
+            observed, evidence, timestamp=_now()
+        )
+        return evidence
+
+    monkeypatch.setattr(broker_module, "_record_pinned_empty_event", record_empty)
+
+    class Launcher:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def wait(self, *, timeout: float) -> int:
+            return 1
+
+    events_fd = os.open("/dev/null", os.O_RDONLY)
+    try:
+        with pytest.raises(OSError, match="interrupted scratch cleanup"):
+            broker._cleanup_failed_containment_setup(
+                Launcher(), identity, events_fd
+            )
+    finally:
+        os.close(events_fd)
+
+    assert store.attempt_termination_proven(claim.job_id, claim.attempt_id)
+    assert store.fail_execution(
+        claim.job_id,
+        claim.attempt_id,
+        "setup cleanup was interrupted after cgroup termination",
+        _now(),
+        attempt_owner_id=claim.owner_id,
+        claim_epoch=claim.claim_epoch,
+        failure_class="terminal",
+        termination_proven=True,
+    )
+    pending = store.pending_systemd_output_cleanups(attempt_id=claim.attempt_id)
+    assert len(pending) == 1
+    assert pending[0].identity == identity
+    assert pending[0].validated is False
+    assert store.resource_snapshot()["state"] == "available"
+
+
+def test_stop_unit_waits_for_systemd_stop_job_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(broker_module.subprocess, "run", run)
+
+    assert broker_module._stop_unit(_identity().unit_name)
+
+    assert captured["command"] == [
+        "/usr/bin/systemctl",
+        "stop",
+        _identity().unit_name,
+    ]
+    assert captured["kwargs"]["timeout"] == 20
 
 
 def test_resolution_failure_leaves_no_broker_scratch_directory(
@@ -3963,6 +6124,58 @@ def test_runner_exit_without_cgroup_proof_quarantines_and_publishes_nothing(
     assert service._store.resource_snapshot()["state"] == "quarantined"
     assert service._store.artifacts() == []
     assert runner.acknowledgements == []
+
+
+def test_missing_containment_identity_keeps_setup_failure_quarantined(
+    tmp_path: Path,
+) -> None:
+    class MissingIdentityRunner(SystemdAttemptRunner):
+        def __init__(self, scratch_root: Path) -> None:
+            scratch_root.mkdir(parents=True)
+            super().__init__(
+                scratch_root / "unused.sock",
+                scratch_root=scratch_root,
+                runner_uid=2301,
+                runner_gid=2301,
+            )
+            self.scratch_directory: Path | None = None
+
+        def prepare_attempt(self, claim) -> Path:
+            self.scratch_directory = self.scratch_root / claim.attempt_id
+            self.scratch_directory.mkdir(mode=0o700)
+            return self.scratch_directory
+
+        def execute_attempt(self, _claim, _prepared):
+            raise OSError("attempt unit identity was not established")
+
+        def cancel_attempt(self, **_kwargs):
+            raise OSError("recovery cannot authorize a unit without bound identity")
+
+    runner = MissingIdentityRunner(tmp_path / "broker-scratch")
+    service, _runner = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        "systemd-setup-without-identity",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+
+    report = service.work()
+    attempt = service._store.current_attempt(queued.job_id)
+
+    assert report["status"] == "attention_required"
+    assert attempt is not None
+    assert attempt["status"] == "failed"
+    assert attempt["failure_class"] == "ambiguous"
+    assert service.get_provenance(queued.job_id)["status"] == "ambiguous"
+    assert service._store.attempt_containment_identity(
+        queued.job_id, str(attempt["attempt_id"])
+    ) is None
+    assert service._store.resource_snapshot()["state"] == "quarantined"
+    assert service._store.artifacts() == []
+    assert runner.scratch_directory is not None
+    assert runner.scratch_directory.exists()
+    assert service.recover()["status"] == "attention_required"
+    assert service._store.resource_snapshot()["state"] == "quarantined"
 
 
 def test_force_killed_runner_with_empty_cgroup_releases_failed_attempt(

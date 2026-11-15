@@ -309,6 +309,16 @@ class _ActiveAttempt:
     claim_epoch: int
     lock: threading.RLock
     done: threading.Event
+    lost_fenced: threading.Event
+
+
+class _ContainmentBindingFailure(BackendEvidenceError):
+    """Keep pinned unit identity available when its durable bind fails."""
+
+    def __init__(self, identity: AttemptUnitIdentity, events_fd: int) -> None:
+        super().__init__("attempt containment identity could not be durably bound")
+        self.identity = identity
+        self.events_fd = events_fd
 
 
 class SystemdAttemptBroker:
@@ -321,6 +331,7 @@ class SystemdAttemptBroker:
             worker_gid=configuration.worker_gid
         )
         self._active: dict[str, _ActiveAttempt] = {}
+        self._starting_attempts: set[str] = set()
         self._active_lock = threading.RLock()
         self._server: socket.socket | None = None
 
@@ -397,9 +408,12 @@ class SystemdAttemptBroker:
                     response = self._prepare(request)
                     _send(connection, response)
                 elif operation == "execute":
-                    response, output_fd = self._execute(connection, request)
+                    response, output_fd = self._execute(
+                        connection, request, deliver_response=True
+                    )
                     try:
-                        _send(connection, response, output_fd=output_fd)
+                        if response.pop("_reply_sent", False) is not True:
+                            _send(connection, response, output_fd=output_fd)
                     finally:
                         if output_fd is not None:
                             os.close(output_fd)
@@ -430,8 +444,36 @@ class SystemdAttemptBroker:
             raise PermissionError("attempt scratch path already exists and cannot be reused")
         return {"ok": True, "scratch_directory": str(scratch)}
 
+    def _reserve_attempt_start(self, attempt: str) -> None:
+        """Reserve an attempt before creating scratch or starting its unit."""
+        with self._active_lock:
+            if not hasattr(self, "_starting_attempts"):
+                self._starting_attempts = set()
+            if attempt in self._active or attempt in self._starting_attempts:
+                raise BackendEvidenceError("attempt already has a broker session")
+            self._starting_attempts.add(attempt)
+
+    def _register_active_attempt(
+        self, attempt: str, active: _ActiveAttempt
+    ) -> None:
+        """Move a reserved attempt into the live-session registry atomically."""
+        with self._active_lock:
+            if attempt not in self._starting_attempts or attempt in self._active:
+                raise BackendEvidenceError("attempt broker reservation changed during startup")
+            self._starting_attempts.remove(attempt)
+            self._active[attempt] = active
+
+    def _release_attempt_start(self, attempt: str) -> None:
+        """Release a setup reservation after setup failed or was rejected."""
+        with self._active_lock:
+            getattr(self, "_starting_attempts", set()).discard(attempt)
+
     def _execute(
-        self, worker: socket.socket, request: Mapping[str, object]
+        self,
+        worker: socket.socket,
+        request: Mapping[str, object],
+        *,
+        deliver_response: bool = False,
     ) -> tuple[dict[str, object], int | None]:
         job, attempt, owner, epoch = _claim_fields(request)
         self._require_current_claim(job, attempt, owner, epoch)
@@ -465,72 +507,104 @@ class SystemdAttemptBroker:
             raise PermissionError("scratch directory is not the broker-created attempt directory")
         self._validate_engine_paths(argv)
         unit = f"media-generation-attempt-{attempt[4:]}.service"
-        if _unit_properties(unit) is not None:
-            raise BackendEvidenceError("attempt unit name already exists and cannot be reused")
-        self._create_attempt_scratch(attempt)
+        self._reserve_attempt_start(attempt)
+        active_registered = False
         try:
-            runner_can_access = _mode_allows(
-                scratch.stat(), self.configuration.runner_uid,
-                self.configuration.runner_groups, read=True, write=True,
-            )
-            if not runner_can_access:
-                raise PermissionError("runner cannot access attempt scratch")
-        except Exception:
-            self._remove_scratch(attempt)
-            raise
-        try:
-            process = _start_systemd_run(self.configuration, unit, scratch)
-        except Exception:
-            self._remove_scratch(attempt)
-            raise
-        identity: AttemptUnitIdentity | None = None
-        events_fd: int | None = None
-        try:
-            identity, events_fd = self._wait_for_containment(
-                process, unit, job, attempt, owner, epoch, resolved_digest
-            )
-            if _read_populated(events_fd) != 1:
+            if self.store.attempt_containment_identity(job, attempt) is not None:
                 raise BackendEvidenceError(
-                    "runner service did not remain in its cgroup"
+                    "attempt already has a bound systemd invocation"
                 )
-            if not _unit_identity_live(identity):
+            if _unit_properties(unit) is not None:
                 raise BackendEvidenceError(
-                    "systemd unit identity changed during setup"
+                    "attempt unit name already exists and cannot be reused"
                 )
-        except Exception as setup_error:
-            _stop_unit(unit)
-            if identity is not None and events_fd is not None:
-                try:
-                    cleaned = self._cleanup_failed_containment_setup(
-                        process, identity, events_fd
-                    )
-                except Exception:
-                    cleaned = False
-                finally:
-                    os.close(events_fd)
-                if not cleaned:
+            self._create_attempt_scratch(attempt)
+            try:
+                runner_can_access = _mode_allows(
+                    scratch.stat(), self.configuration.runner_uid,
+                    self.configuration.runner_groups, read=True, write=True,
+                )
+                if not runner_can_access:
+                    raise PermissionError("runner cannot access attempt scratch")
+            except Exception:
+                self._remove_scratch(attempt)
+                raise
+            try:
+                process = _start_systemd_run(self.configuration, unit, scratch)
+            except Exception:
+                self._remove_scratch(attempt)
+                raise
+            identity: AttemptUnitIdentity | None = None
+            events_fd: int | None = None
+            try:
+                identity, events_fd = self._wait_for_containment(
+                    process, unit, job, attempt, owner, epoch, resolved_digest
+                )
+                if _read_populated(events_fd) != 1:
                     raise BackendEvidenceError(
-                        "containment setup is unverified; scratch is retained and "
-                        "capacity remains quarantined"
+                        "runner service did not remain in its cgroup"
+                    )
+                if not _unit_identity_live(identity):
+                    raise BackendEvidenceError(
+                        "systemd unit identity changed during setup"
+                    )
+            except Exception as setup_error:
+                if isinstance(setup_error, _ContainmentBindingFailure):
+                    identity = setup_error.identity
+                    events_fd = setup_error.events_fd
+                    try:
+                        self.store.bind_attempt_containment_for_termination(
+                            identity, timestamp=_timestamp()
+                        )
+                    except Exception:
+                        pass
+                if identity is not None and events_fd is not None:
+                    try:
+                        cleaned = self._cleanup_failed_containment_setup(
+                            process, identity, events_fd
+                        )
+                    except Exception:
+                        cleaned = False
+                    finally:
+                        os.close(events_fd)
+                    if cleaned:
+                        raise
+                termination_proven = False
+                if identity is not None:
+                    try:
+                        termination_proven = self.store.attempt_termination_proven(
+                            job, attempt
+                        )
+                    except Exception:
+                        pass
+                if termination_proven:
+                    raise BackendEvidenceError(
+                        "containment setup failed after cgroup termination; "
+                        "scratch cleanup remains pending"
                     ) from setup_error
-            raise
-        assert identity is not None and events_fd is not None
-        active = _ActiveAttempt(
-            identity=identity,
-            process=process,
-            cgroup_events_fd=events_fd,
-            scratch_directory=scratch,
-            owner_id=owner,
-            claim_epoch=epoch,
-            lock=threading.RLock(),
-            done=threading.Event(),
-        )
-        with self._active_lock:
-            if attempt in self._active:
-                os.close(events_fd)
-                _stop_unit(unit)
-                raise BackendEvidenceError("attempt already has a live broker session")
-            self._active[attempt] = active
+                if identity is None:
+                    self._reap_launcher(process)
+                raise BackendEvidenceError(
+                    "containment setup is unverified; scratch is retained and "
+                    "capacity remains quarantined"
+                ) from setup_error
+            assert identity is not None and events_fd is not None
+            active = _ActiveAttempt(
+                identity=identity,
+                process=process,
+                cgroup_events_fd=events_fd,
+                scratch_directory=scratch,
+                owner_id=owner,
+                claim_epoch=epoch,
+                lock=threading.RLock(),
+                done=threading.Event(),
+                lost_fenced=threading.Event(),
+            )
+            self._register_active_attempt(attempt, active)
+            active_registered = True
+        finally:
+            if not active_registered:
+                self._release_attempt_start(attempt)
         payload = {
             "identity": identity.to_mapping(),
             "argv": argv,
@@ -600,36 +674,32 @@ class SystemdAttemptBroker:
         except Exception as error:
             runner_error = _safe_error_code(error)
             force_runner_stop = True
-            _stop_unit(unit)
         finally:
-            monitor_stop.set()
-            if monitor_started:
-                monitor.join(timeout=1.0)
+            if not deliver_response:
+                self._stop_worker_disconnect_monitor(
+                    worker, active, lost, monitor_stop
+                )
+                if monitor_started:
+                    monitor.join(timeout=1.0)
 
         if lost.is_set():
-            try:
-                self.store.fence_attempt_for_recovery(
-                    job, attempt, timestamp=_timestamp()
-                )
-            except Exception as error:
-                runner_error = runner_error or _safe_error_code(error)
-            finally:
-                force_runner_stop = True
-                _stop_unit(unit)
-        if force_runner_stop:
-            _stop_unit(unit)
-        else:
+            runner_error = runner_error or "worker_connection_lost"
+            self._fence_worker_loss(active)
+            force_runner_stop = True
+        if not force_runner_stop:
             try:
                 runner_exit_properties = self._wait_for_runner_exit(
                     identity, timeout=self.configuration.empty_timeout_seconds
                 )
             except Exception as error:
                 runner_error = runner_error or _safe_error_code(error)
-                _stop_unit(unit)
-        if runner_exit_properties is not None:
+                force_runner_stop = True
+        if force_runner_stop:
+            self._stop_bound_unit(identity, active.cgroup_events_fd)
+        elif runner_exit_properties is not None:
             # A successful transient service stays loaded with RemainAfterExit.
             # Capture its verified exit result before StopUnit can unload it.
-            _stop_unit(unit)
+            self._stop_bound_unit(identity, active.cgroup_events_fd)
         # On cancellation, worker loss, or an incomplete runner result, the
         # pinned cgroup event remains the termination authority even if systemd
         # has already unloaded the stopped unit. populated=0 cannot occur until
@@ -639,7 +709,7 @@ class SystemdAttemptBroker:
             timeout=self.configuration.empty_timeout_seconds,
         )
         if not empty:
-            _stop_unit(unit)
+            self._stop_bound_unit(identity, active.cgroup_events_fd)
             empty = _wait_cgroup_empty(
                 active.cgroup_events_fd,
                 timeout=self.configuration.empty_timeout_seconds,
@@ -684,7 +754,7 @@ class SystemdAttemptBroker:
         elif runner_exit_properties is not None:
             runner_error = runner_error or "runner_did_not_exit_cleanly"
             runner_exit_code = None
-        _stop_unit(unit)
+        self._stop_bound_unit(identity, active.cgroup_events_fd)
         launcher_exit_code: int | None
         try:
             launcher_exit_code = process.wait(timeout=10)
@@ -699,8 +769,9 @@ class SystemdAttemptBroker:
                 process.stdin.close()
             if process.stdout is not None:
                 process.stdout.close()
-            os.close(active.cgroup_events_fd)
-            active.done.set()
+            with active.lock:
+                active.done.set()
+                os.close(active.cgroup_events_fd)
             if termination is None:
                 with self._active_lock:
                     self._active.pop(attempt, None)
@@ -743,6 +814,32 @@ class SystemdAttemptBroker:
             "stream_complete": stream_complete,
             "error_code": runner_error,
         }
+        if deliver_response:
+            with active.lock:
+                self._stop_worker_disconnect_monitor(
+                    worker, active, lost, monitor_stop
+                )
+                if lost.is_set():
+                    runner_error = runner_error or "worker_connection_lost"
+                    response["error_code"] = runner_error
+                    self._fence_worker_loss(active)
+                    if output_fd is not None:
+                        os.close(output_fd)
+                        output_fd = None
+                else:
+                    try:
+                        _send(worker, response, output_fd=output_fd)
+                    except OSError:
+                        lost.set()
+                        runner_error = "worker_connection_lost"
+                        response["error_code"] = runner_error
+                        self._fence_worker_loss(active)
+                        if output_fd is not None:
+                            os.close(output_fd)
+                            output_fd = None
+                response["_reply_sent"] = True
+            if monitor_started:
+                monitor.join(timeout=1.0)
         return response, output_fd
 
     def _wait_for_runner_exit(
@@ -782,10 +879,12 @@ class SystemdAttemptBroker:
     ) -> tuple[AttemptUnitIdentity, int]:
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
-            if process.poll() is not None:
-                raise RuntimeError("systemd launcher exited before containment was established")
             properties = _unit_properties(unit)
             if properties is None:
+                if process.poll() is not None:
+                    raise RuntimeError(
+                        "systemd launcher exited before the attempt unit was loaded"
+                    )
                 time.sleep(0.02)
                 continue
             _validate_unit_policy(properties, self.configuration)
@@ -793,26 +892,44 @@ class SystemdAttemptBroker:
             cgroup = properties.get("ControlGroup", "")
             expected_cgroup = f"/system.slice/{unit}"
             if not _is_invocation_id(invocation) or cgroup != expected_cgroup:
+                if process.poll() is not None:
+                    raise BackendEvidenceError(
+                        "loaded attempt unit has no verifiable invocation identity"
+                    )
                 time.sleep(0.02)
                 continue
             main_pid = _int_property(properties.get("MainPID"))
-            if main_pid is None or main_pid <= 0:
+            exec_main_pid = _int_property(properties.get("ExecMainPID"))
+            exec_main_code = _int_property(properties.get("ExecMainCode"))
+            exec_main_status = _int_property(properties.get("ExecMainStatus"))
+            runner_exited = (
+                main_pid == 0
+                and exec_main_pid is not None
+                and exec_main_pid > 0
+                and exec_main_code in {1, 2, 3}
+                and exec_main_status is not None
+                and bool(properties.get("Result"))
+            )
+            if main_pid is None or (main_pid <= 0 and not runner_exited):
                 time.sleep(0.02)
                 continue
-            _require_process_credentials(
-                main_pid,
-                uid=self.configuration.runner_uid,
-                gid=self.configuration.runner_gid,
-                supplementary_gids=frozenset(
-                    self.configuration.runner_supplementary_gids
-                ),
-                cgroup_path=cgroup,
-            )
+            if main_pid > 0:
+                _require_process_credentials(
+                    main_pid,
+                    uid=self.configuration.runner_uid,
+                    gid=self.configuration.runner_gid,
+                    supplementary_gids=frozenset(
+                        self.configuration.runner_supplementary_gids
+                    ),
+                    cgroup_path=cgroup,
+                )
             cgroup_directory = Path("/sys/fs/cgroup") / cgroup.lstrip("/")
             directory_fd = os.open(
                 cgroup_directory,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
             )
+            events_fd: int | None = None
+            retain_events_fd = False
             try:
                 observed = os.fstat(directory_fd)
                 if not stat.S_ISDIR(observed.st_mode):
@@ -822,30 +939,82 @@ class SystemdAttemptBroker:
                     os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
                     dir_fd=directory_fd,
                 )
+                current = _unit_properties(unit)
+                if current is None or (
+                    current.get("InvocationID") != invocation
+                    or current.get("ControlGroup") != cgroup
+                ):
+                    raise BackendEvidenceError(
+                        "systemd unit identity changed while containment was pinned"
+                    )
+                _validate_unit_policy(current, self.configuration)
+                current_main_pid = _int_property(current.get("MainPID"))
+                if current_main_pid == main_pid and main_pid is not None and main_pid > 0:
+                    pass
+                elif (
+                    current_main_pid == 0
+                    and main_pid is not None
+                    and main_pid > 0
+                    and _int_property(current.get("ExecMainPID")) == main_pid
+                    and _int_property(current.get("ExecMainCode")) in {1, 2, 3}
+                    and _int_property(current.get("ExecMainStatus")) is not None
+                    and bool(current.get("Result"))
+                ):
+                    runner_exited = True
+                    exec_main_pid = _int_property(current.get("ExecMainPID"))
+                    exec_main_code = _int_property(current.get("ExecMainCode"))
+                    exec_main_status = _int_property(current.get("ExecMainStatus"))
+                    properties = current
+                elif (
+                    runner_exited
+                    and current_main_pid == 0
+                    and current.get("ExecMainPID") == str(exec_main_pid)
+                    and current.get("ExecMainCode") == str(exec_main_code)
+                    and current.get("ExecMainStatus") == str(exec_main_status)
+                    and current.get("Result") == properties.get("Result")
+                ):
+                    properties = current
+                else:
+                    raise BackendEvidenceError(
+                        "systemd runner process state changed while containment was pinned"
+                    )
+                pinned = os.fstat(directory_fd)
+                if (pinned.st_dev, pinned.st_ino) != (
+                    observed.st_dev,
+                    observed.st_ino,
+                ):
+                    raise BackendEvidenceError(
+                        "systemd cgroup identity changed while it was pinned"
+                    )
+                identity = AttemptUnitIdentity(
+                    version=1,
+                    job_id=job,
+                    attempt_id=attempt,
+                    owner_id=owner,
+                    claim_epoch=epoch,
+                    resolved_digest=resolved_digest,
+                    boot_id=_boot_id(),
+                    unit_name=unit,
+                    invocation_id=invocation,
+                    cgroup_path=cgroup,
+                    cgroup_device=observed.st_dev,
+                    cgroup_inode=observed.st_ino,
+                    runner_uid=self.configuration.runner_uid,
+                    runner_gid=self.configuration.runner_gid,
+                )
+                try:
+                    self.store.bind_attempt_containment(
+                        identity, timestamp=_timestamp()
+                    )
+                except Exception as error:
+                    retain_events_fd = True
+                    raise _ContainmentBindingFailure(identity, events_fd) from error
+                retain_events_fd = True
+                return identity, events_fd
             finally:
+                if not retain_events_fd and events_fd is not None:
+                    os.close(events_fd)
                 os.close(directory_fd)
-            identity = AttemptUnitIdentity(
-                version=1,
-                job_id=job,
-                attempt_id=attempt,
-                owner_id=owner,
-                claim_epoch=epoch,
-                resolved_digest=resolved_digest,
-                boot_id=_boot_id(),
-                unit_name=unit,
-                invocation_id=invocation,
-                cgroup_path=cgroup,
-                cgroup_device=observed.st_dev,
-                cgroup_inode=observed.st_ino,
-                runner_uid=self.configuration.runner_uid,
-                runner_gid=self.configuration.runner_gid,
-            )
-            try:
-                self.store.bind_attempt_containment(identity, timestamp=_timestamp())
-            except Exception:
-                os.close(events_fd)
-                raise
-            return identity, events_fd
         raise TimeoutError("systemd attempt did not establish its unit identity")
 
     def _cleanup_failed_containment_setup(
@@ -854,25 +1023,70 @@ class SystemdAttemptBroker:
         identity: AttemptUnitIdentity,
         events_fd: int,
     ) -> bool:
-        """Remove setup scratch only after durable empty-cgroup and launcher proof."""
-        stored = self.store.attempt_containment_identity(
-            identity.job_id, identity.attempt_id
-        )
-        if stored != identity:
+        """Remove setup scratch only after runner/stop and cgroup proof."""
+        try:
+            stored = self.store.attempt_containment_identity(
+                identity.job_id, identity.attempt_id
+            )
+        except Exception:
+            stored = None
+            identity_lookup_succeeded = False
+        else:
+            identity_lookup_succeeded = True
+        if stored is not None and stored != identity:
+            self._reap_launcher(process)
             return False
+        durable_identity = identity_lookup_succeeded and stored == identity
+
+        runner_exited = False
+        try:
+            self._wait_for_runner_exit(
+                identity, timeout=self.configuration.empty_timeout_seconds
+            )
+            runner_exited = True
+        except Exception:
+            # A missing runner observation is not termination evidence. Fall
+            # back to stopping the exact, still-bound systemd invocation.
+            pass
+
+        stop_completed = False
+        if not runner_exited:
+            stop_completed = self._stop_bound_unit(identity, events_fd)
+            if not stop_completed:
+                self._reap_launcher(process)
+                return False
+
         empty = _wait_cgroup_empty(
             events_fd, timeout=self.configuration.empty_timeout_seconds
         )
+        if not empty and not stop_completed:
+            stop_completed = self._stop_bound_unit(identity, events_fd)
         if not empty:
-            _stop_unit(identity.unit_name)
             empty = _wait_cgroup_empty(
                 events_fd, timeout=self.configuration.empty_timeout_seconds
             )
         if not empty:
+            self._reap_launcher(process)
             return False
-        _record_pinned_empty_event(self.store, identity, events_fd)
+        proof = None
+        if durable_identity:
+            try:
+                proof = _record_pinned_empty_event(self.store, identity, events_fd)
+            except Exception:
+                proof = None
+        reaped = self._reap_launcher(process)
+        if proof is None or not reaped:
+            return False
+        self._remove_scratch(identity.attempt_id)
+        return True
+
+    @staticmethod
+    def _reap_launcher(process: subprocess.Popen[bytes]) -> bool:
+        """Reap systemd-run and close its pipes without inferring engine exit."""
+        reaped = False
         try:
             process.wait(timeout=10)
+            reaped = True
         except subprocess.TimeoutExpired:
             try:
                 process.terminate()
@@ -880,19 +1094,83 @@ class SystemdAttemptBroker:
                 pass
             try:
                 process.wait(timeout=10)
+                reaped = True
             except (OSError, subprocess.TimeoutExpired):
+                pass
+        except OSError:
+            reaped = False
+        finally:
+            for stream_name in ("stdin", "stdout", "stderr"):
+                stream = getattr(process, stream_name, None)
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+        return reaped
+
+    def _stop_bound_unit(
+        self, identity: AttemptUnitIdentity, pinned_events_fd: int
+    ) -> bool:
+        """Stop a unit only while its invocation still matches the pinned cgroup."""
+        try:
+            if identity.boot_id != _boot_id():
                 return False
         except OSError:
             return False
-        for stream_name in ("stdin", "stdout", "stderr"):
-            stream = getattr(process, stream_name, None)
-            if stream is not None:
-                try:
-                    stream.close()
-                except OSError:
-                    pass
-        self._remove_scratch(identity.attempt_id)
-        return True
+        directory_fd: int | None = None
+        events_fd: int | None = None
+        try:
+            properties = _unit_properties(identity.unit_name)
+            if properties is None or (
+                properties.get("InvocationID") != identity.invocation_id
+                or properties.get("ControlGroup") != identity.cgroup_path
+            ):
+                return False
+            cgroup = Path("/sys/fs/cgroup") / identity.cgroup_path.lstrip("/")
+            directory_fd = os.open(
+                cgroup,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            observed = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or (observed.st_dev, observed.st_ino)
+                != (identity.cgroup_device, identity.cgroup_inode)
+            ):
+                return False
+            events_fd = os.open(
+                "cgroup.events",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            pinned = os.fstat(pinned_events_fd)
+            current_events = os.fstat(events_fd)
+            if (pinned.st_dev, pinned.st_ino) != (
+                current_events.st_dev,
+                current_events.st_ino,
+            ):
+                return False
+            current_properties = _unit_properties(identity.unit_name)
+            if current_properties is None or (
+                current_properties.get("InvocationID") != identity.invocation_id
+                or current_properties.get("ControlGroup") != identity.cgroup_path
+            ):
+                return False
+            current_directory = os.fstat(directory_fd)
+            if (current_directory.st_dev, current_directory.st_ino) != (
+                identity.cgroup_device,
+                identity.cgroup_inode,
+            ):
+                return False
+            return _stop_unit(identity.unit_name)
+        except (OSError, BackendEvidenceError):
+            return False
+        finally:
+            if events_fd is not None:
+                os.close(events_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def _watch_worker_disconnect(
         self,
@@ -908,25 +1186,36 @@ class SystemdAttemptBroker:
                 readable = [worker]
             if not readable:
                 continue
-            try:
-                unexpected = worker.recv(1, socket.MSG_PEEK)
-            except OSError:
-                unexpected = b""
-            if unexpected == b"":
-                lost.set()
-                try:
-                    self.store.fence_attempt_for_recovery(
-                        active.identity.job_id,
-                        active.identity.attempt_id,
-                        timestamp=_timestamp(),
-                    )
-                except Exception:
-                    pass
-                finally:
-                    _stop_unit(active.identity.unit_name)
-                return
-            # The request is one packet; extra data is a protocol violation.
-            lost.set()
+            with active.lock:
+                if stop.is_set():
+                    return
+                if not lost.is_set():
+                    # EOF and extra data both invalidate the one-packet session.
+                    lost.set()
+                self._fence_worker_loss(active)
+                if not active.done.is_set():
+                    try:
+                        stopped = self._stop_bound_unit(
+                            active.identity, active.cgroup_events_fd
+                        )
+                    except Exception:
+                        stopped = False
+                    if not stopped:
+                        try:
+                            active.process.terminate()
+                        except OSError:
+                            pass
+            return
+
+    def _fence_worker_loss(self, active: _ActiveAttempt) -> bool:
+        """Record the worker-loss fence once across both broker threads."""
+        with active.lock:
+            completion = getattr(active, "lost_fenced", None)
+            if not isinstance(completion, threading.Event):
+                completion = threading.Event()
+                active.lost_fenced = completion
+            if completion.is_set():
+                return True
             try:
                 self.store.fence_attempt_for_recovery(
                     active.identity.job_id,
@@ -934,21 +1223,50 @@ class SystemdAttemptBroker:
                     timestamp=_timestamp(),
                 )
             except Exception:
-                pass
-            finally:
-                _stop_unit(active.identity.unit_name)
-            return
+                return False
+            completion.set()
+            return True
+
+    def _stop_worker_disconnect_monitor(
+        self,
+        worker: socket.socket,
+        active: _ActiveAttempt,
+        lost: threading.Event,
+        stop: threading.Event,
+    ) -> None:
+        """Resolve pending socket readability before disarming the watcher."""
+        with active.lock:
+            if not lost.is_set():
+                try:
+                    readable, _, _ = select.select([worker], [], [], 0)
+                except (OSError, ValueError):
+                    readable = [worker]
+                if readable:
+                    lost.set()
+            stop.set()
 
     def _cancel(self, request: Mapping[str, object]) -> dict[str, object]:
         job, attempt, owner, epoch = _claim_fields(request)
         identity = self.store.attempt_containment_identity(job, attempt)
-        if identity is None or identity.owner_id != owner or identity.claim_epoch != epoch:
+        if identity is None:
+            return {"ok": True, "outcome": "requested"}
+        if identity.owner_id != owner or identity.claim_epoch != epoch:
             raise BackendEvidenceError("cancel request does not match a bound attempt")
+        reconciled = self.store.reconcile_attempt_containment_for_termination(
+            job, attempt, timestamp=_timestamp()
+        )
+        if reconciled is None:
+            return {"ok": True, "outcome": "requested"}
+        if reconciled != identity:
+            raise BackendEvidenceError(
+                "cancellation recovery resolved a different systemd invocation"
+            )
+        identity = reconciled
         if self.store.attempt_termination_proven(job, attempt):
             return {"ok": True, "outcome": "acknowledged"}
         active = self._active_for(identity)
         if active is not None:
-            _stop_unit(identity.unit_name)
+            self._stop_bound_unit(identity, active.cgroup_events_fd)
             if not active.done.wait(self.configuration.empty_timeout_seconds * 2):
                 return {"ok": True, "outcome": "requested"}
             return {
@@ -968,18 +1286,21 @@ class SystemdAttemptBroker:
     def _stop_and_record(
         self, identity: AttemptUnitIdentity
     ) -> CgroupTerminationEvidence | None:
-        if identity.boot_id != _boot_id():
-            return None
-        properties = _unit_properties(identity.unit_name)
-        if properties is None or (
-            properties.get("InvocationID") != identity.invocation_id
-            or properties.get("ControlGroup") != identity.cgroup_path
-        ):
+        try:
+            if identity.boot_id != _boot_id():
+                return None
+        except OSError:
             return None
         cgroup = Path("/sys/fs/cgroup") / identity.cgroup_path.lstrip("/")
         directory_fd: int | None = None
         events_fd: int | None = None
         try:
+            properties = _unit_properties(identity.unit_name)
+            if properties is None or (
+                properties.get("InvocationID") != identity.invocation_id
+                or properties.get("ControlGroup") != identity.cgroup_path
+            ):
+                return None
             directory_fd = os.open(
                 cgroup,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1025,7 +1346,7 @@ class SystemdAttemptBroker:
             # The event FD remains attached to the verified cgroup even if
             # StopUnit unloads the unit or removes its pathname.
             return _record_pinned_empty_event(self.store, identity, events_fd)
-        except OSError:
+        except (OSError, BackendEvidenceError):
             return None
         finally:
             if events_fd is not None:
@@ -1615,6 +1936,7 @@ def _unit_properties(unit: str) -> dict[str, str] | None:
         completed = subprocess.run(
             [
                 "/usr/bin/systemctl", "show", "--no-pager",
+                "--property=LoadState",
                 "--property=InvocationID", "--property=ControlGroup",
                 "--property=User", "--property=Group",
                 "--property=KillMode", "--property=Delegate",
@@ -1631,15 +1953,23 @@ def _unit_properties(unit: str) -> dict[str, str] | None:
             text=True,
             timeout=3,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise BackendEvidenceError(
+            "systemd unit state cannot be verified"
+        ) from error
     if completed.returncode != 0:
-        return None
-    return dict(
+        raise BackendEvidenceError("systemd unit state cannot be verified")
+    properties = dict(
         line.split("=", 1)
         for line in completed.stdout.splitlines()
         if "=" in line
     )
+    load_state = properties.get("LoadState")
+    if load_state == "not-found":
+        return None
+    if load_state != "loaded":
+        raise BackendEvidenceError("systemd unit state cannot be verified")
+    return properties
 
 
 def _stop_unit(unit: str) -> bool:
@@ -1647,7 +1977,7 @@ def _stop_unit(unit: str) -> bool:
         raise ValueError("refusing to stop a unit outside the attempt namespace")
     try:
         completed = subprocess.run(
-            ["/usr/bin/systemctl", "stop", "--no-block", unit],
+            ["/usr/bin/systemctl", "stop", unit],
             check=False,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -1660,7 +1990,10 @@ def _stop_unit(unit: str) -> bool:
 
 def _unit_identity_live(identity: AttemptUnitIdentity) -> bool:
     """Require the live unit and cgroup inode to match before recording proof."""
-    properties = _unit_properties(identity.unit_name)
+    try:
+        properties = _unit_properties(identity.unit_name)
+    except BackendEvidenceError:
+        return False
     if (
         properties is None
         or properties.get("InvocationID") != identity.invocation_id

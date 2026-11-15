@@ -727,17 +727,21 @@ class PublicationManager:
             resource = self.store.resource_snapshot()
             resource_state = str(resource['state'])
             resource_reason = resource.get('reason')
-            incomplete = (
-                resource_state != 'available'
-                or bool(orphans)
+            publication_incomplete = (
+                bool(orphans)
                 or any(item['status'] != 'ok' for item in integrity)
                 or any(
-                    item['state'] not in {'committed', 'abandoned'} or 'error' in item
+                    item['state'] not in {'committed', 'abandoned'}
+                    or 'error' in item
                     or item.get('cleanup') not in {'removed_owned_stage', 'absent'}
                     for item in results
                 )
             )
+            incomplete = resource_state != 'available' or publication_incomplete
             return {'root': str(self.root), 'status': 'attention_required' if incomplete else 'complete',
+                    'publication_status': (
+                        'attention_required' if publication_incomplete else 'complete'
+                    ),
                     'publications': results,
                     'integrity': integrity, 'orphan_files': orphans,
                     'resource_state': resource_state,

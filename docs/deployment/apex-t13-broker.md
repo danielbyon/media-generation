@@ -771,10 +771,63 @@ test -f /opt/media-generation/venv/bin/media-generation-systemd-broker
 test ! -L /opt/media-generation/venv/bin/media-generation-systemd-broker
 test "$(stat -c '%u:%g %a' /opt/media-generation/venv/bin/media-generation-attempt-runner)" = '0:0 755'
 test "$(stat -c '%u:%g %a' /opt/media-generation/venv/bin/media-generation-systemd-broker)" = '0:0 755'
-sh -eu -c '
-    test -z "$(find /opt/media-generation/venv -not -user root -print -quit)"
-    test -z "$(find /opt/media-generation/venv -perm /022 -print -quit)"
-'
+sh -eu <<'CHECK_VENV'
+venv=/opt/media-generation/venv
+fail() {
+    printf 'venv permission check failed: %s\n' "$1" >&2
+    exit 1
+}
+
+[ -d "$venv" ] || fail 'venv is missing or is not a directory'
+[ ! -L "$venv" ] || fail 'venv must not be a symlink'
+if ! venv_owner=$(stat -c '%u:%g' -- "$venv"); then
+    fail 'stat failed for the venv directory'
+fi
+[ "$venv_owner" = '0:0' ] || fail 'venv directory must be owned by root:root'
+
+if ! symlink_markers=$(find -P "$venv" -type l -printf x); then
+    fail 'find failed while enumerating venv symlinks'
+fi
+[ "$symlink_markers" = x ] || fail 'venv must contain exactly one symlink'
+
+lib64=$venv/lib64
+[ -L "$lib64" ] || fail 'venv/lib64 must be a symlink'
+if ! link_owner=$(stat -c '%u:%g' -- "$lib64"); then
+    fail 'stat failed for the venv/lib64 symlink'
+fi
+[ "$link_owner" = '0:0' ] || fail 'venv/lib64 symlink must be owned by root:root'
+
+if ! target_bytes=$(mktemp /tmp/media-generation-venv-link.XXXXXX); then
+    fail 'mktemp failed while checking the venv/lib64 target'
+fi
+trap 'rm -f "$target_bytes"' EXIT
+if ! readlink -z -- "$lib64" > "$target_bytes"; then
+    fail 'readlink failed for the venv/lib64 symlink'
+fi
+if ! printf 'lib\0' | cmp -s - "$target_bytes"; then
+    fail 'venv/lib64 must have the exact literal target lib'
+fi
+
+if ! resolved=$(realpath -e -- "$lib64"); then
+    fail 'realpath failed for the venv/lib64 target'
+fi
+[ "$resolved" = "$venv/lib" ] || fail 'venv/lib64 must resolve exactly to venv/lib'
+[ -d "$resolved" ] || fail 'resolved venv/lib target is not a directory'
+if ! target_owner=$(stat -c '%u:%g' -- "$resolved"); then
+    fail 'stat failed for the resolved venv/lib directory'
+fi
+[ "$target_owner" = '0:0' ] || fail 'resolved venv/lib directory must be owned by root:root'
+
+if ! non_root_entry=$(find -P "$venv" ! -uid 0 -print -quit); then
+    fail 'find failed while checking venv ownership'
+fi
+[ -z "$non_root_entry" ] || fail 'every venv entry must be owned by root'
+
+if ! writable_entry=$(find -P "$venv" ! -type l -perm /022 -print -quit); then
+    fail 'find failed while checking venv write permissions'
+fi
+[ -z "$writable_entry" ] || fail 'a non-symlink venv entry is group- or world-writable'
+CHECK_VENV
 runuser -u media-generation-runner -- \
     test -x /opt/media-generation/venv/bin/media-generation-attempt-runner
 runuser -u media-generation-worker -- \
@@ -782,9 +835,12 @@ runuser -u media-generation-worker -- \
 ```
 
 Verify the broker and runner console scripts are root-owned regular files with
-mode `0755`, and that no file in the new venv is group/world writable. Do not
-repair a failed check with a recursive `chown` or `chmod`; stop and report the
-partial installation state.
+mode `0755`. The permission check allows only the root-owned `lib64` symlink
+with the literal target `lib`, resolving to `/opt/media-generation/venv/lib`.
+It rejects any other symlink, non-root-owned entry, or group/world-writable
+non-symlink entry. A failed `find`, `stat`, `readlink`, or `realpath` check stops
+installation. Do not repair a failed check with a recursive `chown` or `chmod`;
+stop and report the partial installation state.
 
 ### Step 5. Copy and qualify the candidate mirror
 
