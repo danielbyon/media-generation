@@ -1648,50 +1648,231 @@ The application database remains schema version 9. The candidate source must con
 
 ### Read-only preflight
 
-Set `EXPECTED_SOURCE_SHA` to the exact commit approved after source review. Set `BUNDLE` to the exact replacement bundle path reported with that commit. Do not substitute a branch name or a manually chosen revision.
+The preflight has two read-only stages. Stage A checks the reviewed bundle on the Mac with a portable Python command. Stage B repeats the bundle checks on APEX and adds Linux host inventory checks. These stages do not authorize candidate installation or activation. The release handoff records the exact off-host bundle path, the separate APEX inbound path, `EXPECTED_SOURCE_SHA`, and `EXPECTED_SUMS_SHA`. Do not substitute a branch name or a manually chosen revision.
+
+#### A. Off-host Mac bundle validation
+
+Run the portable validator below on the Mac. Set `PYTHON_BIN` to a Python interpreter available on the Mac; the command does not assume the APEX interpreter path. It uses only the Python standard library, reads the bundle, and writes no files. It checks the flat payload inventory and hashes, then validates the release-bound configuration and systemd unit.
+
+#### Before Stage B: transfer the reviewed bundle
+
+After Stage A passes and the owner approves the source revision and bundle hashes, copy the bundle to a new owner-only inbox on APEX. The Mac bundle path is `/var/tmp/media-generation-release-${EXPECTED_SOURCE_SHA}`; the APEX inbox is `/var/tmp/media-generation-incoming-${EXPECTED_SOURCE_SHA}`. Set `BUNDLE` to the Mac path for Stage A and to the APEX inbox for Stage B. Keep the inbox separate from `PACKAGE_STAGE`: Stage B reads the inbox and requires `PACKAGE_STAGE` to be absent, and Stage C copies the verified payload into `PACKAGE_STAGE`.
+
+The earlier initial-install transfer path, `/var/tmp/media-generation-package`, belongs to the existing installation and remains untouched. The following owner-run transfer writes only the new inbox. It has not been run as part of this candidate review.
+
+Before running the transfer, inspect `/var/tmp` on APEX with `namei -l`, `stat`, `getfacl`, and `findmnt`. Confirm the parent matches the expected host state and the revision-specific inbox does not exist. Stop if ownership, mode, ACLs, or mount state differs. This inspection is read-only. The command creates a uniquely named partial directory and publishes the inbox only after checksum verification.
+
+```sh
+set -eu
+: "${EXPECTED_SOURCE_SHA:?set EXPECTED_SOURCE_SHA from the release handoff}"
+: "${EXPECTED_SUMS_SHA:?set EXPECTED_SUMS_SHA from the release handoff}"
+case "$EXPECTED_SOURCE_SHA" in
+  (*[!0-9a-f]*|'') printf 'transfer failed: EXPECTED_SOURCE_SHA must be lowercase hexadecimal\n' >&2; exit 1 ;;
+esac
+if [ "${#EXPECTED_SOURCE_SHA}" -ne 40 ]; then
+  printf 'transfer failed: EXPECTED_SOURCE_SHA must be 40 characters\n' >&2
+  exit 1
+fi
+case "$EXPECTED_SUMS_SHA" in
+  (*[!0-9a-f]*|'') printf 'transfer failed: EXPECTED_SUMS_SHA must be lowercase hexadecimal\n' >&2; exit 1 ;;
+esac
+if [ "${#EXPECTED_SUMS_SHA}" -ne 64 ]; then
+  printf 'transfer failed: EXPECTED_SUMS_SHA must be 64 characters\n' >&2
+  exit 1
+fi
+bundle="/var/tmp/media-generation-release-$EXPECTED_SOURCE_SHA"
+apex_bundle="/var/tmp/media-generation-incoming-$EXPECTED_SOURCE_SHA"
+test -d "$bundle" && test ! -L "$bundle"
+sums_record=$(shasum -a 256 "$bundle/SHA256SUMS")
+actual_sums_sha=${sums_record%% *}
+test "$actual_sums_sha" = "$EXPECTED_SUMS_SHA"
+apex_partial=$(ssh apex "set -eu; test ! -e '$apex_bundle'; test ! -L '$apex_bundle'; umask 077; mktemp -d '/var/tmp/media-generation-incoming-$EXPECTED_SOURCE_SHA.partial.XXXXXXXX'")
+case "$apex_partial" in
+  "$apex_bundle".partial.*) ;;
+  *) printf 'transfer failed: unexpected APEX partial path\n' >&2; exit 1 ;;
+esac
+partial_suffix=${apex_partial##*.partial.}
+case "$partial_suffix" in
+  (*[!A-Za-z0-9]*|'') printf 'transfer failed: unsafe APEX partial path\n' >&2; exit 1 ;;
+esac
+if [ "${#partial_suffix}" -ne 8 ]; then
+  printf 'transfer failed: unexpected APEX partial path length\n' >&2
+  exit 1
+fi
+scp "$bundle"/* "apex:$apex_partial/"
+ssh apex "set -eu; test -d '$apex_partial'; test ! -L '$apex_partial'; cd '$apex_partial'; sha256sum --strict -c SHA256SUMS"
+ssh apex "set -eu; test ! -e '$apex_bundle'; test ! -L '$apex_bundle'; mv -nT -- '$apex_partial' '$apex_bundle'; test -d '$apex_bundle'; test ! -L '$apex_bundle'; test ! -e '$apex_partial'; cd '$apex_bundle'; sha256sum --strict -c SHA256SUMS"
+```
+
+The transfer needs GNU `mktemp`, `mv -nT`, and `sha256sum` on APEX. Stage B also needs GNU `find`, `sort`, and `cmp`; stop if any required command is missing. The transfer creates a unique partial directory, checks all payloads there, then publishes the complete directory with GNU `mv -nT`. A partial copy or failed checksum leaves that directory in place; a retry gets a different partial path and does not overwrite it. The final inbox appears only after the no-clobber rename and a second checksum pass. Stage B checks the manifest digest against `EXPECTED_SUMS_SHA`, verifies the exact file inventory, and runs the portable validator. Stop if the final inbox already exists, either handoff hash differs, a partial path is unexpected, or a checksum fails. Keep partial directories and the completed inbox for inspection; do not replace or remove them during candidate installation.
+
+#### B. APEX read-only host preflight
+
+Set `BUNDLE` to the APEX inbound path above. Run the Linux inventory checks below on APEX with GNU `find`, `sort`, `cmp`, and `sha256sum`. Set `PYTHON_BIN` to an interpreter available on APEX only after verifying its path. Then run the same portable Python validator from Stage A on APEX. The shell inventory uses temporary files under `TMPDIR` (or `/tmp`) and removes them when it exits.
 
 The proposed revision-specific destinations are:
 
 | Purpose | Proposed path |
 | --- | --- |
-| Host-side bundle copy | `/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}` |
+| Off-host reviewed bundle (`BUNDLE` on Mac) | `/var/tmp/media-generation-release-${EXPECTED_SOURCE_SHA}` |
+| APEX inbound bundle (`BUNDLE` on APEX) | `/var/tmp/media-generation-incoming-${EXPECTED_SOURCE_SHA}` |
+| APEX partial transfer directory | `/var/tmp/media-generation-incoming-${EXPECTED_SOURCE_SHA}.partial.<random>` |
+| Root-owned package-stage copy (`PACKAGE_STAGE`) | `/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}` |
 | Candidate application environment | `/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}/venv` |
 | Versioned candidate configuration and unit | `/etc/media-generation/releases/${EXPECTED_SOURCE_SHA}` |
 | Preserved active configuration and unit | `/etc/media-generation/rollback/3bc8041b332f7fcf1e0873ac2cb526625b6456ee` |
 
 These paths are proposed names. Inspect each parent with `namei -l`, `stat`, `getfacl`, and `findmnt` first. Reject a symlink, unexpected owner or mode, unexpected ACL, mount, or existing revision destination. Do not reuse or overwrite a destination left by an earlier attempt. Preserve any partial candidate for inspection.
 
-Before copying the bundle, verify its provenance and all payload checksums:
+After transferring the bundle into the APEX inbox, verify its provenance and all payload checksums before making the package-stage copy:
 
 ```sh
 set -euf
-: "${BUNDLE:?set to the reviewed replacement bundle}"
-: "${EXPECTED_SOURCE_SHA:?set to the reviewed commit}"
-: "${EXPECTED_SUMS_SHA:?set to the reviewed SHA256SUMS hash}"
+: "${BUNDLE:?set BUNDLE to the reviewed bundle path}"
+: "${EXPECTED_SOURCE_SHA:?set EXPECTED_SOURCE_SHA to the reviewed commit}"
+: "${EXPECTED_SUMS_SHA:?set EXPECTED_SUMS_SHA to the reviewed SHA256SUMS digest}"
 PACKAGE_STAGE="/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}"
 CANDIDATE_RELEASE="/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}"
 CONFIG_RELEASE="/etc/media-generation/releases/${EXPECTED_SOURCE_SHA}"
-test -d "$BUNDLE"
-test ! -L "$BUNDLE"
-test -f "$BUNDLE/SOURCE_SHA"
-test ! -L "$BUNDLE/SOURCE_SHA"
-test -f "$BUNDLE/SHA256SUMS"
-test ! -L "$BUNDLE/SHA256SUMS"
-test "$(cat "$BUNDLE/SOURCE_SHA")" = "$EXPECTED_SOURCE_SHA"
-case "$EXPECTED_SOURCE_SHA" in
-  (*[!0-9a-f]*|'') exit 1 ;;
+fail() {
+  printf 'bundle preflight failed: %s\n' "$*" >&2
+  exit 1
+}
+case "$BUNDLE" in
+  /*) ;;
+  *) fail "BUNDLE must be an absolute path" ;;
 esac
-test "${#EXPECTED_SOURCE_SHA}" -eq 40
-test "$(sha256sum "$BUNDLE/SHA256SUMS" | cut -d' ' -f1)" = "$EXPECTED_SUMS_SHA"
-test -z "$(find "$BUNDLE" -mindepth 1 -maxdepth 1 ! -type f -print -quit)"
-expected_files=$(awk '{print $2}' "$BUNDLE/SHA256SUMS" | LC_ALL=C sort)
-actual_files=$(find "$BUNDLE" -mindepth 1 -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort)
-test "$expected_files" = "$actual_files"
-(cd "$BUNDLE" && sha256sum -c SHA256SUMS)
-for destination in "$PACKAGE_STAGE" "$CANDIDATE_RELEASE" "$CONFIG_RELEASE"; do
-  test ! -e "$destination"
-  test ! -L "$destination"
+if [ -L "$BUNDLE" ] || [ ! -d "$BUNDLE" ]; then
+  fail "BUNDLE must be a real directory"
+fi
+case "$EXPECTED_SOURCE_SHA" in
+  (*[!0-9a-f]*|'') fail "EXPECTED_SOURCE_SHA must contain 40 lowercase hexadecimal characters" ;;
+esac
+if [ "${#EXPECTED_SOURCE_SHA}" -ne 40 ]; then
+  fail "EXPECTED_SOURCE_SHA must contain 40 lowercase hexadecimal characters"
+fi
+case "$EXPECTED_SUMS_SHA" in
+  (*[!0-9a-f]*|'') fail "EXPECTED_SUMS_SHA must contain 64 lowercase hexadecimal characters" ;;
+esac
+if [ "${#EXPECTED_SUMS_SHA}" -ne 64 ]; then
+  fail "EXPECTED_SUMS_SHA must contain 64 lowercase hexadecimal characters"
+fi
+for required_file in SOURCE_SHA SHA256SUMS; do
+  if [ -L "$BUNDLE/$required_file" ] || [ ! -f "$BUNDLE/$required_file" ]; then
+    fail "$required_file is missing, a symlink, or not a regular file"
+  fi
 done
+preflight_tmp_root=${TMPDIR:-/tmp}
+case "$preflight_tmp_root" in
+  /*) ;;
+  *) fail "TMPDIR must be an absolute path" ;;
+esac
+if ! preflight_dir=$(mktemp -d "$preflight_tmp_root/media-generation-preflight.XXXXXXXX"); then
+  fail "could not create a temporary inventory directory"
+fi
+trap 'rm -rf -- "$preflight_dir"' 0
+trap 'exit 1' HUP INT TERM
+
+# GNU find reports directories, symlinks, and other non-regular entries here.
+if ! find "$BUNDLE" -mindepth 1 -maxdepth 1 ! -type f -print -quit \
+    > "$preflight_dir/non-regular"; then
+  fail "find failed while checking bundle entry types"
+fi
+if [ -s "$preflight_dir/non-regular" ]; then
+  fail "bundle contains a non-regular entry such as a directory or symlink"
+fi
+
+# NUL delimiters keep unusual filenames from being mistaken for multiple entries.
+if ! find "$BUNDLE" -mindepth 1 -maxdepth 1 -type f -printf '%f\0' \
+    > "$preflight_dir/actual.unsorted"; then
+  fail "find failed while enumerating bundle files"
+fi
+if ! printf '%s\000' \
+    SHA256SUMS \
+    SOURCE_SHA \
+    broker.json \
+    media-generation-apex-ldd-map.jsonl \
+    media-generation-apex-python-aliases.jsonl \
+    media-generation-apex-runtime-sha256.jsonl \
+    media-generation-apex-runtime-symlinks.jsonl \
+    media-generation-apex-source-ldd.txt \
+    media-generation-systemd-broker.service \
+    media_generation-0.1.0-py3-none-any.whl \
+    pillow-13.0.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+    > "$preflight_dir/expected.unsorted"; then
+  fail "could not build the fixed bundle inventory"
+fi
+if ! LC_ALL=C sort -z "$preflight_dir/actual.unsorted" \
+    > "$preflight_dir/actual.sorted"; then
+  fail "sort failed while ordering bundle files"
+fi
+if ! LC_ALL=C sort -z "$preflight_dir/expected.unsorted" \
+    > "$preflight_dir/expected.sorted"; then
+  fail "sort failed while ordering the required bundle inventory"
+fi
+if cmp -s "$preflight_dir/expected.sorted" "$preflight_dir/actual.sorted"; then
+  :
+else
+  compare_status=$?
+  case "$compare_status" in
+    1) fail "bundle inventory does not match the required regular files" ;;
+    *) fail "cmp failed while checking the bundle inventory (status $compare_status)" ;;
+  esac
+fi
+
+if ! printf '%s\n' "$EXPECTED_SOURCE_SHA" \
+    > "$preflight_dir/expected-source-sha"; then
+  fail "could not prepare the expected SOURCE_SHA record"
+fi
+if cmp -s "$BUNDLE/SOURCE_SHA" "$preflight_dir/expected-source-sha"; then
+  :
+else
+  compare_status=$?
+  case "$compare_status" in
+    1) fail "SOURCE_SHA does not match EXPECTED_SOURCE_SHA exactly" ;;
+    *) fail "cmp failed while checking SOURCE_SHA (status $compare_status)" ;;
+  esac
+fi
+if ! sums_record=$(sha256sum "$BUNDLE/SHA256SUMS"); then
+  fail "sha256sum failed while reading SHA256SUMS"
+fi
+actual_sums_sha=${sums_record%% *}
+if [ "$actual_sums_sha" != "$EXPECTED_SUMS_SHA" ]; then
+  fail "SHA256SUMS digest does not match the independent handoff record"
+fi
+
+if ! (
+  cd "$BUNDLE" &&
+  sha256sum -- \
+    SOURCE_SHA \
+    broker.json \
+    media-generation-apex-ldd-map.jsonl \
+    media-generation-apex-python-aliases.jsonl \
+    media-generation-apex-runtime-sha256.jsonl \
+    media-generation-apex-runtime-symlinks.jsonl \
+    media-generation-apex-source-ldd.txt \
+    media-generation-systemd-broker.service \
+    media_generation-0.1.0-py3-none-any.whl \
+    pillow-13.0.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl \
+    > "$preflight_dir/canonical-SHA256SUMS"
+); then
+  fail "sha256sum failed while hashing the required payloads"
+fi
+if cmp -s "$preflight_dir/canonical-SHA256SUMS" "$BUNDLE/SHA256SUMS"; then
+  :
+else
+  compare_status=$?
+  case "$compare_status" in
+    1) fail "SHA256SUMS does not match the canonical payload manifest" ;;
+    *) fail "cmp failed while checking the canonical payload manifest (status $compare_status)" ;;
+  esac
+fi
+for destination in "$PACKAGE_STAGE" "$CANDIDATE_RELEASE" "$CONFIG_RELEASE"; do
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    fail "revision destination already exists: $destination"
+  fi
+done
+printf 'bundle preflight passed: source, inventory, and payload hashes verified\n'
 ```
 
 `SOURCE_SHA` must match `EXPECTED_SOURCE_SHA` and its digest must appear in
@@ -1700,35 +1881,239 @@ checksum file itself.
 
 Compare the `SHA256SUMS` digest and every payload digest with the independently reviewed handoff record. Verify the wheel, Pillow wheel, `broker.json`, unit, runtime inventories, Python alias inventory, loader map, and source-loader report. Require the bundle's `broker.json` to point to `${EXPECTED_SOURCE_SHA}/venv/bin/media-generation-attempt-runner`. Require the bundled unit's `ExecStart` and `RequiresMountsFor` to name the same candidate release path. Stop on any other difference or hash mismatch.
 
-Validate the path-bound deployment payloads before staging them:
+Run the portable validator on either host with this command. On APEX, run it after the Linux inventory block above. The shell requires all four environment variables, passes their values as quoted arguments, and returns the interpreter's exit status.
 
-```python
+```sh
+set -eu
+: "${BUNDLE:?set BUNDLE to the reviewed bundle path}"
+: "${EXPECTED_SOURCE_SHA:?set EXPECTED_SOURCE_SHA to the reviewed commit}"
+: "${EXPECTED_SUMS_SHA:?set EXPECTED_SUMS_SHA to the reviewed SHA256SUMS digest}"
+: "${PYTHON_BIN:?set PYTHON_BIN to an available Python interpreter}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  printf 'configuration validation failed: Python interpreter not found: %s\n' "$PYTHON_BIN" >&2
+  exit 1
+fi
+"$PYTHON_BIN" - "$BUNDLE" "$EXPECTED_SOURCE_SHA" "$EXPECTED_SUMS_SHA" \
+  /etc/systemd/system/media-generation-systemd-broker.service \
+  "/etc/media-generation/releases/${EXPECTED_SOURCE_SHA}/broker.json" <<'MEDIA_GENERATION_BUNDLE_VALIDATION'
+import argparse
+import hashlib
 import json
-import sys
+import re
 from pathlib import Path
 
-bundle = Path(sys.argv[1])
-source_sha = sys.argv[2]
-candidate_venv = f"/opt/media-generation/releases/{source_sha}/venv"
-configuration = json.loads((bundle / "broker.json").read_text())
-unit = (bundle / "media-generation-systemd-broker.service").read_text()
 
-assert configuration["runner_executable"] == (
-    f"{candidate_venv}/bin/media-generation-attempt-runner"
+PAYLOAD_NAMES = {
+    "SOURCE_SHA",
+    "broker.json",
+    "media-generation-apex-ldd-map.jsonl",
+    "media-generation-apex-python-aliases.jsonl",
+    "media-generation-apex-runtime-sha256.jsonl",
+    "media-generation-apex-runtime-symlinks.jsonl",
+    "media-generation-apex-source-ldd.txt",
+    "media-generation-systemd-broker.service",
+    "media_generation-0.1.0-py3-none-any.whl",
+    "pillow-13.0.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+}
+UNIT_PATH = "/etc/systemd/system/media-generation-systemd-broker.service"
+
+
+def require(condition, message):
+    if not condition:
+        raise SystemExit(f"configuration validation failed: {message}")
+
+
+def matches_json_value_exactly(observed, expected):
+    """Compare JSON values while preserving the types of nested values."""
+    if type(observed) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return observed.keys() == expected.keys() and all(
+            matches_json_value_exactly(observed[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(observed) == len(expected) and all(
+            matches_json_value_exactly(actual, value)
+            for actual, value in zip(observed, expected)
+        )
+    return observed == expected
+
+
+parser = argparse.ArgumentParser(
+    description="Validate a release-bound media-generation deployment bundle."
 )
-assert configuration["runner_uid"] == 970
-assert configuration["runner_gid"] == 970
-assert configuration["runner_supplementary_gids"] == [971, 973, 990]
-assert configuration["worker_uid"] == 972
-assert configuration["worker_gid"] == 972
-assert configuration["device_allow"] == ["/dev/kfd", "/dev/dri/renderD128"]
-assert f"ExecStart={candidate_venv}/bin/media-generation-systemd-broker " \
-    "/etc/media-generation/broker.json" in unit
-assert candidate_venv in unit.split("RequiresMountsFor=", 1)[1].split("\n[", 1)[0]
-assert "/opt/media-generation/venv/bin/" not in unit
+parser.add_argument("bundle", type=Path)
+parser.add_argument("source_sha")
+parser.add_argument("expected_sums_sha")
+parser.add_argument("unit_path")
+parser.add_argument("config_path")
+arguments = parser.parse_args()
+
+require(re.fullmatch(r"[0-9a-f]{40}", arguments.source_sha) is not None,
+        "EXPECTED_SOURCE_SHA must be 40 lowercase hexadecimal characters")
+require(re.fullmatch(r"[0-9a-f]{64}", arguments.expected_sums_sha) is not None,
+        "EXPECTED_SUMS_SHA must be 64 lowercase hexadecimal characters")
+require(arguments.bundle.is_absolute(), "BUNDLE must be an absolute path")
+require(not arguments.bundle.is_symlink() and arguments.bundle.is_dir(),
+        "BUNDLE must be a real directory")
+require(arguments.unit_path == UNIT_PATH, "expected unit path")
+candidate_venv = f"/opt/media-generation/releases/{arguments.source_sha}/venv"
+candidate_config = (
+    f"/etc/media-generation/releases/{arguments.source_sha}/broker.json"
+)
+require(arguments.config_path == candidate_config, "expected configuration path")
+
+try:
+    entries = list(arguments.bundle.iterdir())
+except OSError as error:
+    raise SystemExit(f"configuration validation failed: cannot enumerate bundle: {error}")
+expected_entries = PAYLOAD_NAMES | {"SHA256SUMS"}
+require({entry.name for entry in entries} == expected_entries,
+        "bundle inventory does not match the required regular files")
+for entry in entries:
+    try:
+        regular = entry.is_file() and not entry.is_symlink()
+    except OSError as error:
+        raise SystemExit(
+            f"configuration validation failed: cannot inspect bundle entry {entry.name}: {error}"
+        )
+    require(regular, f"bundle entry is not a regular file: {entry.name}")
+
+try:
+    source_bytes = (arguments.bundle / "SOURCE_SHA").read_bytes()
+    sums_bytes = (arguments.bundle / "SHA256SUMS").read_bytes()
+except OSError as error:
+    raise SystemExit(f"configuration validation failed: cannot read bundle metadata: {error}")
+require(source_bytes == f"{arguments.source_sha}\n".encode("ascii"),
+        "SOURCE_SHA does not match EXPECTED_SOURCE_SHA")
+require(hashlib.sha256(sums_bytes).hexdigest() == arguments.expected_sums_sha,
+        "SHA256SUMS digest does not match the independent handoff record")
+
+try:
+    sums_text = sums_bytes.decode("ascii")
+except UnicodeDecodeError as error:
+    raise SystemExit(f"configuration validation failed: SHA256SUMS is not ASCII: {error}")
+require(sums_bytes.endswith(b"\n"), "SHA256SUMS must end with an LF newline")
+require(
+    not any(separator in sums_bytes for separator in (b"\r", b"\v", b"\f")),
+    "SHA256SUMS must use LF line separators",
+)
+manifest_names = set()
+manifest_order = []
+for line_number, line in enumerate(sums_text[:-1].split("\n"), start=1):
+    if (
+        len(line) < 67
+        or line[64:66] != "  "
+        or re.fullmatch(r"[0-9a-f]{64}", line[:64]) is None
+    ):
+        raise SystemExit(
+            f"configuration validation failed: malformed SHA256SUMS entry at line {line_number}"
+        )
+    name = line[66:]
+    require(re.fullmatch(r"[A-Za-z0-9._-]+", name) is not None,
+            f"unsafe SHA256SUMS filename at line {line_number}")
+    require(name in PAYLOAD_NAMES, f"unapproved SHA256SUMS filename: {name}")
+    require(name not in manifest_names, f"duplicate SHA256SUMS filename: {name}")
+    manifest_names.add(name)
+    manifest_order.append(name)
+require(manifest_names == PAYLOAD_NAMES, "SHA256SUMS does not list the exact payload set")
+require(manifest_order == sorted(PAYLOAD_NAMES), "SHA256SUMS entries are not in canonical order")
+for line in sums_text.splitlines():
+    expected_digest = line[:64]
+    name = line[66:]
+    digest = hashlib.sha256()
+    try:
+        with (arguments.bundle / name).open("rb") as payload:
+            for chunk in iter(lambda: payload.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as error:
+        raise SystemExit(
+            f"configuration validation failed: cannot hash payload {name}: {error}"
+        )
+    require(digest.hexdigest() == expected_digest, f"payload checksum mismatch: {name}")
+
+try:
+    configuration = json.loads(
+        (arguments.bundle / "broker.json").read_text(encoding="utf-8")
+    )
+    unit_text = (
+        arguments.bundle / "media-generation-systemd-broker.service"
+    ).read_bytes().decode("utf-8")
+except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"configuration validation failed: cannot read configuration or unit: {error}")
+
+runtime_root = "/srv/media-generation/candidates/qwen-image-edit-2511/runtime"
+expected_configuration = {
+    "database_path": "/var/lib/media-generation-v9/db/jobs.sqlite3",
+    "socket_path": "/run/media-generation/attempt-broker.sock",
+    "scratch_root": "/var/lib/media-generation/scratch",
+    "runner_executable": f"{candidate_venv}/bin/media-generation-attempt-runner",
+    "runner_uid": 970,
+    "runner_gid": 970,
+    "runner_supplementary_gids": [971, 973, 990],
+    "worker_uid": 972,
+    "worker_gid": 972,
+    "scratch_gid": 971,
+    "model_read_gid": 973,
+    "device_allow": ["/dev/kfd", "/dev/dri/renderD128"],
+    "read_roots": [
+        runtime_root,
+        "/srv/media-generation/candidates/qwen-image-edit-2511/inputs",
+    ],
+    "environment_path_allowlist": [
+        "/usr/bin",
+        f"{runtime_root}/rocm-devel-venv/lib/python3.14/site-packages/_rocm_sdk_devel",
+        f"{runtime_root}/rocm-devel-venv/lib/python3.14/site-packages/_rocm_sdk_devel/lib",
+        f"{runtime_root}/rocm-devel-venv/lib/python3.14/site-packages/_rocm_sdk_devel/lib/llvm/lib",
+        f"{runtime_root}/rocm-devel-venv/lib/python3.14/site-packages/_rocm_sdk_devel/lib/rocm_sysdeps/lib",
+    ],
+    "empty_timeout_seconds": 30,
+}
+require(isinstance(configuration, dict), "broker configuration must be an object")
+require(set(configuration) == set(expected_configuration), "broker configuration field set")
+for key, expected_value in expected_configuration.items():
+    require(matches_json_value_exactly(configuration.get(key), expected_value), key)
+
+expected_unit = (
+    "[Unit]\n"
+    "Description=Media Generation systemd attempt broker\n"
+    "After=local-fs.target\n"
+    "RequiresMountsFor=/opt/media-generation "
+    f"{candidate_venv} /etc/media-generation/releases/{arguments.source_sha} \\\n"
+    "    /var/lib/media-generation-v9/db /var/lib/media-generation/scratch \\\n"
+    "    /srv/media-generation/candidates/qwen-image-edit-2511\n"
+    "\n"
+    "[Service]\n"
+    "Type=exec\n"
+    "User=root\n"
+    "Group=root\n"
+    "UMask=0077\n"
+    "WorkingDirectory=/\n"
+    "RuntimeDirectory=media-generation\n"
+    "RuntimeDirectoryMode=0750\n"
+    "RuntimeDirectoryPreserve=no\n"
+    f"ExecStart={candidate_venv}/bin/media-generation-systemd-broker {candidate_config}\n"
+    "Restart=on-failure\n"
+    "RestartSec=2s\n"
+    "NoNewPrivileges=yes\n"
+    "ProtectSystem=strict\n"
+    "ProtectHome=read-only\n"
+    "PrivateTmp=yes\n"
+    "ReadWritePaths=/run/media-generation /var/lib/media-generation-v9/db "
+    "/var/lib/media-generation-v9/systemd-evidence /var/lib/media-generation/scratch\n"
+)
+require(unit_text == expected_unit,
+        "systemd unit does not exactly match the release-bound security template")
+print("bundle configuration and systemd unit validation passed")
+MEDIA_GENERATION_BUNDLE_VALIDATION
 ```
 
-Run it with `/usr/bin/python3.14 - BUNDLE EXPECTED_SOURCE_SHA`. A failure means the bundle does not select the reviewed candidate or it changed a protected identity or device boundary.
+The expected unit and configuration paths are fixed by this command. It binds the candidate runner and broker executables, candidate configuration, and mount requirements to `EXPECTED_SOURCE_SHA`; it also rejects extra unit properties and any change to the protected broker fields. A failure means the bundle does not select the reviewed candidate or does not preserve the approved identity, device, filesystem, or systemd boundary.
+
+The validator checks JSON types as well as values. For example, 970.0 does not satisfy an integer UID field.
+
+On APEX, this command uses the host's selected `PYTHON_BIN`; it does not assume the Mac path or `/usr/bin/python3.14`. The deployment steps that follow remain a separate candidate-installation phase and require owner review before activation.
 
 Confirm the active unit and broker file are regular root-owned files, have no unexpected ACLs, and match the hashes above. Require `DropInPaths` to be empty and the loaded `ExecStart` to match the unit file. Check all service identities and supplementary groups with both keyed account lookups and live process credentials. Check that the worker cannot read runner scratch or access either GPU device, and that the runner cannot write worker publication output.
 
@@ -1772,9 +2157,9 @@ Run it as `media-generation-worker` with `/opt/media-generation/venv/bin/python`
 
 Measure free space on both `/var/tmp` and `/opt`. Include the copied bundle, the new venv, the versioned configuration, and temporary build or install files in the estimate. Require enough free space for two copies of the larger of the bundle or the installed venv. Keep all preflight output and hashes outside the Git repository.
 
-### Candidate installation and qualification
+### C. Candidate installation and qualification
 
-Copy the reviewed bundle into `/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}` only after verifying that the destination and its parent are safe and the destination does not exist. Set the new directory to `root:root 0700`. Verify its complete `SHA256SUMS` again after copying. Leave `/var/tmp/media-generation-package` untouched.
+Copy the verified APEX inbox at `BUNDLE` into `/var/tmp/media-generation-package-${EXPECTED_SOURCE_SHA}` only after verifying that the destination and its parent are safe and the destination does not exist. Set the new directory to `root:root 0700`. Verify its complete `SHA256SUMS` again after copying. Leave both the inbound bundle and the existing `/var/tmp/media-generation-package` untouched.
 
 Create `/opt/media-generation/releases` only if the owner has verified that it is absent. If it already exists, inspect its owner, mode, ACLs, and contents before using it. Create a new `/opt/media-generation/releases/${EXPECTED_SOURCE_SHA}` directory with owner `root`, group `media-generation-model-read`, and mode `0710`. Stop if that exact release path exists or is a symlink. Do not change the owner or mode of `/opt/media-generation` or the existing `venv`.
 
@@ -1786,7 +2171,7 @@ After candidate installation, repeat the old venv's file hash and symlink invent
 
 This phase qualifies only the offline package and filesystem layout. It does not start the broker or run inference.
 
-### Owner-controlled activation
+### D. Owner-controlled activation
 
 Keep installation and activation separate. The owner must review the candidate bundle hashes, install results, database report, permissions, and rollback state, then explicitly approve activation for `EXPECTED_SOURCE_SHA` in an interactive session.
 
