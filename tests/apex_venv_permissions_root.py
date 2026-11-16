@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -938,6 +939,306 @@ class ApexBundlePreflightManifestTests(unittest.TestCase):
             "configuration validation failed: systemd unit does not exactly match the release-bound security template",
             result.stderr,
         )
+
+
+class ApexSqlitePreflightManifestTests(unittest.TestCase):
+    OPTIMIZATION_MODES = (
+        ("normal", False, False),
+        ("-O", True, False),
+        ("PYTHONOPTIMIZE=1", False, True),
+    )
+    EXPECTED_LOGICAL_DIGEST = (
+        "e17e317282ef33cbb2e76488895758ce024ccdda1838c6bf2fbd17b388bb18b9"
+    )
+    INSTALLATION_DATABASE_PATH = (
+        'path = Path("/var/lib/media-generation-v9/db/jobs.sqlite3")'
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        document = MANIFEST.read_text(encoding="utf-8")
+        section_six_shell = ApexBundlePreflightManifestTests._extract_fenced_block(
+            document, "The owner creates only the listed new paths", "sh"
+        )
+        cls.section_six_python = (
+            ApexBundlePreflightManifestTests._extract_heredoc(
+                section_six_shell, "PY"
+            )
+        )
+        if cls.section_six_python.count(cls.INSTALLATION_DATABASE_PATH) != 1:
+            raise AssertionError("installation database path changed unexpectedly")
+        schema_check_start = cls.section_six_python.index(
+            "with sqlite3.connect(path) as connection:"
+        )
+        cls.section_six_schema_check = cls.section_six_python[schema_check_start:]
+        cls.upgrade_python = (
+            ApexBundlePreflightManifestTests._extract_fenced_block(
+                document, "Run the following check as the worker", "python"
+            )
+        )
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="apex-sqlite-preflight-")
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+
+    @property
+    def repository_root(self) -> Path:
+        return MANIFEST.parents[2]
+
+    def _environment(self, *, optimize_environment: bool = False) -> dict[str, str]:
+        environment = os.environ.copy()
+        environment.pop("PYTHONOPTIMIZE", None)
+        source_root = str(self.repository_root / "src")
+        existing_pythonpath = environment.get("PYTHONPATH", "")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            part for part in (source_root, existing_pythonpath) if part
+        )
+        if optimize_environment:
+            environment["PYTHONOPTIMIZE"] = "1"
+        return environment
+
+    def _run_python(
+        self,
+        source: str,
+        *,
+        database: Path | None = None,
+        optimized_flag: bool = False,
+        optimize_environment: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        command = [sys.executable]
+        if optimized_flag:
+            command.append("-O")
+        command.append("-")
+        if database is not None:
+            command.append(str(database))
+        return subprocess.run(
+            command,
+            input=source,
+            text=True,
+            capture_output=True,
+            cwd=self.repository_root,
+            env=self._environment(optimize_environment=optimize_environment),
+            check=False,
+            timeout=30,
+        )
+
+    def _section_six_source(self, database: Path) -> str:
+        return self.section_six_python.replace(
+            self.INSTALLATION_DATABASE_PATH,
+            f"path = Path({str(database)!r})",
+            1,
+        )
+
+    def _section_six_schema_source(self) -> str:
+        return (
+            "import sqlite3\n"
+            "import sys\n"
+            "from pathlib import Path\n"
+            "path = Path(sys.argv[1])\n"
+            f"{self.section_six_schema_check}"
+        )
+
+    def _create_database(self, database: Path, fixture: str = "valid") -> None:
+        if fixture == "missing_database":
+            return
+        if fixture == "invalid_database_file":
+            database.write_bytes(b"not a SQLite database\n")
+            return
+
+        with sqlite3.connect(database) as connection:
+            connection.executescript(
+                "CREATE TABLE execution_resource (id INTEGER PRIMARY KEY, state TEXT);"
+                "CREATE TABLE execution_jobs (id INTEGER PRIMARY KEY, status TEXT NOT NULL, "
+                "parent_id INTEGER REFERENCES execution_jobs(id));"
+                "CREATE TABLE execution_attempts (status TEXT NOT NULL);"
+                "CREATE TABLE execution_cancellations (state TEXT NOT NULL);"
+                "CREATE TABLE artifact_publications (state TEXT NOT NULL);"
+            )
+            if fixture != "missing_resource":
+                resource_state = {
+                    "claimed_resource": "claimed",
+                    "quarantined_resource": "quarantined",
+                    "malformed_resource": None,
+                }.get(fixture, "available")
+                connection.execute(
+                    "INSERT INTO execution_resource (id, state) VALUES (1, ?)",
+                    (resource_state,),
+                )
+
+            if fixture in ("wrong_schema_version", "schema_v8"):
+                connection.execute("PRAGMA user_version = 8")
+            elif fixture != "missing_schema_metadata":
+                connection.execute("PRAGMA user_version = 9")
+
+            if fixture in ("running_job", "ambiguous_job"):
+                status = "running" if fixture == "running_job" else "ambiguous"
+                connection.execute(
+                    "INSERT INTO execution_jobs (status) VALUES (?)", (status,)
+                )
+            elif fixture == "foreign_key_violation":
+                connection.execute("PRAGMA foreign_keys = OFF")
+                connection.execute(
+                    "INSERT INTO execution_jobs (status, parent_id) VALUES (?, ?)",
+                    ("complete", 404),
+                )
+
+            if fixture in ("running_attempt", "ambiguous_attempt"):
+                status = "running" if fixture == "running_attempt" else "ambiguous"
+                connection.execute(
+                    "INSERT INTO execution_attempts (status) VALUES (?)", (status,)
+                )
+            if fixture == "requested_cancellation":
+                connection.execute(
+                    "INSERT INTO execution_cancellations (state) VALUES (?)",
+                    ("requested",),
+                )
+            if fixture in ("allocated_publication", "ready_publication"):
+                state = "allocated" if fixture == "allocated_publication" else "ready"
+                connection.execute(
+                    "INSERT INTO artifact_publications (state) VALUES (?)", (state,)
+                )
+            if fixture == "missing_required_table":
+                connection.execute("DROP TABLE artifact_publications")
+            if fixture == "query_error":
+                connection.execute("DROP TABLE execution_jobs")
+                connection.execute("CREATE TABLE execution_jobs (id INTEGER PRIMARY KEY)")
+
+        if fixture == "integrity_failure":
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "CREATE TABLE integrity_guard (value INTEGER, alternate INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO integrity_guard VALUES (?, ?)", ((1, 10), (2, 20))
+                )
+                connection.execute(
+                    "CREATE INDEX integrity_guard_index ON integrity_guard(value)"
+                )
+                connection.execute("PRAGMA writable_schema = ON")
+                connection.execute(
+                    "UPDATE sqlite_master SET sql = ? WHERE name = ?",
+                    (
+                        "CREATE INDEX integrity_guard_index ON integrity_guard(alternate)",
+                        "integrity_guard_index",
+                    ),
+                )
+                connection.execute("PRAGMA writable_schema = OFF")
+
+    @staticmethod
+    def _database_snapshot(database: Path) -> tuple[tuple[str, bytes], ...]:
+        return tuple(
+            (path.name, path.read_bytes())
+            for path in sorted(database.parent.glob(f"{database.name}*"))
+            if path.is_file()
+        )
+
+    def _run_upgrade_check(
+        self, database: Path, *, optimized_flag: bool = False,
+        optimize_environment: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        return self._run_python(
+            self.upgrade_python,
+            database=database,
+            optimized_flag=optimized_flag,
+            optimize_environment=optimize_environment,
+        )
+
+    def test_upgrade_preflight_returns_expected_digest_for_idle_schema_v9(self) -> None:
+        database = self.base / "idle-v9.sqlite3"
+        self._create_database(database)
+        before = self._database_snapshot(database)
+
+        for name, optimized_flag, optimize_environment in self.OPTIMIZATION_MODES:
+            with self.subTest(mode=name):
+                result = self._run_upgrade_check(
+                    database,
+                    optimized_flag=optimized_flag,
+                    optimize_environment=optimize_environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), self.EXPECTED_LOGICAL_DIGEST)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(self._database_snapshot(database), before)
+
+    def test_upgrade_preflight_rejects_unsafe_database_states_in_all_modes(self) -> None:
+        cases = (
+            ("wrong_schema_version", "expected schema version 9"),
+            ("missing_schema_metadata", "expected schema version 9"),
+            ("integrity_failure", "integrity_check failed"),
+            ("foreign_key_violation", "foreign_key_check found"),
+            ("missing_resource", "resource row id=1 is missing"),
+            ("claimed_resource", "resource id=1 must be available"),
+            ("quarantined_resource", "resource id=1 must be available"),
+            ("malformed_resource", "resource id=1 must be available"),
+            ("running_job", "running or ambiguous execution jobs"),
+            ("ambiguous_job", "running or ambiguous execution jobs"),
+            ("running_attempt", "running or ambiguous execution attempts"),
+            ("ambiguous_attempt", "running or ambiguous execution attempts"),
+            ("requested_cancellation", "requested cancellation rows"),
+            ("allocated_publication", "allocated or ready publication rows"),
+            ("ready_publication", "allocated or ready publication rows"),
+            ("missing_required_table", "artifact publications query failed"),
+            ("query_error", "execution jobs query failed"),
+            ("missing_database", "cannot open database read-only"),
+            ("invalid_database_file", "schema version query failed"),
+        )
+        for fixture, diagnostic in cases:
+            with self.subTest(fixture=fixture):
+                database = self.base / f"{fixture}.sqlite3"
+                self._create_database(database, fixture)
+                before = self._database_snapshot(database)
+                for name, optimized_flag, optimize_environment in self.OPTIMIZATION_MODES:
+                    with self.subTest(mode=name):
+                        result = self._run_upgrade_check(
+                            database,
+                            optimized_flag=optimized_flag,
+                            optimize_environment=optimize_environment,
+                        )
+                        self.assertNotEqual(result.returncode, 0, result.stdout)
+                        self.assertIn(
+                            f"SQLite preflight failed: {diagnostic}", result.stderr
+                        )
+                        self.assertNotRegex(
+                            result.stdout, r"(?m)^[0-9a-f]{64}$"
+                        )
+                        self.assertEqual(self._database_snapshot(database), before)
+
+    def test_initialization_block_creates_schema_v9_in_all_modes(self) -> None:
+        for name, optimized_flag, optimize_environment in self.OPTIMIZATION_MODES:
+            with self.subTest(mode=name):
+                database = self.base / f"initialized-{name}.sqlite3"
+                result = self._run_python(
+                    self._section_six_source(database),
+                    optimized_flag=optimized_flag,
+                    optimize_environment=optimize_environment,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with sqlite3.connect(
+                    f"{database.as_uri()}?mode=ro", uri=True
+                ) as connection:
+                    self.assertEqual(
+                        connection.execute("PRAGMA user_version").fetchone(), (9,)
+                    )
+
+    def test_section_six_schema_check_rejects_wrong_version_in_all_modes(self) -> None:
+        for name, optimized_flag, optimize_environment in self.OPTIMIZATION_MODES:
+            with self.subTest(mode=name):
+                database = self.base / f"unsupported-{name}.sqlite3"
+                self._create_database(database, "schema_v8")
+                before = self._database_snapshot(database)
+                result = self._run_python(
+                    self._section_six_schema_source(),
+                    database=database,
+                    optimized_flag=optimized_flag,
+                    optimize_environment=optimize_environment,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(
+                    "schema initialization check failed: expected user_version 9",
+                    result.stderr,
+                )
+                self.assertEqual(self._database_snapshot(database), before)
 
 
 if __name__ == "__main__":

@@ -1288,7 +1288,17 @@ from media_generation.store import SQLiteStore
 path = Path("/var/lib/media-generation-v9/db/jobs.sqlite3")
 SQLiteStore(path)
 with sqlite3.connect(path) as connection:
-    assert connection.execute("PRAGMA user_version").fetchone()[0] == 9
+    try:
+        schema_version = connection.execute("PRAGMA user_version").fetchone()
+    except sqlite3.Error as exc:
+        raise SystemExit(
+            f"schema initialization check failed: cannot read PRAGMA user_version: {exc}"
+        ) from exc
+    if schema_version != (9,):
+        raise SystemExit(
+            "schema initialization check failed: expected user_version 9, "
+            f"found {schema_version!r}"
+        )
 PY
 test "$(stat -c '%u:%g %a' /var/lib/media-generation-v9/db/jobs.sqlite3)" = '972:972 660'
 test "$(stat -c '%u:%g %a' /var/lib/media-generation-v9/systemd-evidence)" = '0:972 750'
@@ -2131,27 +2141,115 @@ from pathlib import Path
 
 database = Path(sys.argv[1]).resolve()
 uri = f"{database.as_uri()}?mode=ro"
-with sqlite3.connect(uri, uri=True) as connection:
-    connection.execute("PRAGMA query_only = ON")
-    assert connection.execute("PRAGMA user_version").fetchone() == (9,)
-    assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
-    assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-    assert connection.execute(
-        "SELECT state FROM execution_resource WHERE id = 1"
-    ).fetchone() == ("available",)
-    checks = (
-        "SELECT count(*) FROM execution_jobs "
-        "WHERE status IN ('running', 'ambiguous')",
-        "SELECT count(*) FROM execution_attempts "
-        "WHERE status IN ('running', 'ambiguous')",
-        "SELECT count(*) FROM execution_cancellations WHERE state = 'requested'",
-        "SELECT count(*) FROM artifact_publications "
-        "WHERE state IN ('allocated', 'ready')",
+def fail(message):
+    raise SystemExit(f"SQLite preflight failed: {message}")
+
+try:
+    connection = sqlite3.connect(uri, uri=True)
+except sqlite3.Error as exc:
+    fail(f"cannot open database read-only: {exc}")
+
+def query_rows(operation, statement):
+    try:
+        return connection.execute(statement).fetchall()
+    except sqlite3.Error as exc:
+        fail(f"{operation} query failed: {exc}")
+
+def close_connection():
+    try:
+        connection.close()
+    except sqlite3.Error as exc:
+        fail(f"database close failed: {exc}")
+
+try:
+    try:
+        connection.execute("PRAGMA query_only = ON")
+    except sqlite3.Error as exc:
+        fail(f"query-only setup failed: {exc}")
+    if query_rows("read-only mode", "PRAGMA query_only") != [(1,)]:
+        fail("SQLite query_only mode could not be enabled")
+
+    schema_version = query_rows("schema version", "PRAGMA user_version")
+    if (
+        len(schema_version) != 1
+        or len(schema_version[0]) != 1
+        or type(schema_version[0][0]) is not int
+        or schema_version[0][0] != 9
+    ):
+        fail(f"expected schema version 9, found {schema_version!r}")
+
+    integrity = query_rows("integrity_check", "PRAGMA integrity_check")
+    if integrity != [("ok",)]:
+        fail("integrity_check failed: expected exactly one 'ok' result")
+
+    foreign_key_violations = query_rows(
+        "foreign_key_check", "PRAGMA foreign_key_check"
     )
-    assert all(connection.execute(query).fetchone() == (0,) for query in checks)
-    snapshot = "\n".join(connection.iterdump()).encode()
-    print(hashlib.sha256(snapshot).hexdigest())
+    if foreign_key_violations:
+        fail(
+            "foreign_key_check found "
+            f"{len(foreign_key_violations)} violation(s)"
+        )
+
+    resource = query_rows(
+        "execution resource",
+        "SELECT state FROM execution_resource WHERE id = 1",
+    )
+    if not resource:
+        fail("resource row id=1 is missing")
+    if (
+        len(resource) != 1
+        or len(resource[0]) != 1
+        or type(resource[0][0]) is not str
+        or resource[0][0] != "available"
+    ):
+        fail(f"resource id=1 must be available; found {resource!r}")
+
+    checks = (
+        (
+            "execution jobs",
+            "SELECT count(*) FROM execution_jobs "
+            "WHERE status IN ('running', 'ambiguous')",
+            "running or ambiguous execution jobs",
+        ),
+        (
+            "execution attempts",
+            "SELECT count(*) FROM execution_attempts "
+            "WHERE status IN ('running', 'ambiguous')",
+            "running or ambiguous execution attempts",
+        ),
+        (
+            "requested cancellations",
+            "SELECT count(*) FROM execution_cancellations WHERE state = 'requested'",
+            "requested cancellation rows",
+        ),
+        (
+            "artifact publications",
+            "SELECT count(*) FROM artifact_publications "
+            "WHERE state IN ('allocated', 'ready')",
+            "allocated or ready publication rows",
+        ),
+    )
+    for operation, statement, condition in checks:
+        rows = query_rows(operation, statement)
+        if len(rows) != 1 or len(rows[0]) != 1 or type(rows[0][0]) is not int:
+            fail(f"{operation} query returned an unexpected result")
+        if rows[0][0] != 0:
+            fail(f"{condition}: found {rows[0][0]} matching row(s)")
+
+    try:
+        snapshot = "\n".join(connection.iterdump()).encode("utf-8")
+    except (sqlite3.Error, UnicodeError) as exc:
+        fail(f"logical database dump failed: {exc}")
+finally:
+    close_connection()
+
+print(hashlib.sha256(snapshot).hexdigest())
 ```
+
+On failure, the command exits nonzero and reports the failed query or condition
+to stderr. It prints the digest only after every check passes and the read-only
+connection closes cleanly.
 
 Run it as `media-generation-worker` with `/opt/media-generation/venv/bin/python` and `/var/lib/media-generation-v9/db/jobs.sqlite3`. Require success and zero counts. If the resource is claimed or quarantined, an attempt is active or ambiguous, a cancellation is still requested, or a publication is incomplete, stop and use the existing recovery path before considering an upgrade. Record logical integrity digests for any separate artifact database and the root evidence ledger using their own read-only SQLite schemas. Compare them again before rollback. Any unexplained change blocks rollback.
 
