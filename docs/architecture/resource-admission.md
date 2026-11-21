@@ -209,3 +209,13 @@ fits.
 
 APEX-specific qualification remains **UNVERIFIED** until independently collected
 host evidence and real-tool execution evidence demonstrate it.
+
+For systemd-contained attempts, a successful engine observation alone does not
+release capacity. Success requires a valid engine exit observation, verified
+whole-cgroup termination, reconciled publication, and current admission
+authority. Cancellation or worker-loss recovery may release capacity without
+an engine observation when the immutable unit identity and cgroup-empty proof
+are verified and publication is fenced and reconciled. A missing unit identity
+or termination proof leaves the reservation quarantined. The root-owned broker
+design is approved; installing it or changing APEX host policy still requires
+separate owner authorization.

@@ -678,7 +678,7 @@ def test_cancellation_before_execution_dispatch_releases_unlaunched_resource(
 
     def cancel_after_resolution(plan):
         original_resolve(plan)
-        assert service.cancel(job_id)["outcome"] == "accepted"
+        assert service.cancel(job_id)["outcome"] == "requested"
         raise BackendPreparationError(
             "test_pre_dispatch_cancel", "cancel before execution dispatch"
         )
@@ -713,7 +713,7 @@ def test_cancellation_before_managed_popen_releases_unlaunched_resource(
     spawn_calls = 0
 
     def cancel_before_popen(authority):
-        assert service.cancel(job_id)["outcome"] == "accepted"
+        assert service.cancel(job_id)["outcome"] == "requested"
         return original_verify_current(authority)
 
     def unexpected_spawn(*args, **kwargs):

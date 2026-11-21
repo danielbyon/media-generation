@@ -29,14 +29,13 @@ restart-stable candidate identity and declared capabilities. Construction does
 not load a model, hash model component files, start a process, inspect Git, or
 capture host runtime facts.
 
-Before every dispatch `resolve_execution` performs the authoritative offline T07
-evaluation. Static preparation and independent evidence authority must both be
-`ready`, and every pinned declaration, recipe, component, executable, and trusted
-evidence file is read and re-hashed. The selected candidate's stable
-`candidate_id` must still match the identity captured in the adapter
-configuration. A failure is refused before any process starts; the service never
-substitutes another bundle. The fresh `verification_id` belongs to that resolved
-attempt only and is excluded from the restart-stable static configuration.
+Before dispatch, the adapter verifies the recipe, model components, and trusted
+evidence through the T07 evaluator. The candidate must match the selection
+captured in the adapter configuration. For SD-C++ execution, the evaluator
+observes the installed executable at the selected path and records its digest.
+The declaration's original executable metadata remains part of the stable
+selection for queued jobs. Offline T07 inspection still compares the
+historical artifact pins. The fresh `verification_id` belongs to the attempt.
 
 T07 declaration schema version 1 has no field that references a prepared
 manifest or an acquisition journal. The adapter therefore re-evaluates the
@@ -194,30 +193,22 @@ the documented invocation contract cannot bind their required order and
 strength without guessing. Such a request finishes with
 `operation_unsupported`.
 
-The engine version stored in the resolved record is copied from the candidate
-declaration. The application-owned registration pins the real
-stable-diffusion.cpp identity to `master-975-95b3090-2-gb13a482`, the exact
-`git describe --tags` identity of commit
-`b13a48219d5cdf408edcb93da6cd69b612ed03d3`. Exact string matching remains
-mandatory at configuration evaluation and dispatch; a different describe
-string, branch, or commit identifies different engine source and is refused.
+New SD-C++ attempts reuse resolved record v2. `argv[0]` holds the selected
+executable path and `engine.executable_sha256` holds the observed digest.
+`engine.version` and `engine.build` say `unobserved` without a trustworthy
+version or build observation. Earlier v2 writers copied those values from the
+candidate declaration. Existing records retain their original meaning and
+bytes.
 
-Runtime markers are read without mutation. `rocm_version` is read from
-`$ROCM_PATH/.info/version` when `ROCM_PATH` names a readable installation
-marker, then from `/opt/rocm/.info/version`. `amdgpu_version` is read from
-`/sys/module/amdgpu/version` when readable, then from
-`/sys/module/amdgpu/srcversion`. The srcversion file is an opaque loaded-module
-build identifier, not a semantic driver version; the application records it
-under the existing field name and does not parse or order it. If neither
-amdgpu marker is readable, or neither ROCm marker is readable, the
-corresponding value is `null` and dispatch validation refuses the execution.
+`rocm_version` comes from the first readable marker at
+`$ROCM_PATH/.info/version` or `/opt/rocm/.info/version`. `amdgpu_version` comes
+from `/sys/module/amdgpu/version` or the opaque `srcversion` fallback. A missing
+marker is recorded as `null`. Linux remains required. The configured runtime
+must satisfy the invocation and produce a valid image.
 
-Verification happens before launch. The resolved record states that the pinned
-bytes were verified before the process started and that the engine may open
-different bytes afterwards, because no retained file handle is kept across the
-launch. That fact is stored as the `verification_window` object with its
-`verified_before_launch` and `engine_may_open_different_bytes_after_launch`
-flags. The application does not claim that the engine loaded the hashed bytes.
+The `verification_window` records the prelaunch check. The engine opens its own
+files after launch, so the digest describes the executable observed before
+dispatch. Administrators update the protected runtime between attempts.
 
 ## ComfyUI graph execution and resolved record v3
 
@@ -629,6 +620,170 @@ numbering, publisher ownership, fence epochs, retry eligibility, or
 no-clobber artifact publication.
 
 
+## Systemd-contained GPU attempts
+
+For a systemd-enabled Stable Diffusion C++ attempt, the worker resolves the
+invocation once and persists its canonical record before dispatch. The broker
+checks the request against that exact record, then starts a fixed attempt
+runner in a transient system service. The runner receives the durable argv,
+environment, and broker-created scratch path. It does not resolve a new
+invocation or choose systemd properties.
+
+The resolved environment record stores variable names and the selected GPU
+override values. A domain-separated SHA-256 also binds every effective
+environment value, including `PATH`, `LD_LIBRARY_PATH`, and `ROCM_PATH`, without
+copying those path values into public provenance. The broker and runner
+recompute the digest before launch. The broker's root-owned
+`environment_path_allowlist` names the exact directories that may appear in
+search-path variables. Empty entries, relative paths, symlinked directories,
+and paths outside that list are rejected. A configured `ROCM_PATH` must also
+contain a readable `.info/version` file.
+
+The runner owns `ProcessSupervisor` and the engine child. It records the
+existing `LaunchFact` after spawn and the existing `ProcessObservation` after
+the engine child is reaped. The broker writes those facts through the normal
+claim-owner and epoch checks while the attempt remains current. The supervisor
+continues to verify the exact argv and environment and stores only bounded,
+privacy-safe stream summaries. The runner itself starts with the private
+attempt directory as its working directory; it starts the engine with `/` as
+its working directory because the durable engine argv contains absolute input
+and output paths. Direct-child execution paths keep their existing evidence
+contract; this design does not infer process-tree containment from their
+observations.
+
+The result keeps six facts separate:
+
+| Fact | Evidence | What it establishes |
+| --- | --- | --- |
+| Launcher exit | `systemd-run` process return code | The systemd client returned. With `--wait`, systemd-run can propagate the service result; that result is the runner's status, not the engine's. See the [systemd-run manual](https://freedesktop.org/software/systemd/man/latest/systemd-run.html). |
+| Runner exit | The matching unit's `MainPID`, `ExecMainCode`, `ExecMainStatus`, and `Result` | The transient service's runner process exited and systemd classified its exit code or signal. |
+| Engine exit | `ProcessObservation` exit code, signal, and reaped-child fields | The exact supervised engine child exited. It does not establish that every cgroup process exited. |
+| Unit identity | Invocation ID, control-group path, boot ID, and cgroup device/inode | The service and cgroup belong to this attempt. Identity alone does not establish termination. |
+| Cgroup termination | `cgroup.events` reports `populated 0` through the descriptor pinned to the validated unit and cgroup | No process remains in that attempt cgroup. |
+| Stream completion | The runner control stream ended with a complete success record | The broker received the runner result without a lost or malformed control message. |
+
+The broker captures the unit invocation ID, control-group path, boot ID, and
+cgroup device/inode before accepting engine evidence. `RemainAfterExit=yes`
+keeps the completed service available until the broker explicitly stops it.
+The broker opens `cgroup.events` after validating those identities and keeps
+that descriptor through `StopUnit` and the empty check. After receiving a
+runner completion record, it waits until the matching unit reports `MainPID=0`
+and a terminal `ExecMainCode` before it stops the unit and samples
+`cgroup.events`. On cancellation or worker loss, it stops the unit first and
+then verifies that same runner exit before recording cgroup emptiness. The
+broker saves the unit result and exit status before `StopUnit`, because systemd
+may garbage-collect the completed unit afterward. If systemd removes the unit
+or cgroup path before the descriptor is pinned, termination is unproven.
+If the pinned event reports an empty cgroup, the broker durably records the
+proof even when systemd has since removed the unit name or cgroup path. Once
+the proof is durable, later unit garbage collection does not invalidate it. A
+worker or host restart loses an unpersisted descriptor; recovery then needs new
+independently verified evidence or keeps capacity quarantined.
+
+`systemd-run --pipe` connects the transient service's standard streams to the
+broker's launcher pipes. The worker communicates with the broker over its
+authenticated local socket; worker loss alone leaves the launch pipes open
+because the broker owns them. The broker's disconnect watcher fences the
+attempt and stops its exact unit. If the broker or runner loses a pipe endpoint,
+writes may fail with `EPIPE` or `SIGPIPE`; an incomplete control stream cannot
+stand in for engine evidence. The broker treats that result as incomplete and
+uses cgroup proof for cleanup. A worker that dies before it receives a result
+cannot publish the scratch image.
+
+Success requires all of the following: a valid engine observation with exit
+code zero and no signal; successful launcher and unit results; a complete
+runner stream; validated image bytes; verified cgroup-empty evidence; and
+current publication authority. The worker passes the broker's read-only output
+descriptor to the adapter's existing `stream_systemd_execution` method. That
+method validates the image and copies it into the publisher's original staging
+descriptor. The existing publication transaction remains the only path that
+creates the artifact and commits the job.
+
+Cancellation and worker-loss recovery use termination evidence independently
+of engine success evidence. The worker fences publication, the broker stops
+the exact authenticated unit, and recovery waits for the whole cgroup to empty.
+Recovery reconciles or revokes incomplete publication rows before applying the
+existing resource and admission checks. A missing engine observation prevents
+success; it does not by itself prove that a GPU process survived. Verified
+cgroup termination and safe publication state can release capacity for a
+canceled or failed attempt. Uncertain unit identity, missing cgroup proof, or
+unreconciled publication keeps the resource quarantined.
+
+The system service runs under the configured non-root runner UID and primary
+GID. Its supplementary groups are an exact allowlist: the GPU `render` and
+`video` groups when required by the configured device nodes, the private
+scratch group, and the read-only model/runtime group. The broker checks the
+runner's NSS memberships against that allowlist. The worker has its own primary
+publication group and only the read-only model/runtime group as a supplementary
+group; it never joins the scratch or GPU groups. The broker checks the worker's
+NSS memberships exactly. The shared read group relies on ordinary owner/group
+mode bits because broker validation does not evaluate named POSIX ACL entries.
+The mirrored runtime and model tree therefore has root-owned directories with
+group traversal/read permissions and root-owned read-only files. The engine
+executable is group-readable and executable so the runner can launch it; this
+also gives the worker execute permission on that file, but no GPU device or
+scratch access.
+
+At startup the broker checks private search-tree contents, including library
+symlink targets, for root ownership, write protection, runner access, and
+extended ACLs. The administrator maintains the system command tree. Per
+attempt the broker checks the configured search directories and the exact
+resolved invocation. The worker needs read access to candidate data it
+verifies. Private libraries may be accessible only to the runner.
+
+The broker allowlists the required GPU device nodes, model and input read
+roots, scratch directory, and runner executable, then supplies fixed
+`User=`, `Group=`, supplementary-group, device, filesystem, and kill-policy
+properties. The runner has no database access. The root broker opens the
+configured SQLite database to persist launch and engine-observation facts. It
+also maintains a root-owned evidence ledger in a dedicated protected
+directory at
+`<deployment root>/systemd-evidence/<database directory>-<database filename>.systemd-evidence.sqlite3`.
+For the APEX database, the path is
+`/var/lib/media-generation-v9/systemd-evidence/db-jobs.sqlite3.systemd-evidence.sqlite3`.
+The broker stores each
+immutable unit identity and cgroup-empty proof in this ledger, then mirrors the
+facts into the job database. The job database may be writable by the worker,
+so its copy alone is never accepted as proof of containment or termination.
+The ledger is owned by root, readable by the configured worker group, and not
+writable by that group. The directory is also outside the worker-writable
+database directory, so the worker cannot create or replace SQLite sidecars.
+The worker opens it read-only and requires its identity and termination records
+to match before resource release. Missing or conflicting ledger data fails
+closed.
+
+The root-owned broker is the systemd authorization boundary. It invokes
+`systemd-run --system` as root, so the system manager authorizes the broker's
+root credentials; polkit does not give this root process a narrow per-property
+allowlist. The worker receives no general systemd management privilege. A
+unit-name prefix only limits the namespace. The broker also checks peer
+credentials, exact request fields, claim and epoch, the durable resolved
+invocation, and live unit properties; it constructs every transient-unit
+property itself. The broker executable, its root-owned configuration, and
+the protected socket directory must not be writable by the worker.
+
+Broker configuration, runner executable, socket, scratch root, and database
+paths must sit beneath root-owned, nonreplaceable directory chains. The broker
+rejects symlinked or worker-owned ancestors and writable ancestors without a
+root-owned sticky bit. The sidecar ledger needs the same protected parent
+directory as the database, with root ownership and read access for the worker
+group. APEX must provide those paths and the required worker, runner,
+ROCm, model-read, GPU-device, model, scratch, database, and ledger access before
+qualification. Implementation does not apply host permission changes.
+Approving the broker software does not authorize installing it or changing
+systemd or host permissions on APEX. The owner must authorize the installation,
+service configuration, identities, directories, and device access. Until then,
+the APEX backend remains unqualified.
+
+Published image staging files use mode `0600`. The runner is intentionally not
+a member of the worker publication group, so the current broker cannot read a
+published artifact used as an engine `-r` reference. Do not solve this by
+adding the runner to the worker group or broadening every artifact's mode. A
+reference-conditioned APEX run remains blocked until a separately reviewed
+per-attempt read-only input handoff gives the runner only the selected input.
+The deployment manifest covers model/runtime access and reference-free runs;
+it does not claim the reference-conditioned path is qualified.
+
 ## Pre-dispatch refusals
 
 An adapter prepares and resolves the execution before it marks the attempt as
@@ -669,6 +824,11 @@ the publisher's already-open staging descriptor. The existing publisher then
 performs its normal full-image validation, filesystem synchronization, lineage
 insertion, and no-clobber publication.
 
+The C++ engine subprocess starts in `/`. glibc resolves an empty RUNPATH
+component against the current directory ([GNU libc source](https://sourceware.org/pipermail/libc-stable/2017-January/000518.html)),
+so writable attempt scratch is outside that library search. The adapter resolves
+model, reference, and output paths before building the engine arguments.
+
 The adapter removes the scratch directory in `finally` after success or failure.
 The service also removes it if publication fails after resolution but before
 `execute` opens the publisher's staging descriptor. A process crash can leave the
@@ -688,47 +848,20 @@ from the resolved argument vector and the environment it will pass to the
 child. A URL scheme, a remote, host, listen, server, API, proxy, download,
 update, telemetry, or fallback token in the invocation marks the matching
 control prohibited, and any proxy variable in the environment does the same.
-The privacy profile is selected by the application, not by the adapter. An
-application-owned registry maps the exact adapter identifier to the engine
-identity, engine version, and configuration version it covers, and the service
-reads the profile from that registry. A policy object exposed by an adapter is
-ignored, so an adapter cannot widen the controls that apply to it. Adding an
-adapter identity to the registry is an application change.
+The application selects the SD-C++ privacy profile by the supported adapter,
+engine family, and configuration and invocation contracts. The original tool
+version remains the stored profile label. ComfyUI retains its signed runtime
+version requirement.
 
-Invocation or environment settings the application cannot classify remain
-`unverified` and block execution.
-
-The service evaluates the record at the dispatch boundary before it inserts the
-resolved row and before it spawns a child. It requires the record's argv and
-environment to match the prepared invocation, recomputes the privacy settings
-from that argv and environment, requires the recorded map to match the
-recomputation, requires the adapter to declare an identity present in the
-application-owned privacy registry, requires the record's declared engine
-identity and version to match that registration, and requires the
-application-owned policy to return `pass`. A prohibited token in the argv or a
-proxy variable in the environment fails this gate.
-
-The gate also binds the record to the restart-stable adapter configuration
-persisted with the claim. Candidate identity, declaration digest, engine
-identity and executable digest, recipe identity and document digest, required
-component rows, adapters, and the CLI and invocation contracts must match that
-admission selection. The `argv[0]` path must end with the selected executable
-pin, and that one file is read again to confirm the pinned SHA-256; model and
-component files are not hashed a second time. The gate compares the reported
-component rows but does not bind the model-path values in the remaining `argv`
-entries to the corresponding component artifact pins; that path mapping remains
-inside the in-process adapter boundary. Substitutions of the candidate,
-declaration, executable build or bytes, recipe, required component rows,
-adapters, or contracts fail closed as `resolved_execution_mismatch` before the
-resolved row is inserted or a child starts. An engine identity or version
-mismatch against the application-owned registration fails earlier with the
-privacy reason `resolved_engine_mismatch`.
-The binding still consumes the configuration the adapter exposes at admission,
-so an adapter that fabricates both its configuration and its resolution remains
-an in-process trust boundary. The launch record captures the argv and
-environment the supervisor passed; it does not prove that the process opened
-the same bytes the application verified, because the engine opens those paths
-itself after launch.
+Before inserting the resolved record or launching the engine, the service
+recomputes privacy from the exact argv and environment. It requires a pass and
+checks the record against the claimed selection. For SD-C++, the full
+executable path must match the selected declaration, and the digest must match
+the observation captured for this attempt. Candidate and declaration identity,
+the recipe, component identities, and invocation contracts must also match.
+The adapter supplies the mapping from component identities to argv paths.
+The supervisor separately records the argv and environment actually passed to
+the child.
 
 These controls describe application configuration only. They do not prove that
 the executable contains no network code and do not provide operating-system
@@ -782,7 +915,6 @@ that a survivor process is contained, or that the engine cannot access a
 network. Those remain runtime and qualification concerns outside this evidence
 layer.
 
-Component and executable hashes are verified before launch. Because no retained
-descriptor spans the launch, the bytes the engine opens afterwards may differ
-from the bytes that were hashed; the resolved record states this window
-explicitly.
+The adapter verifies model hashes and observes the selected executable before
+launch. The resolved record describes that check. The engine opens its own
+files after launch.

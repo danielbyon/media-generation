@@ -374,7 +374,7 @@ def test_active_cancellation_fences_publication_until_adapter_stops(tmp_path: Pa
                 adapter=paused_adapter(),
                 admission_profile=admission_profile,
             )
-            assert other.cancel(queued.job_id)["outcome"] == "accepted"
+            assert other.cancel(queued.job_id)["outcome"] == "requested"
             assert other.work()["status"] == "resource_busy"
             assert other.recover()["status"] == "resource_busy"
             assert other.get_job(queued.job_id).artifact_id is None
@@ -544,7 +544,7 @@ def test_cancel_at_publication_checkpoint_prevents_logical_artifact(
     job = service.enqueue("checkpoint", request(), max_attempts=2)
     service.work()
 
-    assert canceled[0]["outcome"] == "accepted"
+    assert canceled[0]["outcome"] == "requested"
     restarted = service_at(tmp_path)
     restarted.recover()
     restarted.recover()
@@ -773,7 +773,7 @@ def test_canceled_referenced_child_preserves_parent_bytes_and_lineage(tmp_path: 
     )
     child = child_service.enqueue("child", child_request)
     child_service.work()
-    assert canceled[0]["outcome"] == "accepted"
+    assert canceled[0]["outcome"] == "requested"
     service_at(tmp_path).recover()
 
     current = service_at(tmp_path)

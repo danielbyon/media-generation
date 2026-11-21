@@ -2132,7 +2132,7 @@ def test_running_cancel_expired_lease_and_stale_owner_keep_reserved_admission(
             assert entered.wait(5)
             attempt = service._store.current_attempt(job.job_id)
             assert attempt is not None
-            assert service.cancel(job.job_id)["outcome"] == "accepted"
+            assert service.cancel(job.job_id)["outcome"] == "requested"
             admitted = admission_record(service, job.job_id)
             reserved = service._store.resource_snapshot()
             assert admitted.decision == "reserved"

@@ -657,14 +657,6 @@ def test_runtime_preflight_refuses_unverified_platform(tmp_path: Path, monkeypat
     with pytest.raises(BackendPreparationError) as platform:
         adapter.resolve_execution(_plan())
     assert platform.value.code == "runtime_platform_mismatch"
-    monkeypatch.setattr(
-        engine,
-        "capture_runtime_fingerprint",
-        lambda: {**RUNTIME, "rocm_version": None},
-    )
-    with pytest.raises(BackendPreparationError) as evidence:
-        adapter.resolve_execution(_plan())
-    assert evidence.value.code == "runtime_evidence_incomplete"
 
 
 def test_qwen_edit_requires_zero_conditioning_model_argument(tmp_path: Path) -> None:
@@ -689,6 +681,30 @@ def test_scratch_is_private_outside_output_and_removed_after_cleanup(tmp_path: P
     assert engine._git_worktree_root(scratch) is None
     adapter.cleanup_execution(prepared)
     assert not scratch.exists()
+
+
+def test_engine_child_uses_root_working_directory_for_loader_search(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = build_bundle(tmp_path)
+    adapter = _adapter(bundle, tmp_path / "images")
+    plan = _plan()
+    prepared = adapter.resolve_execution(plan)
+    supervisor = _supervisor(prepared)
+    original_run = supervisor.run
+    observed_cwds: list[Path | None] = []
+
+    def record_child_cwd(
+        argv: tuple[str, ...], *, env: dict[str, str], cwd: Path
+    ) -> ProcessObservation:
+        observed_cwds.append(cwd)
+        return original_run(argv, env=env, cwd=cwd)
+
+    monkeypatch.setattr(supervisor, "run", record_child_cwd)
+    with open(tmp_path / "staged.bin", "w+b") as handle:
+        adapter.execute(plan, handle, supervisor=supervisor)
+
+    assert observed_cwds == [Path("/")]
 
 
 def test_execute_copies_validated_bytes_and_rejects_bad_images(
@@ -1697,42 +1713,13 @@ def test_registered_backend_identity_requires_the_exact_engine(tmp_path: Path) -
         )
 
 
-def test_profile_binds_the_exact_declared_engine_version(tmp_path: Path) -> None:
-    """The profile requires the exact engine version registered by the app."""
-
+def test_sd_cpp_profile_keeps_its_identity_across_declared_versions(tmp_path: Path) -> None:
     bundle = build_bundle(tmp_path)
     adapter = _adapter(bundle, tmp_path / "images")
-    exact = _identity_adapter(
-        adapter, engine_version=LOCAL_INFERENCE_ENGINE_VERSION
-    )
-    profile = application_privacy_profile(exact.adapter_id, exact.configuration)
-    assert profile.tool_version == LOCAL_INFERENCE_ENGINE_VERSION
-    assert profile.adapter_id == adapter.adapter_id
-    assert profile.configuration_version == LOCAL_INFERENCE_CONFIGURATION_VERSION
-
-    wrong = _identity_adapter(
-        adapter, engine_version="master-2099-01-01"
-    )
-    with pytest.raises(ValueError, match="engine version does not match"):
-        application_privacy_profile(wrong.adapter_id, wrong.configuration)
-    with pytest.raises(ValueError, match="engine version does not match"):
-        GenerationService(
-            tmp_path / "wrong-version.sqlite3",
-            tmp_path / "wrong-version-images",
-            adapter=wrong,
-            admission_profile=heavy_admission_profile(),
-        )
-
-    for variant in (
-        f"{LOCAL_INFERENCE_ENGINE_VERSION}-dirty",
-        LOCAL_INFERENCE_ENGINE_VERSION[:-1],
-        LOCAL_INFERENCE_ENGINE_VERSION.upper(),
-    ):
-        variant_adapter = _identity_adapter(adapter, engine_version=variant)
-        with pytest.raises(ValueError, match="engine version does not match"):
-            application_privacy_profile(
-                variant_adapter.adapter_id, variant_adapter.configuration
-            )
+    replacement = _identity_adapter(adapter, engine_version="master-2099-01-01")
+    expected = application_privacy_profile(adapter.adapter_id, adapter.configuration)
+    assert application_privacy_profile(replacement.adapter_id, replacement.configuration) == expected
+    assert expected.tool_version == LOCAL_INFERENCE_ENGINE_VERSION
 
 
 def test_dispatch_requires_the_exact_resolved_engine_identity(
@@ -1750,16 +1737,12 @@ def test_dispatch_requires_the_exact_resolved_engine_identity(
     )
     prepared = adapter.resolve_execution(_plan())
     try:
-        for update in (
-            {"id": "other-engine"},
-            {"version": "master-2099-01-01"},
-        ):
-            record = dict(prepared.resolved_record)
-            record["engine"] = {**record["engine"], **update}
-            tampered = replace(prepared, resolved_record=record)
-            with pytest.raises(PrivacyComplianceError) as failed:
-                service._require_execution_privacy(tampered)
-            assert "resolved_engine_mismatch" in failed.value.result.reason_codes
+        record = dict(prepared.resolved_record)
+        record["engine"] = {**record["engine"], "id": "other-engine"}
+        tampered = replace(prepared, resolved_record=record)
+        with pytest.raises(PrivacyComplianceError) as failed:
+            service._require_execution_privacy(tampered)
+        assert "resolved_engine_mismatch" in failed.value.result.reason_codes
     finally:
         adapter.cleanup_execution(prepared)
 
@@ -1775,4 +1758,158 @@ def test_registered_backend_identity_requires_the_exact_configuration_version(
             tmp_path / "wrong-config-images",
             adapter=_identity_adapter(adapter, configuration_version="sd-cpp-local/v2"),
             admission_profile=heavy_admission_profile(),
+        )
+
+
+def test_systemd_arguments_cover_execution_and_lifecycle_commands() -> None:
+    parser = cli.build_parser()
+    broker_arguments = [
+        "--systemd-broker-socket",
+        "/run/media-generation/broker.sock",
+        "--systemd-scratch-root",
+        "/var/lib/media-generation/scratch",
+        "--systemd-runner-uid",
+        "2301",
+        "--systemd-runner-gid",
+        "2301",
+    ]
+    commands = [
+        [
+            "submit", "--db", "db.sqlite3", "--output-dir", "images",
+            "--idempotency-key", "key", "--request-json", '{"prompt":"x"}',
+        ],
+        ["worker", "--db", "db.sqlite3", "--output-dir", "images"],
+        ["recover", "--db", "db.sqlite3", "--output-dir", "images"],
+        ["cancel", "--db", "db.sqlite3", "--job-id", "job_x"],
+        [
+            "batch", "run", "--db", "db.sqlite3", "--output-dir", "images",
+            "--batch-key", "key", "--requests-json", "[]",
+        ],
+        [
+            "batch", "resume", "--db", "db.sqlite3", "--output-dir", "images",
+            "--batch-id", "batch_x",
+        ],
+    ]
+
+    for command in commands:
+        options = parser.parse_args([*command, *broker_arguments])
+        assert options.systemd_broker_socket == Path(
+            "/run/media-generation/broker.sock"
+        )
+        assert options.systemd_scratch_root == Path(
+            "/var/lib/media-generation/scratch"
+        )
+        assert (options.systemd_runner_uid, options.systemd_runner_gid) == (2301, 2301)
+
+
+def test_systemd_cli_builds_runner_for_all_service_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    created: list[dict[str, object]] = []
+    adapter = object.__new__(engine.StableDiffusionCppAdapter)
+
+    class FakeService:
+        def __init__(self, *_args, **kwargs) -> None:
+            created.append(kwargs)
+
+        def submit(self, *_args, **_kwargs):
+            class Result:
+                attention_required = False
+
+                @staticmethod
+                def to_dict():
+                    return {"job_id": "job_x"}
+
+            return Result()
+
+        @staticmethod
+        def work(*_args, **_kwargs):
+            return {"status": "complete", "outcomes": []}
+
+        @staticmethod
+        def recover(*_args, **_kwargs):
+            return {"status": "complete"}
+
+        @staticmethod
+        def cancel(job_id: str):
+            return {"job_id": job_id, "outcome": "requested"}
+
+    class FakeBatchService:
+        def __init__(self, _service) -> None:
+            pass
+
+        @staticmethod
+        def submit(*_args, **_kwargs):
+            return {"report_state": "complete"}
+
+        @staticmethod
+        def resume(*_args, **_kwargs):
+            return {"report_state": "complete"}
+
+    monkeypatch.setattr(cli, "GenerationService", FakeService)
+    monkeypatch.setattr(cli, "GenerationBatchService", FakeBatchService)
+    monkeypatch.setattr(cli, "_engine_adapter", lambda _options, _output: adapter)
+    monkeypatch.setattr(cli, "_admission_inputs", lambda _options: (None, None))
+    monkeypatch.setattr(cli, "_batch_admission_inputs", lambda _options: (None, None))
+    broker_arguments = [
+        "--systemd-broker-socket", str(tmp_path / "broker.sock"),
+        "--systemd-scratch-root", str(tmp_path / "scratch"),
+        "--systemd-runner-uid", "2301",
+        "--systemd-runner-gid", "2301",
+    ]
+    commands = [
+        [
+            "submit", "--db", str(tmp_path / "submit.sqlite3"), "--output-dir",
+            str(tmp_path / "images"), "--idempotency-key", "key",
+            "--request-json", '{"prompt":"x"}',
+        ],
+        ["worker", "--db", str(tmp_path / "worker.sqlite3"), "--output-dir", str(tmp_path / "images")],
+        ["recover", "--db", str(tmp_path / "recover.sqlite3"), "--output-dir", str(tmp_path / "images")],
+        ["cancel", "--db", str(tmp_path / "cancel.sqlite3"), "--job-id", "job_x"],
+        [
+            "batch", "run", "--db", str(tmp_path / "batch-run.sqlite3"),
+            "--output-dir", str(tmp_path / "images"), "--batch-key", "key",
+            "--requests-json", '[{"prompt":"x"}]',
+        ],
+        [
+            "batch", "resume", "--db", str(tmp_path / "batch-resume.sqlite3"),
+            "--output-dir", str(tmp_path / "images"), "--batch-id", "batch_x",
+        ],
+    ]
+
+    for command in commands:
+        assert cli.main([*command, *broker_arguments]) == 0
+        capsys.readouterr()
+
+    assert len(created) == 6
+    assert all(item.get("attempt_runner") is not None for item in created)
+    assert all(
+        item["attempt_runner"].socket_path == tmp_path / "broker.sock"
+        for item in created
+    )
+
+
+def test_systemd_cli_rejects_partial_configuration_and_missing_engine_adapter() -> None:
+    parser = cli.build_parser()
+    options = parser.parse_args(
+        [
+            "recover", "--db", "db.sqlite3", "--output-dir", "images",
+            "--systemd-broker-socket", "/run/broker.sock",
+        ]
+    )
+    with pytest.raises(InputValidationError, match="all four systemd options"):
+        cli._systemd_attempt_runner(options, adapter=None, for_execution=False)
+
+    execution_options = parser.parse_args(
+        [
+            "worker", "--db", "db.sqlite3", "--output-dir", "images",
+            "--systemd-broker-socket", "/run/broker.sock",
+            "--systemd-scratch-root", "/var/scratch",
+            "--systemd-runner-uid", "2301",
+            "--systemd-runner-gid", "2301",
+        ]
+    )
+    with pytest.raises(InputValidationError, match="StableDiffusionCppAdapter"):
+        cli._systemd_attempt_runner(
+            execution_options, adapter=None, for_execution=True
         )

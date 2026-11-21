@@ -77,7 +77,7 @@ ZERO_CONDITIONING_FLAG = "qwen_image_zero_cond_t"
 MAX_MODEL_ARGS = 8
 OUTPUT_BASENAME = "output.png"
 VERIFICATION_WINDOW_STATEMENT = (
-    "The application hashed every pinned executable, declared component, "
+    "The application observed the selected executable and hashed declared components, "
     "recipe, and evidence file before launch. The engine opens those paths "
     "itself after launch and may observe different bytes, so this record does "
     "not claim the engine loaded the hashed bytes."
@@ -202,6 +202,8 @@ class ResolvedExecution:
     resolved_record: Mapping[str, object]
     width: int
     height: int
+    owns_scratch: bool = True
+    executable_sha256: str | None = None
 
 
 def _invalid(detail: str) -> None:
@@ -676,9 +678,8 @@ def _static_configuration(candidate: EngineCandidate) -> dict[str, object]:
     Timestamps, absolute paths, verification observation identity, and values
     derived by hashing the configuration itself are excluded so independent
     submissions and workers compare the same candidate selections.
-    The executable pin and required operation roles are retained so dispatch
-    can compare an adapter resolution with the selected candidate without
-    repeating the T07 file hashing pass.
+    The original executable metadata stays in the selection for queued jobs.
+    Dispatch records the currently installed executable in the attempt instead.
     """
     declaration = candidate.declaration
     return {
@@ -864,16 +865,11 @@ def _environment_record(environment: Mapping[str, str]) -> dict[str, object]:
 
 
 def _validate_runtime(runtime: Mapping[str, object]) -> None:
-    """Refuse dispatch unless the declared ROCm runtime markers are readable."""
+    """Require Linux for the native ROCm invocation."""
     if runtime.get("platform") != "linux":
         raise BackendPreparationError(
             "runtime_platform_mismatch",
-            "the pinned engine requires a Linux ROCm host",
-        )
-    if not runtime.get("rocm_version") or not runtime.get("amdgpu_version"):
-        raise BackendPreparationError(
-            "runtime_evidence_incomplete",
-            "ROCm and amdgpu version markers are required before dispatch",
+            "the engine requires a Linux ROCm host",
         )
 
 
@@ -1020,13 +1016,29 @@ class StableDiffusionCppAdapter:
 
         return _static_configuration(self._candidate)
 
-    def resolve_execution(self, plan: GenerationPlan) -> ResolvedExecution:
+    @property
+    def selected_executable(self) -> Path:
+        """Return the full executable path from the admitted candidate selection."""
+        declaration = self._candidate.declaration
+        return declaration.engine.executable.resolved_path(declaration.root_index)
+
+    def observed_executable_digest(self, attempt_id: str) -> str | None:
+        """Return the executable digest captured during this pending resolution."""
+        with self._resolved_lock:
+            resolved = self._resolved.get(attempt_id)
+        return None if resolved is None else resolved.executable_sha256
+
+    def resolve_execution(
+        self,
+        plan: GenerationPlan,
+        *,
+        scratch_directory: Path | None = None,
+    ) -> ResolvedExecution:
         """Re-evaluate the candidate and return one immutable pre-dispatch plan.
 
-        Every pinned declaration, recipe, component, and trusted evidence file is
-        read again through the T07 evaluator. The fresh verification identity is
-        retained only in the attempt-scoped resolved record; it never enters the
-        restart-stable adapter configuration used to match queued candidates.
+        Recheck the recipe, model components, and trusted evidence. Record the
+        installed executable and the fresh verification identity on this
+        attempt. Queued jobs still match the original candidate configuration.
         """
         if not isinstance(plan, GenerationPlan):
             raise ValueError("plan must be a GenerationPlan")
@@ -1041,6 +1053,8 @@ class StableDiffusionCppAdapter:
         evaluation = evaluate_candidate(
             candidate.declaration,
             trusted_evidence=candidate.trusted_evidence,
+            selected_backend_kind=BACKEND_KIND,
+            observe_installed_engine=True,
         )
         if evaluation.status != READY:
             raise BackendPreparationError(
@@ -1057,6 +1071,9 @@ class StableDiffusionCppAdapter:
                 "bundle_corrupt",
                 "candidate evaluation identity changed during execution resolution",
             )
+        executable_digest = evaluation.observations["engine.executable"].sha256
+        if executable_digest is None:
+            raise BackendPreparationError("bundle_unverified", "engine bytes could not be observed")
         declaration = candidate.declaration
         operation_name, operation = _select_operation(candidate.recipe, plan)
         if declaration.adapters:
@@ -1069,7 +1086,28 @@ class StableDiffusionCppAdapter:
         runtime = capture_runtime_fingerprint()
         _validate_runtime(runtime)
 
-        scratch = _create_scratch(self._output_directory)
+        owns_scratch = scratch_directory is None
+        scratch = (
+            _create_scratch(self._output_directory)
+            if owns_scratch
+            else Path(scratch_directory).absolute()
+        )
+        scratch_parent = scratch.parent
+        scratch_available = (
+            scratch.is_dir()
+            if scratch.exists()
+            else scratch_parent.is_dir() and not scratch_parent.is_symlink()
+        )
+        if not owns_scratch and (
+            not scratch_available
+            or scratch.is_symlink()
+            or scratch.is_relative_to(self._output_directory)
+            or _git_worktree_root(scratch)
+        ):
+            raise BackendPreparationError(
+                "runtime_evidence_incomplete",
+                "broker scratch path is unavailable or outside its private root",
+            )
         try:
             output_path = scratch / OUTPUT_BASENAME
             argv, components = _build_invocation(
@@ -1087,9 +1125,9 @@ class StableDiffusionCppAdapter:
                 "declaration_sha256": declaration.declaration_sha256,
                 "engine": {
                     "id": declaration.engine.id,
-                    "version": declaration.engine.version,
-                    "build": declaration.engine.build,
-                    "executable_sha256": declaration.engine.executable.sha256,
+                    "version": "unobserved",
+                    "build": "unobserved",
+                    "executable_sha256": executable_digest,
                 },
                 "recipe": {
                     "id": declaration.recipe.id,
@@ -1138,6 +1176,8 @@ class StableDiffusionCppAdapter:
                 resolved_record=record,
                 width=plan.width,
                 height=plan.height,
+                owns_scratch=owns_scratch,
+                executable_sha256=executable_digest,
             )
             with self._resolved_lock:
                 if plan.attempt_id in self._resolved:
@@ -1148,7 +1188,8 @@ class StableDiffusionCppAdapter:
                 self._resolved[plan.attempt_id] = resolved
             return resolved
         except BaseException:
-            shutil.rmtree(scratch, ignore_errors=True)
+            if owns_scratch:
+                shutil.rmtree(scratch, ignore_errors=True)
             raise
 
     def execute(
@@ -1188,7 +1229,9 @@ class StableDiffusionCppAdapter:
             process_observation = supervisor.run(
                 resolved.argv,
                 env=resolved.environment,
-                cwd=resolved.scratch_directory,
+                # An empty ELF RUNPATH component searches the process CWD.
+                # Keep that search outside the writable attempt scratch.
+                cwd=Path("/"),
             )
             if (
                 process_observation.exit_code != 0
@@ -1204,7 +1247,11 @@ class StableDiffusionCppAdapter:
             self._remove_scratch(resolved.scratch_directory)
 
     def _stream_execution(
-        self, resolved: ResolvedExecution, staged: BinaryIO
+        self,
+        resolved: ResolvedExecution,
+        staged: BinaryIO,
+        *,
+        source: BinaryIO | None = None,
     ) -> ImageMetadata:
         """Validate the scratch image and stream it into the publisher's stream.
 
@@ -1215,13 +1262,10 @@ class StableDiffusionCppAdapter:
         """
         output_path = Path(resolved.output_path)
         try:
-            with open_regular(output_path) as source:
-                info = validate_image(source)
-                if (info.width, info.height) != (resolved.width, resolved.height):
-                    raise GenerationError(
-                        "declared engine wrote an image with unexpected dimensions"
-                    )
-                copy_source(source, staged)
+            if source is None:
+                with open_regular(output_path) as opened:
+                    return self._validate_and_copy(resolved, opened, staged)
+            return self._validate_and_copy(resolved, source, staged)
         except FileNotFoundError as error:
             raise GenerationError(
                 "declared engine did not write its declared output file"
@@ -1230,7 +1274,40 @@ class StableDiffusionCppAdapter:
             raise GenerationError(
                 "declared engine output failed image validation"
             ) from error
+
+    @staticmethod
+    def _validate_and_copy(
+        resolved: ResolvedExecution,
+        source: BinaryIO,
+        staged: BinaryIO,
+    ) -> ImageMetadata:
+        """Validate one pinned regular output and copy it to the existing stage."""
+        source.seek(0)
+        info = validate_image(source)
+        if (info.width, info.height) != (resolved.width, resolved.height):
+            raise GenerationError(
+                "declared engine wrote an image with unexpected dimensions"
+            )
+        source.seek(0)
+        copy_source(source, staged)
         return ImageMetadata(info.media_type, info.image_format, info.width, info.height)
+
+    def stream_systemd_execution(
+        self,
+        resolved: ResolvedExecution,
+        staged: BinaryIO,
+        source: BinaryIO,
+    ) -> ImageMetadata:
+        """Validate broker-pinned output after whole-cgroup termination proof."""
+        with self._resolved_lock:
+            pending = self._resolved.pop(resolved.attempt_id, None)
+        if pending is not resolved:
+            raise GenerationError("broker output does not match the resolved attempt")
+        try:
+            return self._stream_execution(resolved, staged, source=source)
+        finally:
+            if resolved.owns_scratch:
+                self._remove_scratch(resolved.scratch_directory)
 
     def cleanup_execution(self, resolved: ResolvedExecution) -> None:
         """Remove scratch after an aborted publication or an adapter-side failure.
@@ -1243,7 +1320,8 @@ class StableDiffusionCppAdapter:
             pending = self._resolved.get(resolved.attempt_id)
             if pending is resolved:
                 self._resolved.pop(resolved.attempt_id, None)
-        self._remove_scratch(resolved.scratch_directory)
+        if resolved.owns_scratch:
+            self._remove_scratch(resolved.scratch_directory)
 
     @staticmethod
     def _remove_scratch(directory: Path) -> None:

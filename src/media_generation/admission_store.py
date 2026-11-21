@@ -27,7 +27,9 @@ _TRANSITION_SOURCES: dict[str, tuple[str, ...]] = {
     "not_required": ("reserved", "released"),
     "canceled": ("queued", "not_required", "blocked", "denied"),
     "queued": ("reserved", "released"),
-    "released": ("reserved",),
+    # A quarantine may be released only by the Store recovery path after it
+    # independently verifies termination and publication reconciliation.
+    "released": ("reserved", "quarantined"),
     "quarantined": ("reserved",),
 }
 

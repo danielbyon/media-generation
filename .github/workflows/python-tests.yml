@@ -14,30 +14,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            python-version: "3.14.4"
-          - os: ubuntu-latest
-            python-version: "3.14"
-          - os: macos-latest
-            python-version: "3.14.4"
-          - os: macos-latest
-            python-version: "3.14"
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.14"
       - name: Install package and test dependencies
-        run: make install
-      - name: Run test suite
-        run: make test
-      - name: Check installed CLI entry point
-        run: make smoke
+        run: |
+          make setup
+          make install PYTHON=./.venv/bin/python
       - name: Run aggregate validation
-        run: make check
+        run: make check PYTHON=./.venv/bin/python
       - name: Inspect cleanup plan without changing files
-        run: make clean-dry-run
-      - name: Verify installed console script directly
-        run: media-generation --help
+        run: make clean-dry-run PYTHON=./.venv/bin/python
+      - name: Check broker filesystem boundaries with real credentials
+        if: runner.os == 'Linux'
+        run: sudo "$PWD/.venv/bin/python" tests/apex_venv_permissions_root.py
