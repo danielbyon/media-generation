@@ -66,21 +66,11 @@ the result to be `unverified`. Credential-like keys and nested model-acquisition
 configuration cause `fail`. The service owns the expectation; an adapter
 cannot choose its profile or submit a pass status.
 
-For a supervised backend-execution adapter, the service selects the profile from
-an application-owned registry keyed by the exact adapter identity, engine
-identity, engine version, and configuration version. A policy object exposed by
-the adapter is ignored, so an adapter cannot widen the controls that apply to it
-and an unregistered identity is refused instead of evaluated permissively.
-
-The real-engine registration pins the engine version to
-`master-975-95b3090-2-gb13a482`. That value is the revision identity reported
-by the pinned stable-diffusion.cpp source tree through `git describe --tags`, and it
-denotes commit `b13a48219d5cdf408edcb93da6cd69b612ed03d3`. It is an opaque
-source-revision identity rather than a semantic release number. Registration
-and dispatch compare the value literally with the candidate declaration's
-`engine.version`; a different describe string, branch, or commit is a different
-engine identity and is refused. The application does not normalize versions or
-accept a prefix, range, or approximate match.
+The application owns the profile registry for supervised backends. The SD-C++
+profile requires adapter ID `stable-diffusion-cpp-local-v1`, engine ID
+`stable-diffusion.cpp`, and the supported configuration, CLI, and invocation
+contracts. The original engine version stays in SD-C++ privacy records as a
+profile label. ComfyUI also requires its signed runtime version.
 
 The result contains its schema and status, exact adapter/profile/tool/version
 identifiers, stable fingerprints, per-control redacted evidence, stable reason
@@ -185,8 +175,7 @@ The following work belongs to later real-tool integrations:
 An integration is ready for review only when the adapter publishes effective
 privacy settings, the application-owned profile covers every control, strict
 admission is enabled where local-only behavior is required, and the
-configuration and policy versions are stable. A profile applies only to the
-exact tool and configuration version it names.
+configuration and policy versions are stable. Each profile applies to the tool and configuration contract it names.
 
 For the real stable-diffusion.cpp engine the application owns the settings
 record. It scans the resolved argument vector for URL schemes and for remote,
@@ -195,9 +184,8 @@ tokens, and it records whether proxy variables or other network-enabling keys
 appear in the child environment. A prohibited token produces `fail`; an
 unrecognized flag or environment name stays `unverified` and blocks execution.
 An explicit caller-supplied policy cannot replace the application-owned profile
-that the service selects by adapter identity, engine identity, engine version,
-and configuration version. The profile evaluates the resolved argv and child
-environment.
+that the service selects for the supported SD-C++ contract. The profile
+evaluates the resolved argv and child environment.
 
 The service repeats the derivation at dispatch instead of trusting the stored
 map. It recomputes the settings from the argv and child environment it is about
@@ -205,26 +193,26 @@ to spawn, requires an exact match with the resolved record, and requires
 `pass` before it inserts evidence or starts a process. The resolved record's
 argv and environment must also match that prepared invocation.
 
-The gate also binds the resolved record to the restart-stable configuration
-persisted with the claim. Candidate identity, declaration digest, engine
-identity and executable digest, recipe identity and document digest, required
-component rows, adapters, and the CLI and invocation contracts must match that
-admission selection. The `argv[0]` path must end with the selected executable
-pin, and that one file is read again to confirm the pinned SHA-256; model and
-component files are not hashed a second time. The gate compares the reported
-component rows but does not bind the model-path values in the remaining `argv`
-entries to the corresponding component artifact pins; that path mapping remains
-inside the in-process adapter boundary. Substitutions of the candidate,
-declaration, executable build or bytes, recipe, required component rows,
-adapters, or contracts fail closed as `resolved_execution_mismatch` before
-evidence is written or a process starts. An engine identity or version
-mismatch against the application-owned registration fails earlier with the
-privacy reason `resolved_engine_mismatch`.
-The binding still consumes the configuration the adapter exposes at admission,
-so an adapter that fabricates both its configuration and its resolution remains
-an in-process trust boundary. The launch record captures the argv and child
-environment that the supervisor passed without proving that the process opened
-the same bytes the application verified after launch.
+The gate binds the recorded engine ID, candidate and declaration digests,
+recipe, component identities, adapters, and invocation contracts to the claim.
+For SD-C++, `argv[0]` must match the full selected executable path.
+`engine.executable_sha256` must equal the SHA-256 captured during resolution of
+the same attempt. The service compares it with the adapter's pending
+observation without rehashing the executable. Engine version and build are
+diagnostic fields. The trusted adapter derives model
+paths from the candidate. The service validates the component identity rows
+and exact prepared argv. It does not independently match each model-path
+argument to the corresponding component pin.
+
+A candidate or executable binding mismatch fails as
+`resolved_execution_mismatch` before the resolved record is inserted or a
+process starts. An engine ID other than `stable-diffusion.cpp` fails the SD-C++
+privacy gate with `resolved_engine_mismatch`.
+ComfyUI continues checking its independently signed version and executable
+binding.
+
+The launch record captures the argv and environment the supervisor passed.
+The process opens its own files after launch.
 
 ## ComfyUI policy
 

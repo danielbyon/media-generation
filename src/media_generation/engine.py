@@ -77,7 +77,7 @@ ZERO_CONDITIONING_FLAG = "qwen_image_zero_cond_t"
 MAX_MODEL_ARGS = 8
 OUTPUT_BASENAME = "output.png"
 VERIFICATION_WINDOW_STATEMENT = (
-    "The application hashed every pinned executable, declared component, "
+    "The application observed the selected executable and hashed declared components, "
     "recipe, and evidence file before launch. The engine opens those paths "
     "itself after launch and may observe different bytes, so this record does "
     "not claim the engine loaded the hashed bytes."
@@ -203,6 +203,7 @@ class ResolvedExecution:
     width: int
     height: int
     owns_scratch: bool = True
+    executable_sha256: str | None = None
 
 
 def _invalid(detail: str) -> None:
@@ -677,9 +678,8 @@ def _static_configuration(candidate: EngineCandidate) -> dict[str, object]:
     Timestamps, absolute paths, verification observation identity, and values
     derived by hashing the configuration itself are excluded so independent
     submissions and workers compare the same candidate selections.
-    The executable pin and required operation roles are retained so dispatch
-    can compare an adapter resolution with the selected candidate without
-    repeating the T07 file hashing pass.
+    The original executable metadata stays in the selection for queued jobs.
+    Dispatch records the currently installed executable in the attempt instead.
     """
     declaration = candidate.declaration
     return {
@@ -865,16 +865,11 @@ def _environment_record(environment: Mapping[str, str]) -> dict[str, object]:
 
 
 def _validate_runtime(runtime: Mapping[str, object]) -> None:
-    """Refuse dispatch unless the declared ROCm runtime markers are readable."""
+    """Require Linux for the native ROCm invocation."""
     if runtime.get("platform") != "linux":
         raise BackendPreparationError(
             "runtime_platform_mismatch",
-            "the pinned engine requires a Linux ROCm host",
-        )
-    if not runtime.get("rocm_version") or not runtime.get("amdgpu_version"):
-        raise BackendPreparationError(
-            "runtime_evidence_incomplete",
-            "ROCm and amdgpu version markers are required before dispatch",
+            "the engine requires a Linux ROCm host",
         )
 
 
@@ -1021,6 +1016,18 @@ class StableDiffusionCppAdapter:
 
         return _static_configuration(self._candidate)
 
+    @property
+    def selected_executable(self) -> Path:
+        """Return the full executable path from the admitted candidate selection."""
+        declaration = self._candidate.declaration
+        return declaration.engine.executable.resolved_path(declaration.root_index)
+
+    def observed_executable_digest(self, attempt_id: str) -> str | None:
+        """Return the executable digest captured during this pending resolution."""
+        with self._resolved_lock:
+            resolved = self._resolved.get(attempt_id)
+        return None if resolved is None else resolved.executable_sha256
+
     def resolve_execution(
         self,
         plan: GenerationPlan,
@@ -1029,10 +1036,9 @@ class StableDiffusionCppAdapter:
     ) -> ResolvedExecution:
         """Re-evaluate the candidate and return one immutable pre-dispatch plan.
 
-        Every pinned declaration, recipe, component, and trusted evidence file is
-        read again through the T07 evaluator. The fresh verification identity is
-        retained only in the attempt-scoped resolved record; it never enters the
-        restart-stable adapter configuration used to match queued candidates.
+        Recheck the recipe, model components, and trusted evidence. Record the
+        installed executable and the fresh verification identity on this
+        attempt. Queued jobs still match the original candidate configuration.
         """
         if not isinstance(plan, GenerationPlan):
             raise ValueError("plan must be a GenerationPlan")
@@ -1047,6 +1053,8 @@ class StableDiffusionCppAdapter:
         evaluation = evaluate_candidate(
             candidate.declaration,
             trusted_evidence=candidate.trusted_evidence,
+            selected_backend_kind=BACKEND_KIND,
+            observe_installed_engine=True,
         )
         if evaluation.status != READY:
             raise BackendPreparationError(
@@ -1063,6 +1071,9 @@ class StableDiffusionCppAdapter:
                 "bundle_corrupt",
                 "candidate evaluation identity changed during execution resolution",
             )
+        executable_digest = evaluation.observations["engine.executable"].sha256
+        if executable_digest is None:
+            raise BackendPreparationError("bundle_unverified", "engine bytes could not be observed")
         declaration = candidate.declaration
         operation_name, operation = _select_operation(candidate.recipe, plan)
         if declaration.adapters:
@@ -1114,9 +1125,9 @@ class StableDiffusionCppAdapter:
                 "declaration_sha256": declaration.declaration_sha256,
                 "engine": {
                     "id": declaration.engine.id,
-                    "version": declaration.engine.version,
-                    "build": declaration.engine.build,
-                    "executable_sha256": declaration.engine.executable.sha256,
+                    "version": "unobserved",
+                    "build": "unobserved",
+                    "executable_sha256": executable_digest,
                 },
                 "recipe": {
                     "id": declaration.recipe.id,
@@ -1166,6 +1177,7 @@ class StableDiffusionCppAdapter:
                 width=plan.width,
                 height=plan.height,
                 owns_scratch=owns_scratch,
+                executable_sha256=executable_digest,
             )
             with self._resolved_lock:
                 if plan.attempt_id in self._resolved:

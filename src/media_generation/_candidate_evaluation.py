@@ -21,6 +21,7 @@ from ._candidate_contract import (
     HASH_CHUNK_BYTES,
     INCOMPATIBLE,
     LICENSE_EVIDENCE_SCHEMA,
+    MAX_ARTIFACT_BYTES,
     MISSING,
     PROVENANCE_EVIDENCE_SCHEMA,
     READY,
@@ -140,6 +141,7 @@ class _Evaluator:
         *,
         trusted_evidence: Iterable[TrustedEvidence] = (),
         selected_backend_kind: str | None = None,
+        observe_installed_engine: bool = False,
     ) -> None:
         if (
             selected_backend_kind is not None
@@ -148,6 +150,11 @@ class _Evaluator:
             raise CandidateValidationError(
                 f"selected backend kind {selected_backend_kind!r} is unknown"
             )
+        if observe_installed_engine and (
+            selected_backend_kind != _SD_CPP_BACKEND_KIND or declaration.engine.launch is not None
+        ):
+            raise CandidateValidationError("installed engine observation requires the native SD-C++ backend")
+        self.observe_installed_engine = observe_installed_engine
         self.declaration = declaration
         self.selected_backend_kind = selected_backend_kind
         self.roots = declaration.root_index
@@ -466,7 +473,10 @@ class _Evaluator:
                     observed={"engine_id": declaration.engine.id},
                 )
             )
-        if declaration.recipe.engine_version != declaration.engine.version:
+        if (
+            not self.observe_installed_engine
+            and declaration.recipe.engine_version != declaration.engine.version
+        ):
             self.items.append(
                 StatusItem(
                     artifact="recipe.compatibility.version",
@@ -878,11 +888,28 @@ class _Evaluator:
 
     def evaluate(self) -> CandidateEvaluation:
         declaration = self.declaration
-        self._add_artifact(
-            "engine.executable",
-            declaration.engine.executable,
-            require_executable=declaration.requires_executable("engine"),
-        )
+        if self.observe_installed_engine:
+            pin = declaration.engine.executable
+            root = self.roots[pin.root].path
+            observed = _observe_file(
+                root / pin.path, root, maximum=MAX_ARTIFACT_BYTES, require_executable=True
+            )
+            self.observations["engine.executable"] = observed
+            self.items.append(
+                StatusItem(
+                    artifact="engine.executable",
+                    status=observed.status,
+                    code=observed.code,
+                    message="Observed the selected executable before dispatch.",
+                    observed=observed.to_dict(),
+                )
+            )
+        else:
+            self._add_artifact(
+                "engine.executable",
+                declaration.engine.executable,
+                require_executable=declaration.requires_executable("engine"),
+            )
         self._check_provenance(
             "engine",
             declaration.engine.provenance,
@@ -928,13 +955,14 @@ class _Evaluator:
         self._check_compatibility()
         required_claims = {
             "engine",
-            "version",
             "recipe",
             *(
                 f"role:{role}" for role in declaration.recipe.required_roles
             ),
             *(f"flag:{name}" for name, _ in declaration.recipe.architecture_flags),
         }
+        if not self.observe_installed_engine:
+            required_claims.add("version")
         if self.selected_backend_kind == _COMFYUI_BACKEND_KIND:
             required_claims.add(COMFYUI_QWEN_REFERENCE_POLICY_CLAIM)
         covered_claims = self._check_compatibility_evidence()
@@ -1215,12 +1243,14 @@ def evaluate_candidate(
     *,
     trusted_evidence: Iterable[TrustedEvidence] = (),
     selected_backend_kind: str | None = None,
+    observe_installed_engine: bool = False,
 ) -> CandidateEvaluation:
-    """Run the authoritative offline static evaluation."""
+    """Evaluate declared evidence, optionally observing the installed SD-C++ executable."""
     return _Evaluator(
         declaration,
         trusted_evidence=trusted_evidence,
         selected_backend_kind=selected_backend_kind,
+        observe_installed_engine=observe_installed_engine,
     ).evaluate()
 def inspect_candidate(
     declaration_path: Path,

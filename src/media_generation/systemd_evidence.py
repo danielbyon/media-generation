@@ -18,7 +18,7 @@ from .systemd_attempts import (
 
 
 _SCHEMA_VERSION = 1
-_TABLE_SQL = """CREATE TABLE IF NOT EXISTS systemd_attempt_evidence (
+_TABLE_SQL = """CREATE TABLE systemd_attempt_evidence (
     job_id TEXT NOT NULL,
     attempt_id TEXT NOT NULL,
     identity_json TEXT NOT NULL,
@@ -27,6 +27,15 @@ _TABLE_SQL = """CREATE TABLE IF NOT EXISTS systemd_attempt_evidence (
     termination_at TEXT,
     PRIMARY KEY (job_id, attempt_id)
 )"""
+
+
+def _require_schema_version(connection: sqlite3.Connection) -> None:
+    version = connection.execute("PRAGMA user_version").fetchone()[0]
+    if version != _SCHEMA_VERSION:
+        raise BackendEvidenceError(
+            f"systemd evidence ledger version {version} is unsupported; "
+            "preserve the ledger and inspect it before starting the broker"
+        )
 
 
 class SystemdEvidenceLedger:
@@ -66,19 +75,44 @@ class SystemdEvidenceLedger:
                 0o600,
             )
             os.close(descriptor)
-            info = self.path.lstat()
-        self._require_trusted_file(info, require_root=True)
-        with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(_TABLE_SQL)
-            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-            if version not in {0, _SCHEMA_VERSION}:
-                raise BackendEvidenceError("systemd evidence ledger version is unsupported")
-            connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
-            connection.commit()
-        if worker_gid is None:
-            os.chmod(self.path, 0o600)
+            with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(_TABLE_SQL)
+                connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                connection.commit()
         else:
+            self._require_trusted_file(info, require_root=True)
+            try:
+                with sqlite3.connect(
+                    self.path.as_uri() + "?mode=ro", uri=True
+                ) as connection:
+                    _require_schema_version(connection)
+                    columns = connection.execute(
+                        "PRAGMA table_info(systemd_attempt_evidence)"
+                    ).fetchall()
+            except sqlite3.Error as error:
+                raise BackendEvidenceError("root systemd evidence ledger is unreadable") from error
+            if [tuple(column[1:]) for column in columns] != [
+                ("job_id", "TEXT", 1, None, 1),
+                ("attempt_id", "TEXT", 1, None, 2),
+                ("identity_json", "TEXT", 1, None, 0),
+                ("identity_digest", "TEXT", 1, None, 0),
+                ("termination_json", "TEXT", 0, None, 0),
+                ("termination_at", "TEXT", 0, None, 0),
+            ]:
+                raise BackendEvidenceError(
+                    "systemd evidence ledger schema is incomplete or invalid; "
+                    "preserve the ledger and inspect it before starting the broker"
+                )
+            expected_mode = 0o600 if worker_gid is None else 0o640
+            if stat.S_IMODE(info.st_mode) != expected_mode or (
+                worker_gid is not None and info.st_gid != worker_gid
+            ):
+                raise PermissionError(
+                    "existing systemd evidence ledger has unexpected access permissions"
+                )
+            return
+        if worker_gid is not None:
             os.chown(self.path, 0, worker_gid)
             os.chmod(self.path, 0o640)
         self._require_trusted_file(self.path.lstat(), require_root=True)
@@ -99,13 +133,15 @@ class SystemdEvidenceLedger:
     def bind_identity(self, identity: AttemptUnitIdentity) -> None:
         """Pin one unit incarnation before the broker reports it to the worker."""
         self._require_root()
-        if not self.path.exists():
-            self.initialize()
         self._validate_parent()
+        self._require_trusted_file(self.path.lstat(), require_root=True)
         identity_json = backend_canonical_json(identity.to_mapping())
         digest = identity_digest(identity)
-        with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
+        with sqlite3.connect(
+            self.path.as_uri() + "?mode=rw", uri=True, timeout=30, isolation_level=None
+        ) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            _require_schema_version(connection)
             row = connection.execute(
                 """SELECT identity_json, identity_digest
                    FROM systemd_attempt_evidence WHERE job_id = ? AND attempt_id = ?""",
@@ -136,12 +172,16 @@ class SystemdEvidenceLedger:
         """Persist only a proof matching the already-pinned root identity."""
         self._require_root()
         self._validate_parent()
+        self._require_trusted_file(self.path.lstat(), require_root=True)
         if evidence.identity != identity:
             raise BackendEvidenceError("cgroup proof identity differs from broker ledger")
         identity_json = backend_canonical_json(identity.to_mapping())
         proof_json = backend_canonical_json(evidence.to_mapping())
-        with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
+        with sqlite3.connect(
+            self.path.as_uri() + "?mode=rw", uri=True, timeout=30, isolation_level=None
+        ) as connection:
             connection.execute("BEGIN IMMEDIATE")
+            _require_schema_version(connection)
             row = connection.execute(
                 """SELECT identity_json, identity_digest, termination_json
                    FROM systemd_attempt_evidence WHERE job_id = ? AND attempt_id = ?""",
@@ -179,7 +219,9 @@ class SystemdEvidenceLedger:
         ledger_identity = self._decode_identity(
             row[0], row[1], identity.job_id, identity.attempt_id
         )
-        if ledger_identity != identity or row[2] is None:
+        if ledger_identity != identity:
+            raise BackendEvidenceError("root evidence ledger names another invocation")
+        if row[2] is None:
             return None
         try:
             proof = CgroupTerminationEvidence.from_mapping(json.loads(row[2]))
@@ -201,6 +243,7 @@ class SystemdEvidenceLedger:
         uri = self.path.as_uri() + "?mode=ro"
         try:
             with sqlite3.connect(uri, uri=True, timeout=30) as connection:
+                _require_schema_version(connection)
                 row = connection.execute(
                     """SELECT identity_json, identity_digest, termination_json
                        FROM systemd_attempt_evidence WHERE job_id = ? AND attempt_id = ?""",

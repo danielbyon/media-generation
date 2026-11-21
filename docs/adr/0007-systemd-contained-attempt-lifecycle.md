@@ -81,6 +81,17 @@ job database, resource-release checks accept containment and termination
 facts only when they match the root-owned ledger. A missing ledger record or a
 mismatch is not termination proof.
 
+The broker initializes the core v1 ledger before accepting work. An unsupported
+or incomplete existing ledger blocks startup and stays available for inspection.
+The job database remains schema v9.
+
+The owner maintains the SD-C++ installation and updates it between attempts.
+The broker verifies private runtime permissions at startup. SD-C++ records the
+selected executable in resolved record v2, while declaration metadata preserves
+the original selection. The GNU OpenMP search order is deployment configuration
+and readiness evidence. Process and cgroup evidence govern completion and
+resource release.
+
 An existing user manager was not selected because APEX has not been qualified
 to provide the required system-service identity, GPU device allowlist, cgroup
 policy, and durable unit lifecycle. The root broker keeps those controls in

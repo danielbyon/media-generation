@@ -657,14 +657,6 @@ def test_runtime_preflight_refuses_unverified_platform(tmp_path: Path, monkeypat
     with pytest.raises(BackendPreparationError) as platform:
         adapter.resolve_execution(_plan())
     assert platform.value.code == "runtime_platform_mismatch"
-    monkeypatch.setattr(
-        engine,
-        "capture_runtime_fingerprint",
-        lambda: {**RUNTIME, "rocm_version": None},
-    )
-    with pytest.raises(BackendPreparationError) as evidence:
-        adapter.resolve_execution(_plan())
-    assert evidence.value.code == "runtime_evidence_incomplete"
 
 
 def test_qwen_edit_requires_zero_conditioning_model_argument(tmp_path: Path) -> None:
@@ -1721,42 +1713,13 @@ def test_registered_backend_identity_requires_the_exact_engine(tmp_path: Path) -
         )
 
 
-def test_profile_binds_the_exact_declared_engine_version(tmp_path: Path) -> None:
-    """The profile requires the exact engine version registered by the app."""
-
+def test_sd_cpp_profile_keeps_its_identity_across_declared_versions(tmp_path: Path) -> None:
     bundle = build_bundle(tmp_path)
     adapter = _adapter(bundle, tmp_path / "images")
-    exact = _identity_adapter(
-        adapter, engine_version=LOCAL_INFERENCE_ENGINE_VERSION
-    )
-    profile = application_privacy_profile(exact.adapter_id, exact.configuration)
-    assert profile.tool_version == LOCAL_INFERENCE_ENGINE_VERSION
-    assert profile.adapter_id == adapter.adapter_id
-    assert profile.configuration_version == LOCAL_INFERENCE_CONFIGURATION_VERSION
-
-    wrong = _identity_adapter(
-        adapter, engine_version="master-2099-01-01"
-    )
-    with pytest.raises(ValueError, match="engine version does not match"):
-        application_privacy_profile(wrong.adapter_id, wrong.configuration)
-    with pytest.raises(ValueError, match="engine version does not match"):
-        GenerationService(
-            tmp_path / "wrong-version.sqlite3",
-            tmp_path / "wrong-version-images",
-            adapter=wrong,
-            admission_profile=heavy_admission_profile(),
-        )
-
-    for variant in (
-        f"{LOCAL_INFERENCE_ENGINE_VERSION}-dirty",
-        LOCAL_INFERENCE_ENGINE_VERSION[:-1],
-        LOCAL_INFERENCE_ENGINE_VERSION.upper(),
-    ):
-        variant_adapter = _identity_adapter(adapter, engine_version=variant)
-        with pytest.raises(ValueError, match="engine version does not match"):
-            application_privacy_profile(
-                variant_adapter.adapter_id, variant_adapter.configuration
-            )
+    replacement = _identity_adapter(adapter, engine_version="master-2099-01-01")
+    expected = application_privacy_profile(adapter.adapter_id, adapter.configuration)
+    assert application_privacy_profile(replacement.adapter_id, replacement.configuration) == expected
+    assert expected.tool_version == LOCAL_INFERENCE_ENGINE_VERSION
 
 
 def test_dispatch_requires_the_exact_resolved_engine_identity(
@@ -1774,16 +1737,12 @@ def test_dispatch_requires_the_exact_resolved_engine_identity(
     )
     prepared = adapter.resolve_execution(_plan())
     try:
-        for update in (
-            {"id": "other-engine"},
-            {"version": "master-2099-01-01"},
-        ):
-            record = dict(prepared.resolved_record)
-            record["engine"] = {**record["engine"], **update}
-            tampered = replace(prepared, resolved_record=record)
-            with pytest.raises(PrivacyComplianceError) as failed:
-                service._require_execution_privacy(tampered)
-            assert "resolved_engine_mismatch" in failed.value.result.reason_codes
+        record = dict(prepared.resolved_record)
+        record["engine"] = {**record["engine"], "id": "other-engine"}
+        tampered = replace(prepared, resolved_record=record)
+        with pytest.raises(PrivacyComplianceError) as failed:
+            service._require_execution_privacy(tampered)
+        assert "resolved_engine_mismatch" in failed.value.result.reason_codes
     finally:
         adapter.cleanup_execution(prepared)
 

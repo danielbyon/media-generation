@@ -341,6 +341,7 @@ class SystemdAttemptBroker:
             raise PermissionError("systemd attempt broker must run as root")
         if not _linux_cgroup_v2():
             raise RuntimeError("systemd attempt broker requires unified cgroup v2")
+        self._validate_private_runtime()
         self._open_server_socket()
         assert self._server is not None
         while True:
@@ -1541,16 +1542,13 @@ class SystemdAttemptBroker:
             if not value or any(not entry for entry in entries):
                 raise PermissionError("engine environment search path has an empty entry")
             for entry in entries:
-                self._validate_environment_path(entry, search_variable=name)
+                self._validate_environment_path(entry)
 
         rocm_path = environment.get("ROCM_PATH")
         if rocm_path is not None:
             self._validate_environment_path(rocm_path)
-            self._validate_rocm_release_marker(Path(rocm_path))
 
-    def _validate_environment_path(
-        self, value: str, *, search_variable: str | None = None
-    ) -> None:
+    def _validate_environment_path(self, value: str) -> None:
         """Recheck one configured search directory immediately before launch."""
         path = Path(value)
         if not path.is_absolute() or str(path) != value:
@@ -1568,158 +1566,49 @@ class SystemdAttemptBroker:
         ):
             raise PermissionError("engine environment search path is not authorized")
         _require_root_directory(path)
+        _require_no_extended_posix_acl_ancestors(resolved)
         _require_directory_traversal(
             path,
             self.configuration.runner_uid,
             self.configuration.runner_groups,
             label="configured runner cannot traverse an engine environment directory",
         )
-        _require_directory_traversal(
-            path,
-            self.configuration.worker_uid,
-            self.configuration.worker_groups,
-            label="configured worker cannot traverse an engine environment directory",
-        )
-        if search_variable is not None:
-            _require_no_extended_posix_acl_ancestors(resolved)
-            self._validate_environment_search_files(path, search_variable=search_variable)
 
-    def _validate_environment_search_files(
-        self, directory: Path, *, search_variable: str
-    ) -> None:
-        """Check every loader-visible runtime file and directory before launch."""
-        if search_variable not in {"LD_LIBRARY_PATH", "PATH"}:
-            raise ValueError("unsupported engine environment search variable")
+    def _validate_private_runtime(self) -> None:
+        """Check configured private search trees before serving any attempts.
 
-        def inspect(candidate: Path, *, inspect_subdirectories: bool) -> None:
-            try:
-                info = candidate.lstat()
-            except OSError as error:
-                raise PermissionError("engine environment search file is unavailable") from error
-            is_symlink = stat.S_ISLNK(info.st_mode)
-            if is_symlink:
-                info = self._resolve_protected_environment_entry(candidate)
+        The OS owns the system command tree. Administrators replace private
+        runtime files only while dispatch is stopped and repeat this check at
+        startup. Nested directories can contain loader-selected libraries.
+        """
+        roots = set(self.configuration.environment_path_allowlist) - {Path("/usr/bin")}
+        for root in sorted(roots):
+            self._validate_environment_path(str(root))
+            if not any(parent in roots for parent in root.parents):
+                self._validate_runtime_contents(root)
+
+    def _validate_runtime_contents(self, directory: Path) -> None:
+        for entry in directory.iterdir():
+            info = entry.lstat()
+            link = stat.S_ISLNK(info.st_mode)
+            if link:
+                info = self._resolve_protected_environment_entry(entry)
             else:
-                _require_no_extended_posix_acl(candidate)
-            if stat.S_ISDIR(info.st_mode):
-                if not inspect_subdirectories:
-                    return
-                if is_symlink:
-                    raise PermissionError(
-                        "engine runtime search subdirectory symlinks are not allowed"
-                    )
-                if info.st_uid != 0:
-                    raise PermissionError(
-                        "engine runtime search directory must be root-owned"
-                    )
-                if (
-                    info.st_mode & 0o022
-                    or _mode_allows(
-                        info,
-                        self.configuration.worker_uid,
-                        self.configuration.worker_groups,
-                        write=True,
-                    )
-                    or _mode_allows(
-                        info,
-                        self.configuration.runner_uid,
-                        self.configuration.runner_groups,
-                        write=True,
-                    )
-                ):
-                    raise PermissionError(
-                        "engine runtime search directory is worker-writable"
-                    )
-                for uid, groups, label in (
-                    (
-                        self.configuration.runner_uid,
-                        self.configuration.runner_groups,
-                        "runner",
-                    ),
-                    (
-                        self.configuration.worker_uid,
-                        self.configuration.worker_groups,
-                        "worker",
-                    ),
-                ):
-                    if not _mode_allows(
-                        info, uid, groups, read=True, execute=True
-                    ):
-                        raise PermissionError(
-                            f"configured {label} cannot search an engine runtime directory"
-                        )
-                try:
-                    nested = sorted(
-                        candidate.iterdir(), key=lambda item: item.name
-                    )
-                except OSError as error:
-                    raise PermissionError(
-                        "engine runtime subdirectory cannot be inspected"
-                    ) from error
-                for item in nested:
-                    inspect(item, inspect_subdirectories=True)
-                return
-            if not stat.S_ISREG(info.st_mode):
-                raise PermissionError("engine environment search entry is not a regular file")
-            if info.st_uid != 0:
-                raise PermissionError("engine environment search file must be root-owned")
-            if (
-                info.st_mode & 0o022
-                or _mode_allows(
-                    info,
-                    self.configuration.worker_uid,
-                    self.configuration.worker_groups,
-                    write=True,
-                )
-                or _mode_allows(
-                    info,
-                    self.configuration.runner_uid,
-                    self.configuration.runner_groups,
-                    write=True,
-                )
-            ):
-                raise PermissionError(
-                    "engine environment search file is worker-writable"
-                )
-
-            if search_variable == "LD_LIBRARY_PATH":
-                if not _mode_allows(
-                    info,
-                    self.configuration.runner_uid,
-                    self.configuration.runner_groups,
-                    read=True,
-                ):
-                    raise PermissionError(
-                        "configured runner cannot read an engine runtime search file"
-                    )
-                if not _mode_allows(
-                    info,
-                    self.configuration.worker_uid,
-                    self.configuration.worker_groups,
-                    read=True,
-                ):
-                    raise PermissionError(
-                        "configured worker cannot read an engine runtime search file"
-                    )
-            elif info.st_mode & 0o111 and not _mode_allows(
+                _require_no_extended_posix_acl(entry)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise PermissionError("engine runtime entry must be root-owned and non-writable")
+            if not _mode_allows(
                 info,
                 self.configuration.runner_uid,
                 self.configuration.runner_groups,
-                execute=True,
+                read=True,
+                execute=stat.S_ISDIR(info.st_mode),
             ):
-                raise PermissionError(
-                    "configured runner cannot execute an engine PATH search file"
-                )
-
-        try:
-            candidates = sorted(directory.iterdir(), key=lambda candidate: candidate.name)
-        except OSError as error:
-            raise PermissionError("engine environment search directory cannot be inspected") from error
-        for candidate in candidates:
-            inspect(
-                candidate,
-                inspect_subdirectories=search_variable == "LD_LIBRARY_PATH",
-            )
+                raise PermissionError("configured runner cannot access an engine runtime entry")
+            if stat.S_ISDIR(info.st_mode) and not link:
+                self._validate_runtime_contents(entry)
+            elif not stat.S_ISREG(info.st_mode):
+                raise PermissionError("engine runtime entry must be a directory or regular file")
 
     def _resolve_protected_environment_entry(self, path: Path) -> os.stat_result:
         """Resolve symlinks while checking every path component for replacement."""
@@ -1772,11 +1661,6 @@ class SystemdAttemptBroker:
                     self.configuration.runner_uid,
                     self.configuration.runner_groups,
                     execute=True,
-                ) or not _mode_allows(
-                    info,
-                    self.configuration.worker_uid,
-                    self.configuration.worker_groups,
-                    execute=True,
                 ):
                     raise PermissionError(
                         "engine environment symlink target directory cannot be traversed"
@@ -1793,48 +1677,6 @@ class SystemdAttemptBroker:
             raise PermissionError(
                 "engine environment symlink target cannot be verified"
             ) from error
-
-    def _validate_rocm_release_marker(self, rocm_path: Path) -> None:
-        marker = rocm_path / ".info" / "version"
-        try:
-            _require_root_owned_ancestors(marker)
-            _require_no_extended_posix_acl_ancestors(marker)
-            info = marker.lstat()
-        except OSError as error:
-            raise PermissionError("configured ROCm release marker is unavailable") from error
-        if (
-            stat.S_ISLNK(info.st_mode)
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != 0
-            or info.st_mode & 0o022
-            or not info.st_mode & 0o444
-            or info.st_size <= 0
-            or info.st_size > 256
-        ):
-            raise PermissionError("configured ROCm release marker is unsafe or unreadable")
-        if not _mode_allows(
-            info, self.configuration.worker_uid, self.configuration.worker_groups, read=True
-        ) or not _mode_allows(
-            info, self.configuration.runner_uid, self.configuration.runner_groups, read=True
-        ):
-            raise PermissionError("configured worker or runner cannot read the ROCm marker")
-        _require_directory_traversal(
-            marker.parent,
-            self.configuration.worker_uid,
-            self.configuration.worker_groups,
-            label="configured worker cannot traverse the ROCm release marker directory",
-        )
-        _require_directory_traversal(
-            marker.parent,
-            self.configuration.runner_uid,
-            self.configuration.runner_groups,
-            label="configured runner cannot traverse the ROCm release marker directory",
-        )
-        try:
-            if not marker.read_text(encoding="utf-8").strip():
-                raise PermissionError("configured ROCm release marker is empty")
-        except (OSError, UnicodeError) as error:
-            raise PermissionError("configured ROCm release marker is unreadable") from error
 
     def _open_output(
         self,

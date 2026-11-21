@@ -141,21 +141,21 @@ def test_smoke_does_not_execute_shell_metacharacters_from_cli_override(
     assert not marker.exists()
 
 
-def test_ci_matrix_runs_each_make_gate_and_preserves_entrypoint_smoke() -> None:
+def test_ci_runs_the_aggregate_gate_once_per_platform() -> None:
     workflow = (SOURCE_ROOT / ".github" / "workflows" / "python-tests.yml").read_text(
         encoding="utf-8"
     )
 
-    for os, version in (
-        ("ubuntu-24.04", "3.14.4"),
-        ("ubuntu-latest", "3.14"),
-        ("macos-latest", "3.14.4"),
-        ("macos-latest", "3.14"),
-    ):
-        assert f'- os: {os}\n            python-version: "{version}"' in workflow
-    for command in ["make install", "make test", "make smoke", "make check", "make clean-dry-run"]:
-        assert f"run: {command}" in workflow
-    assert "media-generation --help" in workflow
+    assert "os: [ubuntu-24.04, macos-latest]" in workflow
+    assert 'python-version: "3.14"' in workflow
+    assert workflow.count("make check PYTHON=./.venv/bin/python") == 1
+    assert "make install PYTHON=./.venv/bin/python" in workflow
+    assert "make clean-dry-run PYTHON=./.venv/bin/python" in workflow
+    assert "run: make test" not in workflow
+    assert "run: make smoke" not in workflow
+    assert "media-generation --help" not in workflow
+    assert "if: runner.os == 'Linux'" in workflow
+    assert "tests/apex_venv_permissions_root.py" in workflow
 
 
 def test_cleanup_documentation_covers_operations_and_limits() -> None:

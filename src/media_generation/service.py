@@ -1263,8 +1263,7 @@ class GenerationService:
                         durable_execution = self._store.get_backend_execution(
                             claim.job_id, claim.attempt_id
                         )
-                        # A completion packet may drive success only when it
-                        # repeats the observation persisted under this claim.
+                        # Match the completion to the observation saved under this claim.
                         if (
                             durable_execution is None
                             or durable_execution.get("state") != "observed"
@@ -1288,7 +1287,9 @@ class GenerationService:
                             raise BackendEvidenceError(
                                 "broker completion has no durable whole-cgroup proof"
                             )
-                        self._verify_execution_evidence(claim, prepared_execution)
+                        self._verify_execution_evidence(
+                            claim, prepared_execution, record=durable_execution
+                        )
                         if systemd_completion.output_fd is None:
                             raise BackendEvidenceError(
                                 "systemd broker omitted the pinned output descriptor"
@@ -1530,9 +1531,8 @@ class GenerationService:
         Resolution performs the T07 evaluation and builds the resolved record.
         The record cannot be its own authority: every field that selects a
         candidate, engine, recipe, or component must match the restart-stable
-        configuration selected for the attempt. The pinned backend executable
-        must also appear at its contract-defined argv position, so an adapter
-        cannot obtain a privacy pass for a different program.
+        configuration selected for the attempt. Check the full selected
+        SD-C++ path, or the pinned executable for other adapter contracts.
         """
         record = getattr(prepared, "resolved_record", None)
         if not isinstance(record, dict):
@@ -1553,7 +1553,9 @@ class GenerationService:
             raise _resolved_execution_mismatch(
                 "resolved execution engine identity missing"
             )
-        for name in ("id", "version", "build", "executable_sha256"):
+        installed_sd_cpp = isinstance(self.adapter, StableDiffusionCppAdapter)
+        fields = ("id",) if installed_sd_cpp else ("id", "version", "build", "executable_sha256")
+        for name in fields:
             _require_selected_field(
                 record_engine, selected_engine, name, label=f"engine.{name}"
             )
@@ -1579,6 +1581,20 @@ class GenerationService:
             configuration.get("adapters"),
             label="adapters",
         )
+        if installed_sd_cpp:
+            argv = tuple(getattr(prepared, "argv", ()))
+            if not argv or argv[0] != str(self.adapter.selected_executable):
+                raise _resolved_execution_mismatch(
+                    "resolved argv[0] does not match the selected executable path"
+                )
+            digest = self.adapter.observed_executable_digest(
+                str(record.get("attempt_id"))
+            )
+            if digest is None or record_engine.get("executable_sha256") != digest:
+                raise _resolved_execution_mismatch(
+                    "resolved executable digest does not match this attempt's observation"
+                )
+            return
         self._require_selected_executable(
             record_engine,
             selected_engine,
@@ -1659,9 +1675,8 @@ class GenerationService:
         settings from the argv and environment it is about to spawn, requires
         that the record matches that recomputation, and requires the
         application-owned policy to return PASS. The profile is selected by
-        the application-owned registry from the exact adapter identity, engine
-        identity, engine version, and configuration version; a policy object
-        exposed by the adapter is never consulted. A caller-supplied policy
+        the application-owned registry using the adapter's supported contract.
+        ComfyUI also binds its signed engine version. A caller-supplied policy
         cannot relax this gate, and ``require_privacy_pass=False`` does not
         apply to backend execution adapters.
 
@@ -1776,7 +1791,10 @@ class GenerationService:
                 )
         if (
             engine.get("id") != registration.tool_id
-            or engine.get("version") != registration.tool_version
+            or (
+                not isinstance(self.adapter, StableDiffusionCppAdapter)
+                and engine.get("version") != registration.tool_version
+            )
         ):
             raise PrivacyComplianceError(
                 replace(
@@ -1817,14 +1835,21 @@ class GenerationService:
         if result.status is not PrivacyComplianceStatus.PASS:
             raise PrivacyComplianceError(result)
 
-    def _verify_execution_evidence(self, claim: ExecutionClaim, prepared: object) -> None:
+    def _verify_execution_evidence(
+        self,
+        claim: ExecutionClaim,
+        prepared: object,
+        *,
+        record: Mapping[str, object] | None = None,
+    ) -> None:
         """Reject publication unless persisted launch facts match resolution.
 
         The supervisor records the exact argv and environment it spawned. A
         mismatch with the resolved plan, a missing launch record, or a missing
         reaped-child observation fails closed before the publisher commits.
         """
-        record = self._store.get_backend_execution(claim.job_id, claim.attempt_id)
+        if record is None:
+            record = self._store.get_backend_execution(claim.job_id, claim.attempt_id)
         if record is None:
             raise BackendEvidenceError(
                 "backend execution evidence is missing after execution"

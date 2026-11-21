@@ -1217,7 +1217,7 @@ def test_runtime_fingerprint_falls_back_to_amdgpu_srcversion(
 def test_runtime_fingerprint_returns_none_when_markers_are_unreadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Missing markers stay null and still fail closed at dispatch validation."""
+    """Missing diagnostic markers stay null."""
 
     _isolate_runtime_markers(tmp_path, monkeypatch)
     monkeypatch.delenv("ROCM_PATH", raising=False)
@@ -1226,9 +1226,6 @@ def test_runtime_fingerprint_returns_none_when_markers_are_unreadable(
 
     assert runtime["rocm_version"] is None
     assert runtime["amdgpu_version"] is None
-    with pytest.raises(BackendPreparationError) as raised:
-        engine._validate_runtime({**runtime, "platform": "linux"})
-    assert raised.value.code == "runtime_evidence_incomplete"
 
 
 def test_drain_failure_kills_and_reaps_child(

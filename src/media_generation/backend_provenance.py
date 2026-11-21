@@ -429,19 +429,11 @@ def _amdgpu_version_marker() -> str | None:
 
 
 def capture_runtime_fingerprint() -> dict[str, str | None]:
-    """Return the documented read-only runtime facts used for dispatch policy.
+    """Observe the host platform and available runtime diagnostics.
 
-    Every value is read from a read-only source and may be None when the source
-    is absent. The ROCm release marker comes from ROCM_PATH/.info/version when
-    ROCM_PATH is set and that file is readable, then from
-    /opt/rocm/.info/version. The amdgpu field comes from
-    /sys/module/amdgpu/version when readable, then from
-    /sys/module/amdgpu/srcversion, which is an opaque loaded-module build
-    identifier rather than a semantic driver version. The field name and record
-    schema stay unchanged for the srcversion fallback.
-
-    A caller must not treat None as evidence of a capable runtime; the engine
-    module refuses ROCm execution when the version markers are missing.
+    ROCm uses the first readable marker under ROCM_PATH or /opt/rocm. The
+    amdgpu marker can be an opaque module srcversion. Unavailable observations
+    stay None. Engine and device behavior establish runtime compatibility.
     """
 
     rocm_path = os.environ.get("ROCM_PATH") or None

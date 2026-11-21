@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import io
 import json
 import os
@@ -1979,17 +1980,17 @@ def test_engine_and_model_paths_require_read_access_for_the_worker_group(
 
 
 @pytest.mark.parametrize(
-    ("worker_groups", "expected_to_pass"),
+    ("runner_groups", "expected_to_pass"),
     [
-        (frozenset({2300}), False),
-        (frozenset({2300, 2303}), True),
+        (frozenset({2301}), False),
+        (frozenset({2301, 2303}), True),
     ],
-    ids=["worker-missing-read-group", "worker-read-group"],
+    ids=["runner-missing-read-group", "runner-read-group"],
 )
-def test_runtime_path_requires_traversal_for_both_service_identities(
+def test_runtime_path_requires_runner_traversal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    worker_groups: frozenset[int],
+    runner_groups: frozenset[int],
     expected_to_pass: bool,
 ) -> None:
     runtime = tmp_path / "rocm-runtime"
@@ -1999,9 +2000,7 @@ def test_runtime_path_requires_traversal_for_both_service_identities(
     broker.configuration = SimpleNamespace(
         environment_path_allowlist=(runtime,),
         runner_uid=2301,
-        runner_groups=frozenset({2301, model_read_gid}),
-        worker_uid=2300,
-        worker_groups=worker_groups,
+        runner_groups=runner_groups,
         model_read_gid=model_read_gid,
     )
     directory_info = os.stat_result(
@@ -2020,7 +2019,7 @@ def test_runtime_path_requires_traversal_for_both_service_identities(
     if expected_to_pass:
         broker._validate_environment_path(str(runtime))
     else:
-        with pytest.raises(PermissionError, match="worker"):
+        with pytest.raises(PermissionError, match="runner"):
             broker._validate_environment_path(str(runtime))
 
 
@@ -2035,79 +2034,6 @@ def test_broker_accepts_public_search_path_for_both_service_identities() -> None
     )
 
     broker._validate_environment_path("/usr/bin")
-
-
-@pytest.mark.parametrize(
-    ("directory_mode", "expected_to_pass"),
-    [(0o700, False), (0o2750, True)],
-    ids=["marker-directory-inaccessible", "marker-directory-readable"],
-)
-def test_rocm_marker_requires_service_group_traversal(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    directory_mode: int,
-    expected_to_pass: bool,
-) -> None:
-    rocm_path = tmp_path / "rocm"
-    marker = rocm_path / ".info" / "version"
-    marker.parent.mkdir(parents=True)
-    marker.write_text("10.1.0\n", encoding="utf-8")
-    model_read_gid = 2303
-    worker = SimpleNamespace(pw_name="generation-worker", pw_gid=2300)
-    broker = object.__new__(SystemdAttemptBroker)
-    broker.configuration = SimpleNamespace(
-        worker_uid=2300,
-        worker_gid=2300,
-        worker_groups=frozenset({2300, model_read_gid}),
-        runner_uid=2301,
-        runner_groups=frozenset({2301, model_read_gid}),
-        model_read_gid=model_read_gid,
-    )
-    directory_info = os.stat_result(
-        (
-            stat.S_IFDIR | directory_mode,
-            1,
-            1,
-            1,
-            0,
-            model_read_gid if directory_mode == 0o2750 else 0,
-            0,
-            0,
-            0,
-            0,
-        )
-    )
-    marker_info = os.stat_result(
-        (stat.S_IFREG | 0o640, 2, 1, 1, 0, model_read_gid, 7, 0, 0, 0)
-    )
-    original_lstat = Path.lstat
-    original_stat = Path.stat
-
-    def fake_lstat(path: Path):
-        if path == marker:
-            return marker_info
-        return original_lstat(path)
-
-    def fake_stat(path: Path, *, follow_symlinks: bool = True):
-        if os.path.isdir(path):
-            return directory_info
-        return original_stat(path, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(Path, "lstat", fake_lstat)
-    monkeypatch.setattr(Path, "stat", fake_stat)
-    monkeypatch.setattr(broker_module, "_require_root_owned_ancestors", lambda _path: None)
-    monkeypatch.setattr(broker_module.pwd, "getpwuid", lambda _uid: worker)
-    monkeypatch.setattr(
-        broker_module.os,
-        "getgrouplist",
-        lambda _name, primary_gid: [primary_gid, model_read_gid],
-    )
-
-    if expected_to_pass:
-        broker._validate_rocm_release_marker(rocm_path)
-    else:
-        with pytest.raises(PermissionError, match="worker"):
-            broker._validate_rocm_release_marker(rocm_path)
 
 
 @pytest.mark.parametrize("component_flag", ["--llm", "--llm_vision"])
@@ -3022,35 +2948,13 @@ def test_broker_accepts_configured_environment_search_paths(
         runner_uid=2301,
         runner_groups=frozenset({2301, 2303}),
         worker_uid=2300,
-        worker_groups=frozenset({2300, 2303}),
+        worker_groups=frozenset({2300}),
     )
     monkeypatch.setattr(broker_module, "_require_root_directory", lambda _path: None)
     monkeypatch.setattr(
         broker_module, "_require_directory_traversal", lambda *_args, **_kwargs: None
     )
-    original_stat = Path.stat
-    protected_directories = {
-        library_directory / "glibc-hwcaps",
-        optimized_directory,
-    }
-
-    def fake_stat(path: Path, *, follow_symlinks: bool = True) -> os.stat_result:
-        info = original_stat(path, follow_symlinks=follow_symlinks)
-        if path in protected_directories:
-            fields = list(info)
-            fields[0] = stat.S_IFDIR | 0o2750
-            fields[4] = 0
-            fields[5] = 2303
-            return os.stat_result(fields)
-        file_modes = {library: 0o640, optimized_library: 0o640, binary: 0o750}
-        if path in file_modes:
-            fields = list(info)
-            fields[0] = stat.S_IFREG | file_modes[path]
-            fields[4] = 0
-            fields[5] = 2303
-            return os.stat_result(fields)
-        return info
-
+    protected_directories = {library_directory / "glibc-hwcaps", optimized_directory}
     original_lstat = Path.lstat
 
     def fake_lstat(path: Path) -> os.stat_result:
@@ -3070,8 +2974,13 @@ def test_broker_accepts_configured_environment_search_paths(
             return os.stat_result(fields)
         return info
 
-    monkeypatch.setattr(Path, "stat", fake_stat)
     monkeypatch.setattr(Path, "lstat", fake_lstat)
+    broker._validate_private_runtime()
+    monkeypatch.setattr(
+        Path,
+        "iterdir",
+        lambda _path: pytest.fail("dispatch must not enumerate runtime files"),
+    )
     broker._validate_engine_environment(
         {"LD_LIBRARY_PATH": str(library_directory), "PATH": str(binary_directory)}
     )
@@ -3118,33 +3027,24 @@ def test_broker_rejects_worker_writable_nested_loader_library(
 
     monkeypatch.setattr(Path, "lstat", fake_lstat)
 
-    with pytest.raises(PermissionError, match="worker-writable"):
-        broker._validate_environment_search_files(
-            library_directory, search_variable="LD_LIBRARY_PATH"
-        )
+    with pytest.raises(PermissionError, match="non-writable"):
+        broker._validate_runtime_contents(library_directory)
 
 
 @pytest.mark.parametrize(
-    ("search_variable", "file_mode", "file_uid", "file_gid", "message"),
+    ("file_mode", "file_uid", "file_gid", "message"),
     [
-        ("LD_LIBRARY_PATH", 0o660, 0, 2303, "worker-writable"),
-        ("LD_LIBRARY_PATH", 0o600, 0, 0, "runner cannot read"),
-        ("LD_LIBRARY_PATH", 0o640, 0, 2301, "worker cannot read"),
-        ("LD_LIBRARY_PATH", 0o640, 2301, 2303, "root-owned"),
-        ("PATH", 0o700, 0, 0, "runner cannot execute"),
+        (0o600, 0, 0, "runner cannot access"),
+        (0o640, 2301, 2303, "root-owned"),
     ],
     ids=[
-        "group-writable-library",
         "unreadable-library",
-        "worker-cannot-read-library",
-        "runner-owned-writable-library",
-        "unusable-path-command",
+        "runner-owned-library",
     ],
 )
 def test_broker_rejects_unsafe_runtime_search_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    search_variable: str,
     file_mode: int,
     file_uid: int,
     file_gid: int,
@@ -3194,7 +3094,7 @@ def test_broker_rejects_unsafe_runtime_search_files(
     monkeypatch.setattr(Path, "lstat", fake_lstat)
 
     with pytest.raises(PermissionError, match=message):
-        broker._validate_engine_environment({search_variable: str(search_path)})
+        broker._validate_private_runtime()
 
 
 @pytest.mark.parametrize(
@@ -3279,7 +3179,7 @@ def test_broker_rejects_runtime_symlink_into_worker_writable_directory(
     ))
 
     with pytest.raises(PermissionError, match="replaceable"):
-        broker._validate_engine_environment({"LD_LIBRARY_PATH": str(search_path)})
+        broker._validate_private_runtime()
     assert worker_directory in observed_paths
 
 
@@ -3348,10 +3248,10 @@ def test_broker_checks_runtime_symlink_target_ancestor_traversal(
     monkeypatch.setattr(Path, "lstat", fake_lstat)
 
     if expected_error is None:
-        broker._validate_engine_environment({"LD_LIBRARY_PATH": str(search_path)})
+        broker._validate_private_runtime()
     else:
         with pytest.raises(PermissionError, match=expected_error):
-            broker._validate_engine_environment({"LD_LIBRARY_PATH": str(search_path)})
+            broker._validate_private_runtime()
 
 
 def test_broker_rechecks_environment_directory_permissions_before_launch(
@@ -4086,6 +3986,9 @@ def _claimed_systemd_attempt(tmp_path, *, return_service: bool = False):
     SystemdEvidenceLedger.path_for(service.database_path).parent.mkdir(
         parents=True, exist_ok=True
     )
+    with pytest.MonkeyPatch.context() as startup:
+        startup.setattr(store_module.os, "geteuid", lambda: 0)
+        service._store._systemd_evidence_ledger.initialize()
     queued = service.enqueue(
         "systemd-containment", _request(), workload_demand=heavy_workload_demand()
     )
@@ -4144,12 +4047,16 @@ def _claimed_systemd_attempt(tmp_path, *, return_service: bool = False):
     return service._store, claim, identity
 
 
-def _systemd_service(tmp_path, runner):
-    bundle = build_bundle(tmp_path)
+def _systemd_service(tmp_path, runner, *, bundle=None):
+    if bundle is None:
+        bundle = build_bundle(tmp_path)
     service = _service(tmp_path, bundle, attempt_runner=runner)
     SystemdEvidenceLedger.path_for(service.database_path).parent.mkdir(
         parents=True, exist_ok=True
     )
+    with pytest.MonkeyPatch.context() as startup:
+        startup.setattr(store_module.os, "geteuid", lambda: 0)
+        service._store._systemd_evidence_ledger.initialize()
     runner.store = service._store
     return service, runner
 
@@ -4506,6 +4413,50 @@ def test_unit_disappearance_after_durable_proof_allows_recovery_cleanup(
 
     assert result == {"ok": True, "acknowledged": True}
     assert cleaned == [claim.attempt_id]
+
+
+def test_systemd_service_accepts_replacement_engine_without_version_markers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    bundle = build_bundle(tmp_path)
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    service, _ = _systemd_service(tmp_path, runner, bundle=bundle)
+    demand = heavy_workload_demand()
+    first = service.enqueue("original", _request(), workload_demand=demand)
+    assert service.work()["processed"] == 1
+    before = service._store.current_attempt(first.job_id)
+    assert before is not None and before["status"] == "succeeded"
+
+    def stored_resolution(job_id):
+        with _raw_connection(service.database_path) as connection:
+            return tuple(connection.execute(
+                "SELECT resolved_json, resolved_digest FROM backend_executions WHERE job_id = ?",
+                (job_id,),
+            ).fetchone())
+
+    original = stored_resolution(first.job_id)
+    second = service.enqueue("replacement", _request(), workload_demand=demand)
+    with bundle.engine_path.open("ab") as executable:
+        executable.write(b"\n# compatible administrator update\n")
+    expected = hashlib.sha256(bundle.engine_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        engine,
+        "capture_runtime_fingerprint",
+        lambda: {**RUNTIME, "rocm_version": None, "amdgpu_version": None},
+    )
+
+    assert service.work()["processed"] == 1
+    assert service.get_provenance(second.job_id)["status"] == "succeeded"
+    updated = json.loads(stored_resolution(second.job_id)[0])
+    assert updated["schema_version"] == 2
+    assert updated["argv"][0] == str(bundle.engine_path)
+    assert updated["engine"]["executable_sha256"] == expected
+    assert updated["engine"]["version"] == updated["engine"]["build"] == "unobserved"
+    assert updated["runtime"]["rocm_version"] is None
+    assert updated["runtime"]["amdgpu_version"] is None
+    assert json.loads(original[0])["engine"]["executable_sha256"] != expected
+    assert stored_resolution(first.job_id) == original
 
 
 def test_systemd_runner_streams_validated_scratch_into_existing_publication(
@@ -5178,6 +5129,27 @@ def test_systemd_evidence_ledger_requires_worker_group_read_access(
     facts["st_mode"] = stat.S_IFREG | 0o600
     with pytest.raises(PermissionError, match="readable by the worker group"):
         ledger.validate_worker_access(worker_gid)
+
+
+@pytest.mark.parametrize(
+    ("version", "error"), [(2, "version 2"), (61, "version 61"), (1, "incomplete")]
+)
+def test_ledger_startup_preserves_unsupported_or_incomplete_existing_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: int, error: str
+) -> None:
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    parent = tmp_path / "systemd-evidence"
+    parent.mkdir()
+    ledger = SystemdEvidenceLedger(parent / "test.systemd-evidence.sqlite3")
+    with sqlite3.connect(ledger.path) as connection:
+        connection.execute(f"PRAGMA user_version = {version}")
+        connection.execute("CREATE TABLE systemd_attempt_evidence (job_id TEXT)")
+        connection.execute("INSERT INTO systemd_attempt_evidence VALUES ('preserve')")
+    before = ledger.path.read_bytes()
+
+    with pytest.raises(BackendEvidenceError, match=error):
+        ledger.initialize()
+    assert ledger.path.read_bytes() == before
 
 
 def test_worker_keyed_group_lookup_rejects_unexpected_scratch_membership(
@@ -5953,23 +5925,34 @@ def test_completion_observation_must_match_durable_engine_evidence(
     assert runner.acknowledgements == [False]
 
 
+@pytest.mark.parametrize(
+    ("diagnostic", "exit_code"),
+    [
+        ("unsupported argument: --sampling-method", 2),
+        ("error while loading shared libraries: libamdhip64.so.7", 127),
+    ],
+    ids=["unsupported-option", "missing-shared-library"],
+)
 def test_engine_failure_with_successful_launcher_cannot_publish(
-    tmp_path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, diagnostic: str, exit_code: int
 ) -> None:
     monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
-    runner = _SyntheticSystemdAttemptRunner(
-        tmp_path / "broker-scratch", engine_exit_code=23
-    )
-    service, runner = _systemd_service(tmp_path, runner)
+    bundle = build_bundle(tmp_path)
+    runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
+    service, _ = _systemd_service(tmp_path, runner, bundle=bundle)
     queued = service.enqueue(
         "systemd-engine-failed", _request(), workload_demand=heavy_workload_demand()
+    )
+    bundle.engine_path.write_text(
+        f"#!/bin/sh\nprintf '%s\\n' '{diagnostic}' >&2\nexit {exit_code}\n",
+        encoding="ascii",
     )
 
     report = service.work()
 
     assert report["processed"] == 1
     assert service.get_provenance(queued.job_id)["status"] == "failed"
-    assert service.get_execution(queued.job_id)["observed"]["exit_code"] == 23
+    assert service.get_execution(queued.job_id)["observed"]["exit_code"] == exit_code
     assert service._store.resource_snapshot()["state"] == "available"
     assert service._store.artifacts() == []
 

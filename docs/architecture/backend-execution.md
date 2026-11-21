@@ -29,14 +29,13 @@ restart-stable candidate identity and declared capabilities. Construction does
 not load a model, hash model component files, start a process, inspect Git, or
 capture host runtime facts.
 
-Before every dispatch `resolve_execution` performs the authoritative offline T07
-evaluation. Static preparation and independent evidence authority must both be
-`ready`, and every pinned declaration, recipe, component, executable, and trusted
-evidence file is read and re-hashed. The selected candidate's stable
-`candidate_id` must still match the identity captured in the adapter
-configuration. A failure is refused before any process starts; the service never
-substitutes another bundle. The fresh `verification_id` belongs to that resolved
-attempt only and is excluded from the restart-stable static configuration.
+Before dispatch, the adapter verifies the recipe, model components, and trusted
+evidence through the T07 evaluator. The candidate must match the selection
+captured in the adapter configuration. For SD-C++ execution, the evaluator
+observes the installed executable at the selected path and records its digest.
+The declaration's original executable metadata remains part of the stable
+selection for queued jobs. Offline T07 inspection still compares the
+historical artifact pins. The fresh `verification_id` belongs to the attempt.
 
 T07 declaration schema version 1 has no field that references a prepared
 manifest or an acquisition journal. The adapter therefore re-evaluates the
@@ -194,30 +193,22 @@ the documented invocation contract cannot bind their required order and
 strength without guessing. Such a request finishes with
 `operation_unsupported`.
 
-The engine version stored in the resolved record is copied from the candidate
-declaration. The application-owned registration pins the real
-stable-diffusion.cpp identity to `master-975-95b3090-2-gb13a482`, the exact
-`git describe --tags` identity of commit
-`b13a48219d5cdf408edcb93da6cd69b612ed03d3`. Exact string matching remains
-mandatory at configuration evaluation and dispatch; a different describe
-string, branch, or commit identifies different engine source and is refused.
+New SD-C++ attempts reuse resolved record v2. `argv[0]` holds the selected
+executable path and `engine.executable_sha256` holds the observed digest.
+`engine.version` and `engine.build` say `unobserved` without a trustworthy
+version or build observation. Earlier v2 writers copied those values from the
+candidate declaration. Existing records retain their original meaning and
+bytes.
 
-Runtime markers are read without mutation. `rocm_version` is read from
-`$ROCM_PATH/.info/version` when `ROCM_PATH` names a readable installation
-marker, then from `/opt/rocm/.info/version`. `amdgpu_version` is read from
-`/sys/module/amdgpu/version` when readable, then from
-`/sys/module/amdgpu/srcversion`. The srcversion file is an opaque loaded-module
-build identifier, not a semantic driver version; the application records it
-under the existing field name and does not parse or order it. If neither
-amdgpu marker is readable, or neither ROCm marker is readable, the
-corresponding value is `null` and dispatch validation refuses the execution.
+`rocm_version` comes from the first readable marker at
+`$ROCM_PATH/.info/version` or `/opt/rocm/.info/version`. `amdgpu_version` comes
+from `/sys/module/amdgpu/version` or the opaque `srcversion` fallback. A missing
+marker is recorded as `null`. Linux remains required. The configured runtime
+must satisfy the invocation and produce a valid image.
 
-Verification happens before launch. The resolved record states that the pinned
-bytes were verified before the process started and that the engine may open
-different bytes afterwards, because no retained file handle is kept across the
-launch. That fact is stored as the `verification_window` object with its
-`verified_before_launch` and `engine_may_open_different_bytes_after_launch`
-flags. The application does not claim that the engine loaded the hashed bytes.
+The `verification_window` records the prelaunch check. The engine opens its own
+files after launch, so the digest describes the executable observed before
+dispatch. Administrators update the protected runtime between attempts.
 
 ## ComfyUI graph execution and resolved record v3
 
@@ -733,13 +724,12 @@ executable is group-readable and executable so the runner can launch it; this
 also gives the worker execute permission on that file, but no GPU device or
 scratch access.
 
-Before launch, the broker inspects each direct entry in the configured `PATH`
-and `LD_LIBRARY_PATH` directories. It fails closed if an entry cannot be
-inspected, is a special file, targets a non-root-owned file, or is writable by
-the group, world, worker, or runner. Every symlink hop and directory in a
-target path must also be root-owned and nonreplaceable. Runtime libraries must
-be readable by both services, and executable `PATH` entries must be executable
-by the runner. Private engine and model inputs cannot be world-readable.
+At startup the broker checks private search-tree contents, including library
+symlink targets, for root ownership, write protection, runner access, and
+extended ACLs. The administrator maintains the system command tree. Per
+attempt the broker checks the configured search directories and the exact
+resolved invocation. The worker needs read access to candidate data it
+verifies. Private libraries may be accessible only to the runner.
 
 The broker allowlists the required GPU device nodes, model and input read
 roots, scratch directory, and runner executable, then supplies fixed
@@ -858,47 +848,20 @@ from the resolved argument vector and the environment it will pass to the
 child. A URL scheme, a remote, host, listen, server, API, proxy, download,
 update, telemetry, or fallback token in the invocation marks the matching
 control prohibited, and any proxy variable in the environment does the same.
-The privacy profile is selected by the application, not by the adapter. An
-application-owned registry maps the exact adapter identifier to the engine
-identity, engine version, and configuration version it covers, and the service
-reads the profile from that registry. A policy object exposed by an adapter is
-ignored, so an adapter cannot widen the controls that apply to it. Adding an
-adapter identity to the registry is an application change.
+The application selects the SD-C++ privacy profile by the supported adapter,
+engine family, and configuration and invocation contracts. The original tool
+version remains the stored profile label. ComfyUI retains its signed runtime
+version requirement.
 
-Invocation or environment settings the application cannot classify remain
-`unverified` and block execution.
-
-The service evaluates the record at the dispatch boundary before it inserts the
-resolved row and before it spawns a child. It requires the record's argv and
-environment to match the prepared invocation, recomputes the privacy settings
-from that argv and environment, requires the recorded map to match the
-recomputation, requires the adapter to declare an identity present in the
-application-owned privacy registry, requires the record's declared engine
-identity and version to match that registration, and requires the
-application-owned policy to return `pass`. A prohibited token in the argv or a
-proxy variable in the environment fails this gate.
-
-The gate also binds the record to the restart-stable adapter configuration
-persisted with the claim. Candidate identity, declaration digest, engine
-identity and executable digest, recipe identity and document digest, required
-component rows, adapters, and the CLI and invocation contracts must match that
-admission selection. The `argv[0]` path must end with the selected executable
-pin, and that one file is read again to confirm the pinned SHA-256; model and
-component files are not hashed a second time. The gate compares the reported
-component rows but does not bind the model-path values in the remaining `argv`
-entries to the corresponding component artifact pins; that path mapping remains
-inside the in-process adapter boundary. Substitutions of the candidate,
-declaration, executable build or bytes, recipe, required component rows,
-adapters, or contracts fail closed as `resolved_execution_mismatch` before the
-resolved row is inserted or a child starts. An engine identity or version
-mismatch against the application-owned registration fails earlier with the
-privacy reason `resolved_engine_mismatch`.
-The binding still consumes the configuration the adapter exposes at admission,
-so an adapter that fabricates both its configuration and its resolution remains
-an in-process trust boundary. The launch record captures the argv and
-environment the supervisor passed; it does not prove that the process opened
-the same bytes the application verified, because the engine opens those paths
-itself after launch.
+Before inserting the resolved record or launching the engine, the service
+recomputes privacy from the exact argv and environment. It requires a pass and
+checks the record against the claimed selection. For SD-C++, the full
+executable path must match the selected declaration, and the digest must match
+the observation captured for this attempt. Candidate and declaration identity,
+the recipe, component identities, and invocation contracts must also match.
+The adapter supplies the mapping from component identities to argv paths.
+The supervisor separately records the argv and environment actually passed to
+the child.
 
 These controls describe application configuration only. They do not prove that
 the executable contains no network code and do not provide operating-system
@@ -952,7 +915,6 @@ that a survivor process is contained, or that the engine cannot access a
 network. Those remain runtime and qualification concerns outside this evidence
 layer.
 
-Component and executable hashes are verified before launch. Because no retained
-descriptor spans the launch, the bytes the engine opens afterwards may differ
-from the bytes that were hashed; the resolved record states this window
-explicitly.
+The adapter verifies model hashes and observes the selected executable before
+launch. The resolved record describes that check. The engine opens its own
+files after launch.

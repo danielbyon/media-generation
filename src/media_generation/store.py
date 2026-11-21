@@ -2380,16 +2380,10 @@ END"""
                     identity.job_id,
                     identity.attempt_id,
                     require_current_attempt=False,
+                    expected_identity=identity,
                 )
             if not termination_proven:
                 continue
-            ledger_identity = self._systemd_evidence_ledger.read_identity(
-                identity.job_id, identity.attempt_id
-            )
-            if ledger_identity != identity:
-                raise BackendEvidenceError(
-                    "pending cleanup identity differs from the root evidence ledger"
-                )
             pending.append(
                 PendingSystemdOutputCleanup(
                     identity=identity,
@@ -3255,6 +3249,8 @@ END"""
         attempt_id: str,
         *,
         require_current_attempt: bool = True,
+        require_mirror: bool = False,
+        expected_identity: AttemptUnitIdentity | None = None,
     ) -> bool:
         """Validate the persisted whole-cgroup proof independently of engine exit."""
         row = connection.execute(
@@ -3287,14 +3283,9 @@ END"""
                 or identity_digest(identity) != row["identity_digest"]
             ):
                 raise ValueError("stored containment identity does not match its attempt")
+            if expected_identity is not None and identity != expected_identity:
+                raise ValueError("containment differs from the selected attempt identity")
             proof_json = row["termination_json"]
-            ledger_identity = self._systemd_evidence_ledger.read_identity(
-                job_id, attempt_id
-            )
-            if ledger_identity is None:
-                return False
-            if ledger_identity != identity:
-                raise ValueError("root evidence ledger names another invocation")
             ledger_proof = self._systemd_evidence_ledger.read_termination(identity)
             if ledger_proof is None:
                 return False
@@ -3310,7 +3301,7 @@ END"""
             raise BackendEvidenceError(
                 "stored systemd containment evidence is malformed"
             ) from error
-        return True
+        return proof_json is not None or not require_mirror
 
     def _attempt_cgroup_termination_mirror_persisted(
         self,
@@ -3319,16 +3310,9 @@ END"""
         attempt_id: str,
     ) -> bool:
         """Return whether SQLite stores the exact proof held by the root ledger."""
-        if not self._attempt_cgroup_termination_evidence(
-            connection, job_id, attempt_id
-        ):
-            return False
-        row = connection.execute(
-            """SELECT termination_json FROM execution_containment
-               WHERE job_id = ? AND attempt_id = ?""",
-            (job_id, attempt_id),
-        ).fetchone()
-        return row is not None and row["termination_json"] is not None
+        return self._attempt_cgroup_termination_evidence(
+            connection, job_id, attempt_id, require_mirror=True
+        )
 
     def termination_evidence_proven(self, job_id: str, attempt_id: str) -> bool:
         """Read whether the exact engine child has a durable exit observation."""
@@ -4001,7 +3985,9 @@ END"""
                     raise BackendEvidenceError(
                         "systemd scratch cleanup could not be queued with publication"
                     )
-            direct_child_termination_proven = self._attempt_termination_evidence(
+            # The success predicate above already checked the exact root proof
+            # and the reaped engine in this transaction.
+            direct_child_termination_proven = is_systemd_attempt or self._attempt_termination_evidence(
                 connection, artifact.job_id, artifact.attempt_id
             )
             process_tree_required = (
@@ -4009,7 +3995,7 @@ END"""
                     connection, artifact.job_id, artifact.attempt_id
                 )
             )
-            termination_proven = self._attempt_termination_proven(
+            termination_proven = is_systemd_attempt or self._attempt_termination_proven(
                 connection, artifact.job_id, artifact.attempt_id
             )
             resource_release_proven = self._resource_release_proven(

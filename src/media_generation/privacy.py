@@ -1075,6 +1075,7 @@ def _digest(value: object) -> str:
 
 
 LOCAL_INFERENCE_CONFIGURATION_VERSION = "sd-cpp-local/v1"
+# Historical SD-C++ profile label. Keep it stable for stored privacy evidence.
 LOCAL_INFERENCE_ENGINE_VERSION = "master-975-95b3090-2-gb13a482"
 COMFYUI_ADAPTER_ID = "comfyui-local-v1"
 COMFYUI_CONFIGURATION_VERSION = "comfyui-local/v2"
@@ -1180,22 +1181,6 @@ _COMFYUI_CREDENTIAL_VALUE = re.compile(
     r"client[_-]?secret|password|passwd|secret|token)\b\s*[:=]\s*\S+"
 )
 _COMFYUI_SHA256 = re.compile(r"\A[0-9a-f]{64}\Z")
-"""Exact stable-diffusion.cpp revision identity the local profile covers.
-
-The value is the revision identity reported by the pinned stable-diffusion.cpp
-source tree through git describe --tags. It denotes commit
-b13a48219d5cdf408edcb93da6cd69b612ed03d3 on the observed master development
-history. It is an opaque source-revision identity, not a semantic release
-number.
-The governing upstream tag is lightweight, so the --tags form is required;
-plain git describe reports no annotated tag for this commit.
-
-The string must match a candidate declaration's engine.version exactly. A
-different git describe --tags value, branch, or commit identifies different engine
-source and is refused by the application-owned privacy registration; the
-application does not normalize versions or compare them by prefix.
-"""
-
 _INVOCATION_CONTROL_TOKENS: dict[PrivacyControl, frozenset[str]] = {
     PrivacyControl.EXTERNAL_API: frozenset({"api", "external_api"}),
     PrivacyControl.CLOUD_INFERENCE: frozenset({"cloud", "cloud_inference"}),
@@ -1945,7 +1930,7 @@ def local_inference_privacy_profile(
     tool_version: str,
     configuration_version: object = LOCAL_INFERENCE_CONFIGURATION_VERSION,
 ) -> PrivacyProfile:
-    """Return the application-owned profile for one pinned local engine build.
+    """Return the application-owned SD-C++ profile with its existing evidence identity.
 
     Every control maps to an explicit setting that the application constructs
     for the declared invocation: only local artifact paths are passed, the
@@ -2027,10 +2012,8 @@ DEFAULT_PRIVACY_POLICY = PrivacyCompliancePolicy((DETERMINISTIC_CPU_PRIVACY_PROF
 class LocalInferencePrivacyRegistration:
     """Application-owned binding for one local inference adapter.
 
-    The registration names the exact adapter identity, engine identity,
-    engine version, and configuration version the application is willing to
-    evaluate. The profile is created from these pinned values, never from an
-    adapter-supplied policy or an arbitrary candidate declaration.
+    These values identify the stored profile. For SD-C++ the version is the
+    original evidence label. ComfyUI also uses its signed version for admission.
     """
 
     adapter_id: str
@@ -2077,9 +2060,8 @@ APPLICATION_PRIVACY_REGISTRATIONS = (
 )
 """Application-owned registrations that may evaluate as local inference.
 
-The registry lives in application code and never in an adapter. Adding an entry
-is the only way to authorize another adapter identity, and every entry names
-the exact engine identity, engine version, and configuration version it covers.
+Each entry identifies an application-owned profile. SD-C++ uses the original
+engine version as a stored label and validates its invocation contract.
 """
 
 APPLICATION_PRIVACY_REGISTRY = {
@@ -2125,10 +2107,8 @@ def application_privacy_profile(
 ) -> PrivacyProfile:
     """Return the app-owned profile for one exact adapter configuration.
 
-    Selection never consults a policy object supplied by the adapter. The
-    registration must match the adapter identifier, engine identifier, engine
-    version, and configuration version exactly. Any mismatch raises instead of
-    degrading into partial evaluation.
+    The application selects the profile from the adapter and its supported
+    configuration. ComfyUI also requires its signed engine version.
     """
 
     registration = application_privacy_registration(adapter_id)
@@ -2151,11 +2131,23 @@ def application_privacy_profile(
         raise ValueError(
             "backend execution configuration must declare engine version"
         )
-    if tool_version != registration.tool_version:
-        raise ValueError(
-            "backend execution engine version does not match "
-            "application-owned registration"
-        )
+    if registration.tool_id == COMFYUI_TOOL_ID:
+        if tool_version != registration.tool_version:
+            raise ValueError(
+                "backend execution engine version does not match "
+                "application-owned registration"
+            )
+    else:
+        from .engine import BACKEND_KIND, CLI_CONTRACTS, INVOCATION_CONTRACT
+
+        cli_contract = configuration.get("cli_contract")
+        if (
+            configuration.get("backend_kind") != BACKEND_KIND
+            or configuration.get("invocation_contract") != INVOCATION_CONTRACT
+            or not isinstance(cli_contract, str)
+            or cli_contract not in CLI_CONTRACTS
+        ):
+            raise ValueError("SD-C++ privacy profile requires a supported invocation contract")
     if not _same_json_scalar(
         configuration.get("configuration_version"),
         registration.configuration_version,
