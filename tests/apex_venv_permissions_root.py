@@ -96,8 +96,9 @@ class BrokerFilesystemPermissionsTests(unittest.TestCase):
         storage.mkdir(mode=0o710)
         os.chown(storage, 0, runner.pw_gid)
         scratch = storage / attempt
-        scratch.mkdir(mode=0o770)
-        os.chown(scratch, 0, runner.pw_gid)
+        broker = object.__new__(SystemdAttemptBroker)
+        broker.configuration = SimpleNamespace(scratch_root=storage, scratch_gid=runner.pw_gid)
+        broker._create_attempt_scratch(attempt)
         inputs = storage / (attempt + ".inputs")
         sibling = storage / ("att_" + uuid.uuid4().hex + ".inputs")
         for directory in (inputs, sibling):
