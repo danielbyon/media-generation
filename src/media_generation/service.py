@@ -88,6 +88,8 @@ from .systemd_attempts import (
     SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
     SystemdAttemptCompletion,
     SystemdAttemptPreRpcError,
+    SystemdAttemptPrelaunchRefusal,
+    staged_reference_directory,
     SystemdAttemptRunner,
 )
 
@@ -1210,8 +1212,15 @@ class GenerationService:
                     scratch_directory = self._attempt_runner.prepare_attempt(claim)
                 prelaunch_stage = "execution_resolution"
                 if self._attempt_runner is not None:
+                    protected_plan = plan
+                    if claim.references:
+                        inputs = staged_reference_directory(scratch_directory)
+                        protected_plan = replace(plan, references=tuple(
+                            replace(reference, path=inputs / f"{index}.png")
+                            for index, reference in enumerate(claim.references)
+                        ))
                     prepared_execution = self.adapter.resolve_execution(
-                        plan, scratch_directory=scratch_directory
+                        protected_plan, scratch_directory=scratch_directory
                     )
                 else:
                     prepared_execution = self.adapter.resolve_execution(plan)
@@ -1374,10 +1383,13 @@ class GenerationService:
             while cursor is not None:
                 if isinstance(cursor, SystemdAttemptPreRpcError):
                     systemd_prelaunch_refusal = True
+                    prelaunch_stage = "attempt_request_validation"
+                    break
+                if isinstance(cursor, SystemdAttemptPrelaunchRefusal):
+                    systemd_prelaunch_refusal = True
+                    prelaunch_stage = "broker_prelaunch_refusal"
                     break
                 cursor = cursor.__cause__
-            if systemd_prelaunch_refusal:
-                prelaunch_stage = "attempt_request_validation"
             snapshot = self._store.get_provenance(claim.job_id)
             if snapshot["artifact"] is not None and snapshot["status"] == "succeeded":
                 return None
@@ -1442,7 +1454,7 @@ class GenerationService:
                     )
                 else:
                     # Persist fixed labels only; exception text can expose paths or secrets.
-                    category = "unknown"
+                    category = "rejected" if prelaunch_stage == "broker_prelaunch_refusal" else "unknown"
                     cursor = error
                     while cursor is not None:
                         if isinstance(cursor, PermissionError):

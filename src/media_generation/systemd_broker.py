@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import array
 import errno
+import fcntl
+import hashlib
 import json
 import os
 import pwd
@@ -31,15 +33,18 @@ from pathlib import Path
 from typing import Mapping
 
 from .backend_provenance import backend_digest, environment_record
-from .engine import ENVIRONMENT_ALLOWLIST
+from .engine import APP_MAX_REFERENCES, ENVIRONMENT_ALLOWLIST
 from .errors import BackendEvidenceError
-from .store import ExecutionClaim, SQLiteStore
+from .images import MAX_ENCODED_BYTES
+from .store import BROKER_PRELAUNCH_REFUSAL, ExecutionClaim, SQLiteStore
 from .systemd_evidence import SystemdEvidenceLedger
-from .systemd_protocol import encode_json_line, read_json_line
+from .systemd_protocol import encode_json_line, read_json_line, received_descriptors
 from .systemd_attempts import (
     SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
     AttemptUnitIdentity,
     CgroupTerminationEvidence,
+    prelaunch_binding,
+    staged_reference_directory,
 )
 
 
@@ -81,6 +86,10 @@ _REQUESTS = {
 }
 _MAX_PACKET = 1024 * 1024
 _MAX_OUTPUT_BYTES = 512 * 1024 * 1024
+
+
+class _PrelaunchRefusal(BackendEvidenceError):
+    """Report a checked execute request that stopped before starting a unit."""
 
 
 @dataclass(frozen=True)
@@ -389,6 +398,7 @@ class SystemdAttemptBroker:
 
     def _serve_connection(self, connection: socket.socket) -> None:
         with connection:
+            descriptors: list[int] = []
             try:
                 pid, uid, gid = _peer_credentials(connection)
                 if uid != self.configuration.worker_uid or gid != self.configuration.worker_gid:
@@ -401,17 +411,25 @@ class SystemdAttemptBroker:
                         {self.configuration.model_read_gid}
                     ),
                 )
-                packet, _ancillary, flags, _address = connection.recvmsg(_MAX_PACKET)
-                if flags & getattr(socket, "MSG_TRUNC", 0):
-                    raise ValueError("broker request exceeds the protocol limit")
+                packet, ancillary, flags, _address = connection.recvmsg(
+                    _MAX_PACKET, socket.CMSG_SPACE(APP_MAX_REFERENCES * array.array("i").itemsize)
+                )
+                descriptors = received_descriptors(ancillary, flags, limit=APP_MAX_REFERENCES)
                 operation, request = _validated_request(packet)
+                if descriptors and operation != "execute":
+                    raise ValueError("only execute accepts reference descriptors")
                 if operation == "prepare":
                     response = self._prepare(request)
                     _send(connection, response)
                 elif operation == "execute":
-                    response, output_fd = self._execute(
-                        connection, request, deliver_response=True
-                    )
+                    try:
+                        response, output_fd = self._execute(
+                            connection, request, deliver_response=True,
+                            **({"reference_fds": descriptors} if descriptors else {}),
+                        )
+                    except _PrelaunchRefusal:
+                        _send(connection, {"ok": False, "prelaunch_refusal": prelaunch_binding(request)})
+                        return
                     try:
                         if response.pop("_reply_sent", False) is not True:
                             _send(connection, response, output_fd=output_fd)
@@ -432,6 +450,9 @@ class SystemdAttemptBroker:
                     )
                 except OSError:
                     pass
+            finally:
+                for fd in descriptors:
+                    os.close(fd)
 
     def _prepare(self, request: Mapping[str, object]) -> dict[str, object]:
         job, attempt, owner, epoch = _claim_fields(request)
@@ -475,6 +496,7 @@ class SystemdAttemptBroker:
         request: Mapping[str, object],
         *,
         deliver_response: bool = False,
+        reference_fds: list[int] | None = None,
     ) -> tuple[dict[str, object], int | None]:
         job, attempt, owner, epoch = _claim_fields(request)
         self._require_current_claim(job, attempt, owner, epoch)
@@ -502,12 +524,9 @@ class SystemdAttemptBroker:
             or environment_record(environment) != durable.get("environment")
         ):
             raise BackendEvidenceError("environment differs from durable resolution")
-        self._validate_engine_environment(environment)
         scratch = self.configuration.scratch_root / attempt
-        if request.get("scratch_directory") != str(scratch):
-            raise PermissionError("scratch directory is not the broker-created attempt directory")
-        self._validate_engine_paths(argv)
         unit = f"media-generation-attempt-{attempt[4:]}.service"
+        inputs = staged_reference_directory(scratch)
         self._reserve_attempt_start(attempt)
         active_registered = False
         try:
@@ -519,22 +538,39 @@ class SystemdAttemptBroker:
                 raise BackendEvidenceError(
                     "attempt unit name already exists and cannot be reused"
                 )
-            self._create_attempt_scratch(attempt)
+            for path in (scratch, inputs):
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    continue
+                raise PermissionError("attempt storage already exists and cannot be reused")
             try:
-                runner_can_access = _mode_allows(
+                self._validate_engine_environment(environment)
+                if request.get("scratch_directory") != str(scratch):
+                    raise PermissionError("scratch directory differs from broker path")
+                conditioning = durable.get("conditioning", [])
+                if "conditioning" in durable or reference_fds:
+                    self._stage_reference_inputs(
+                        job, attempt, argv, conditioning, reference_fds or [], inputs
+                    )
+                else:
+                    self._validate_engine_paths(argv)
+                self._create_attempt_scratch(attempt)
+                if not _mode_allows(
                     scratch.stat(), self.configuration.runner_uid,
                     self.configuration.runner_groups, read=True, write=True,
-                )
-                if not runner_can_access:
+                ):
                     raise PermissionError("runner cannot access attempt scratch")
-            except Exception:
+                self._require_current_claim(job, attempt, owner, epoch)
+            except Exception as error:
                 self._remove_scratch(attempt)
-                raise
-            try:
-                process = _start_systemd_run(self.configuration, unit, scratch)
-            except Exception:
-                self._remove_scratch(attempt)
-                raise
+                if not self.store.record_broker_prelaunch_refusal(
+                    job, attempt, owner, epoch, resolved_digest
+                ):
+                    raise
+                raise _PrelaunchRefusal("broker refused before launch") from error
+            # From this point a failure may follow systemd accepting the unit.
+            process = _start_systemd_run(self.configuration, unit, scratch)
             identity: AttemptUnitIdentity | None = None
             events_fd: int | None = None
             try:
@@ -1450,6 +1486,7 @@ class SystemdAttemptBroker:
             or current.get("attempt_id") != attempt
             or current.get("owner_id") != owner
             or current.get("claim_epoch") != epoch
+            or current.get("job_failure_message") == BROKER_PRELAUNCH_REFUSAL
             or current.get("containment_contract") != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
             or not self.store.assert_attempt_authority(job, attempt, owner, epoch)
         ):
@@ -1461,6 +1498,61 @@ class SystemdAttemptBroker:
             if active is None or active.identity != identity:
                 return None
             return active
+
+    def _stage_reference_inputs(
+        self, job: str, attempt: str, argv: list[str], conditioning: object,
+        descriptors: list[int], inputs: Path,
+    ) -> None:
+        """Copy the frozen attempt's ordered references into protected files."""
+        current = self.store.current_attempt(job)
+        if current is None or current["attempt_id"] != attempt:
+            raise PermissionError("reference inputs do not belong to the current attempt")
+        frozen = json.loads(current["plan_json"])["references"]
+        expected = [
+            {key: item[key] for key in ("artifact_id", "role", "content_sha256")}
+            for item in frozen
+        ]
+        if conditioning != expected or not len(expected) == len(descriptors) <= APP_MAX_REFERENCES:
+            raise BackendEvidenceError("reference identity or descriptor count differs from the claim")
+        destinations = [inputs / f"{index}.png" for index in range(len(expected))]
+        model_argv = []
+        found = []
+        tokens = iter(argv)
+        for token in tokens:
+            if token == "-r":
+                found.append(next(tokens, None))
+            else:
+                model_argv.append(token)
+        if found != [str(path) for path in destinations]:
+            raise BackendEvidenceError("reference paths differ from the attempt inputs")
+        self._validate_engine_paths(model_argv)
+        if not descriptors:
+            return
+        inputs.mkdir(mode=0o700)
+        os.chown(inputs, 0, self.configuration.scratch_gid)
+        for fd, reference, destination in zip(descriptors, expected, destinations, strict=True):
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
+                or not 0 < info.st_size <= MAX_ENCODED_BYTES
+            ):
+                raise PermissionError("reference descriptor must be a bounded read-only regular file")
+            digest = hashlib.sha256()
+            with destination.open("xb") as stream:
+                offset = 0
+                while offset < info.st_size:
+                    data = os.pread(fd, min(1024 * 1024, info.st_size - offset), offset)
+                    if not data:
+                        raise ValueError("reference descriptor was truncated")
+                    stream.write(data)
+                    digest.update(data)
+                    offset += len(data)
+                if os.pread(fd, 1, offset) or digest.hexdigest() != reference["content_sha256"]:
+                    raise ValueError("reference content differs from the claim")
+                os.fchown(stream.fileno(), 0, self.configuration.scratch_gid)
+                os.fchmod(stream.fileno(), 0o440)
+        inputs.chmod(0o750)
 
     def _validate_engine_paths(self, argv: list[str]) -> None:
         paths: list[tuple[Path, bool]] = [(Path(argv[0]), True)]
@@ -1708,20 +1800,36 @@ class SystemdAttemptBroker:
         scratch = self.configuration.scratch_root / attempt
         if scratch.parent != self.configuration.scratch_root or not _safe_attempt_id(attempt):
             raise PermissionError("scratch cleanup path is not attempt-scoped")
-        try:
-            observed = scratch.lstat()
-        except FileNotFoundError:
-            return
-        if (
-            not stat.S_ISDIR(observed.st_mode)
-            or stat.S_ISLNK(observed.st_mode)
-            or observed.st_uid != 0
-            or observed.st_gid != self.configuration.scratch_gid
-        ):
-            raise PermissionError("scratch directory ownership changed")
-        if not shutil.rmtree.avoids_symlink_attacks:
-            raise RuntimeError("safe descriptor-relative scratch removal is unavailable")
-        shutil.rmtree(scratch)
+        for directory in (scratch, staged_reference_directory(scratch)):
+            try:
+                observed = directory.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                not stat.S_ISDIR(observed.st_mode)
+                or observed.st_uid != 0
+                or observed.st_gid not in (
+                    {self.configuration.scratch_gid, 0} if directory != scratch
+                    else {self.configuration.scratch_gid}
+                )
+            ):
+                raise PermissionError("attempt storage ownership changed")
+            if not shutil.rmtree.avoids_symlink_attacks:
+                raise RuntimeError("safe descriptor-relative scratch removal is unavailable")
+            shutil.rmtree(directory)
+
+
+def _attempt_mount_properties(scratch: Path) -> list[str]:
+    """Expose only this attempt's directories under the private scratch root."""
+    properties = [
+        f"TemporaryFileSystem={scratch.parent}:ro",
+        f"BindPaths={scratch}",
+        f"ReadWritePaths={scratch}",
+    ]
+    inputs = staged_reference_directory(scratch)
+    if inputs.is_dir():
+        properties.append(f"BindReadOnlyPaths={inputs}")
+    return properties
 
 
 def _start_systemd_run(
@@ -1747,7 +1855,7 @@ def _start_systemd_run(
         "--property=ProtectHome=read-only",
         "--property=PrivateDevices=no",
         "--property=DevicePolicy=closed",
-        f"--property=ReadWritePaths={scratch}",
+        *(f"--property={property_}" for property_ in _attempt_mount_properties(scratch)),
         "--property=CapabilityBoundingSet=",
         "--property=RestrictSUIDSGID=yes",
         "--property=ProtectKernelTunables=yes",

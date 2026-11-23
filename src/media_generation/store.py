@@ -57,6 +57,9 @@ from .systemd_attempts import (
 )
 
 
+BROKER_PRELAUNCH_REFUSAL = "broker prelaunch refusal"
+
+
 def _require_systemd_broker_process() -> None:
     """Keep host termination facts writable only by the privileged broker."""
     if not hasattr(os, "geteuid") or os.geteuid() != 0:
@@ -3002,6 +3005,7 @@ END"""
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT attempts.*, execution.status AS job_status,
+                          execution.failure_message AS job_failure_message,
                           execution.max_attempts, execution.fence_epoch,
                           execution.containment_contract AS job_containment_contract
                    FROM execution_jobs AS execution
@@ -3022,6 +3026,51 @@ END"""
         """Read whether a claim is still the job's current publication authority."""
         with self._connection() as connection:
             return self._attempt_authorized(connection, job_id, attempt_id, owner_id, claim_epoch)
+
+    def record_broker_prelaunch_refusal(
+        self, job_id: str, attempt_id: str, owner_id: str, claim_epoch: int,
+        resolved_digest: str,
+    ) -> bool:
+        """Prevent another broker from launching this claim after a refusal."""
+        _require_systemd_broker_process()
+        with self._connection(transaction=True) as con:
+            return con.execute(
+                """UPDATE execution_jobs
+                   SET failure_message = CASE WHEN status = 'running'
+                       THEN :refusal ELSE failure_message END
+                   WHERE job_id = :job AND current_attempt_id = :attempt
+                     AND containment_contract = :contract
+                     AND (
+                         (status = 'running' AND fence_epoch = :epoch
+                          AND failure_message IS NULL)
+                         OR (status = 'canceled' AND fence_epoch = :epoch + 1
+                             AND EXISTS (
+                                 SELECT 1 FROM execution_cancellations
+                                 WHERE job_id = :job AND attempt_id = :attempt
+                                   AND claim_epoch = :epoch AND state = 'requested'
+                             ))
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM execution_attempts
+                         WHERE job_id = :job AND attempt_id = :attempt AND status = 'running'
+                           AND owner_id = :owner AND claim_epoch = :epoch
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM execution_resource
+                         WHERE id = 1 AND state = 'claimed' AND job_id = :job
+                           AND attempt_id = :attempt AND owner_id = :owner
+                     )
+                     AND EXISTS (
+                         SELECT 1 FROM backend_executions WHERE attempt_id = :attempt
+                           AND job_id = :job AND state = 'resolved' AND resolved_digest = :digest
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1 FROM execution_containment WHERE attempt_id = :attempt
+                     )""",
+                {"refusal": BROKER_PRELAUNCH_REFUSAL, "job": job_id, "attempt": attempt_id,
+                 "owner": owner_id, "epoch": claim_epoch, "digest": resolved_digest,
+                 "contract": SYSTEMD_CGROUP_CONTAINMENT_CONTRACT},
+            ).rowcount == 1
 
     def fence_attempt_for_recovery(
         self, job_id: str, attempt_id: str, *, timestamp: str

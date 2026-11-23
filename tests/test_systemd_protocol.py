@@ -39,3 +39,18 @@ def test_runner_and_broker_encode_the_same_json_line(
 
     assert runner_output.getvalue() == broker_output.getvalue()
     assert runner_output.getvalue().endswith(b"\n")
+
+
+def test_truncated_ancillary_frame_closes_received_descriptor(tmp_path) -> None:
+    import array
+    import os
+    import socket
+
+    from media_generation.systemd_protocol import received_descriptors
+
+    fd = os.open(tmp_path, os.O_RDONLY)
+    ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]).tobytes())]
+    with pytest.raises(ValueError, match="descriptor frame"):
+        received_descriptors(ancillary, socket.MSG_CTRUNC, limit=1)
+    with pytest.raises(OSError):
+        os.fstat(fd)

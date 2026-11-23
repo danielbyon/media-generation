@@ -165,7 +165,22 @@ The broker sets the runtime directory group in its main process before binding
 the socket. Keep the single `ExecStart`. The worker uses only the broker socket.
 The transient service uses the separate runner identity, the two allowed GPU
 devices, and the attempt scratch directory. Its engine runs with `/` as its
-working directory.
+working directory. Keep the worker's artifact directory private. For a request
+with references, the worker opens the committed artifacts and sends their
+read-only descriptors with the execute request. The broker copies the ordered
+references to a root-owned directory beside the attempt's writable scratch
+and checks each copy against the frozen reference digest. The resolved
+invocation already names those paths. The transient service sees its own
+writable scratch and its own read-only inputs under the scratch root.
+
+The broker can confirm a refusal for the exact execute request only before
+it attempts to start the transient service. It removes any partial inputs and
+records the refusal on the current job before replying. This blocks a
+duplicate execute even if the broker restarts. The worker still finalizes
+the job and releases capacity. A lost response or an uncertain launch still
+requires whole-cgroup proof before reuse. After possible launch, the existing
+scratch cleanup also removes the staged references once termination and
+publication reconciliation permit it.
 
 ## 2. Readiness
 

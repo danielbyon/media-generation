@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import array
 import json
+import os
+import socket
 from collections.abc import Mapping
 from typing import BinaryIO
 
@@ -37,3 +40,27 @@ def read_json_line(stream: BinaryIO) -> dict[str, object]:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValueError("runner control message must be a JSON object")
     return value
+
+def received_descriptors(ancillary, flags: int, *, limit: int) -> list[int]:
+    """Own every received descriptor or close them all when framing is invalid."""
+    descriptors: list[int] = []
+    invalid = bool(flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC))
+    for level, kind, data in ancillary:
+        if (level, kind) != (socket.SOL_SOCKET, socket.SCM_RIGHTS):
+            invalid = True
+            continue
+        integers = array.array("i")
+        size = len(data) - len(data) % integers.itemsize
+        integers.frombytes(data[:size])
+        descriptors.extend(integers)
+        invalid |= size != len(data) or not integers
+    try:
+        if invalid or len(descriptors) > limit:
+            raise ValueError("invalid broker descriptor frame")
+        for fd in descriptors:
+            os.set_inheritable(fd, False)
+    except BaseException:
+        for fd in descriptors:
+            os.close(fd)
+        raise
+    return descriptors

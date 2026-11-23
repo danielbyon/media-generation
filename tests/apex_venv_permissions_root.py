@@ -9,12 +9,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from media_generation.systemd_broker import SystemdAttemptBroker
+from media_generation.systemd_broker import SystemdAttemptBroker, _attempt_mount_properties
 from media_generation.systemd_evidence import SystemdEvidenceLedger
 
 
@@ -82,6 +83,64 @@ class BrokerFilesystemPermissionsTests(unittest.TestCase):
         self.assertEqual(self._open_as(self.worker_uid, ledger.path, "rb"), 0)
         self.assertNotEqual(self._open_as(self.worker_uid, ledger.path, "r+b"), 0)
         self.assertNotEqual(self._open_as(self.runner_uid, ledger.path, "rb"), 0)
+
+
+    @unittest.skipUnless(Path("/run/systemd/system").is_dir(), "requires a live systemd manager")
+    def test_transient_runner_sees_only_its_own_scratch_and_inputs(self) -> None:
+        attempt = "att_" + uuid.uuid4().hex
+        storage = self.root / "scratch"
+        storage.mkdir(mode=0o710)
+        os.chown(storage, 0, self.runner_uid)
+        scratch = storage / attempt
+        scratch.mkdir(mode=0o770)
+        os.chown(scratch, 0, self.runner_uid)
+        inputs = storage / (attempt + ".inputs")
+        sibling = storage / ("att_" + uuid.uuid4().hex + ".inputs")
+        for directory in (inputs, sibling):
+            directory.mkdir(mode=0o750)
+            os.chown(directory, 0, self.runner_uid)
+            path = directory / "0.png"
+            path.write_bytes(b"reference")
+            os.chown(path, 0, self.runner_uid)
+            path.chmod(0o440)
+        private = self.root / "artifacts"
+        private.mkdir(mode=0o700)
+        os.chown(private, self.worker_uid, self.worker_uid)
+        artifact = private / "reference.png"
+        artifact.write_bytes(b"private")
+        self.assertNotEqual(self._open_as(self.worker_uid, inputs / "0.png", "rb"), 0)
+        self.assertNotEqual(self._open_as(self.worker_uid, scratch / "new", "wb"), 0)
+        check = """
+import os
+import sys
+from pathlib import Path
+reference, scratch, sibling, artifact = map(Path, sys.argv[1:])
+assert reference.read_bytes() == b"reference"
+assert not sibling.exists()
+for action in (lambda: reference.write_bytes(b"bad"), reference.unlink, artifact.read_bytes):
+    try:
+        action()
+    except OSError:
+        pass
+    else:
+        raise AssertionError("unexpected access")
+(scratch / "runner-output").write_bytes(b"output")
+"""
+        result = subprocess.run(
+            [
+                "/usr/bin/systemd-run", "--quiet", "--pipe", "--wait", "--collect",
+                f"--unit=media-generation-test-{attempt[4:]}",
+                "--service-type=exec", "--property=ProtectSystem=strict",
+                f"--property=User={self.runner_uid}", f"--property=Group={self.runner_uid}",
+                f"--working-directory={scratch}",
+                *(f"--property={property_}" for property_ in _attempt_mount_properties(scratch)),
+                "--", "/usr/bin/python3", "-I", "-c", check, str(inputs / "0.png"),
+                str(scratch), str(sibling), str(artifact),
+            ],
+            capture_output=True, text=True, check=False, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((scratch / "runner-output").read_bytes(), b"output")
 
 
 if __name__ == "__main__":

@@ -1246,7 +1246,7 @@ def test_broker_peer_authorization_uses_linux_credential_field_order(
             return False
 
         @staticmethod
-        def recvmsg(_limit):
+        def recvmsg(_limit, _ancillary_size):
             return b"request", (), 0, None
 
     connection = PeerConnection()
@@ -1297,7 +1297,7 @@ def test_broker_rejects_worker_peer_with_unexpected_process_groups(
             return False
 
         @staticmethod
-        def recvmsg(_limit):
+        def recvmsg(_limit, _ancillary_size):
             return b"request", (), 0, None
 
     def reject_process_groups(pid: int, **kwargs: object) -> None:
@@ -2995,9 +2995,13 @@ def test_broker_rejects_unsafe_library_search_path_entries(
         environment_path_allowlist=(library, binary, rocm),
     )
     broker.store = _Store()
+    broker.store.attempt_containment_identity = lambda *_args: None
+    broker.store.record_broker_prelaunch_refusal = lambda *_args: True
+    broker._active = {}
+    broker._active_lock = threading.RLock()
     broker._require_current_claim = lambda *_args: None
     broker._validate_engine_paths = lambda _argv: None
-    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: {})
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _unit: None)
     request = {
         "job_id": identity.job_id,
         "attempt_id": identity.attempt_id,
@@ -3012,8 +3016,10 @@ def test_broker_rejects_unsafe_library_search_path_entries(
         "runner_gid": identity.runner_gid,
     }
 
-    with pytest.raises(PermissionError, match="environment search path"):
+    with pytest.raises(broker_module._PrelaunchRefusal) as error:
         broker._execute(object(), request)
+    assert isinstance(error.value.__cause__, PermissionError)
+    assert "environment search path" in str(error.value.__cause__)
 
 
 def test_broker_accepts_configured_environment_search_paths(
@@ -6934,3 +6940,236 @@ def test_broker_fails_closed_when_posix_acl_state_cannot_be_read(
 
     with pytest.raises(PermissionError, match="ACL state cannot be verified"):
         broker_module._require_no_extended_posix_acl(path)
+
+
+def test_systemd_resolves_worker_reference_to_protected_attempt_path(tmp_path) -> None:
+    from PIL import Image
+    from media_generation.domain import GenerationRequest
+
+    class CapturingRunner(_SyntheticSystemdAttemptRunner):
+        def execute_attempt(self, claim, prepared):
+            self.invocation = claim, prepared
+            raise RuntimeError("stop before systemd launch")
+
+    runner = CapturingRunner(tmp_path / "broker-scratch")
+    service, _ = _systemd_service(tmp_path, runner)
+    Image.new("RGB", (64, 64)).save(tmp_path / "reference.png")
+    artifact = service.import_image(tmp_path, "reference.png")
+    service.enqueue(
+        "reference-handoff",
+        GenerationRequest(prompt="reference", reference_ids=(artifact.artifact_id,)),
+        workload_demand=heavy_workload_demand(),
+    )
+    service.work()
+    claim, prepared = runner.invocation
+    expected = runner.scratch_root / f"{claim.attempt_id}.inputs" / "0.png"
+    assert prepared.argv[prepared.argv.index("-r") + 1] == str(expected)
+    assert prepared.resolved_record["argv"] == list(prepared.argv)
+    assert claim.references[0].path == Path(artifact.path)
+
+
+@pytest.mark.parametrize("case", ["valid", "missing", "wrong_digest", "extra", "writable", "directory"])
+def test_broker_reference_descriptor_handoff(tmp_path, monkeypatch, case) -> None:
+    import array
+
+    if sys.platform != "linux":
+        pytest.skip("Linux broker descriptor transport")
+    identity = _identity()
+    scratch = tmp_path / identity.attempt_id
+    inputs = scratch.with_name(scratch.name + ".inputs")
+    raw = b"immutable reference bytes"
+    source = tmp_path / "worker-artifact.png"
+    source.write_bytes(raw)
+    condition = {
+        "artifact_id": "art_" + "d" * 32,
+        "role": "reference",
+        "content_sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    resolved = {
+        "argv": ["/engine", "-r", str(inputs / "0.png")],
+        "environment": environment_record({}),
+        "conditioning": [condition],
+    }
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.configuration = SimpleNamespace(
+        scratch_root=tmp_path, scratch_gid=os.getgid(),
+        runner_uid=identity.runner_uid, runner_gid=identity.runner_gid,
+        runner_groups=frozenset({identity.runner_gid}),
+        worker_uid=os.getuid(), worker_gid=os.getgid(), model_read_gid=1,
+    )
+    broker.store = SimpleNamespace(
+        get_backend_execution=lambda *_: {
+            "state": "resolved", "resolved": resolved, "resolved_digest": identity.resolved_digest,
+        },
+        current_attempt=lambda *_: {
+            "attempt_id": identity.attempt_id,
+            "plan_json": json.dumps({"references": [condition]}),
+        },
+        attempt_containment_identity=lambda *_: None,
+        record_broker_prelaunch_refusal=lambda *_: True,
+    )
+    broker._require_current_claim = lambda *_: None
+    broker._validate_engine_paths = lambda argv: (
+        None if argv == ["/engine"] else pytest.fail(f"unexpected invocation {argv}")
+    )
+    broker._active = {}
+    broker._active_lock = threading.RLock()
+    monkeypatch.setattr(broker_module, "_require_process_credentials", lambda *a, **kw: None)
+    monkeypatch.setattr(broker_module, "_unit_properties", lambda _: None)
+    monkeypatch.setattr(broker_module, "_mode_allows", lambda *a, **kw: True)
+    monkeypatch.setattr(broker_module, "backend_digest", lambda _: identity.resolved_digest)
+    if os.getuid() != 0:
+        monkeypatch.setattr(broker_module.os, "chown", lambda *a: None)
+        monkeypatch.setattr(broker_module.os, "fchown", lambda *a: None)
+        actual_lstat = Path.lstat
+
+        def root_owned(path):
+            result = actual_lstat(path)
+            if path == inputs or path == scratch:
+                values = list(result)
+                values[4] = 0
+                return os.stat_result(values)
+            return result
+
+        monkeypatch.setattr(Path, "lstat", root_owned)
+    launched = []
+
+    def stop_at_launch(_config, _unit, _scratch):
+        launched.append(True)
+        assert (inputs / "0.png").read_bytes() == raw
+        assert stat.S_IMODE(inputs.stat().st_mode) == 0o750
+        assert stat.S_IMODE((inputs / "0.png").stat().st_mode) == 0o440
+        raise RuntimeError("launch outcome unknown")
+
+    monkeypatch.setattr(broker_module, "_start_systemd_run", stop_at_launch)
+    request = {
+        "operation": "execute",
+        "job_id": identity.job_id, "attempt_id": identity.attempt_id,
+        "owner_id": identity.owner_id, "claim_epoch": identity.claim_epoch,
+        "resolved_digest": identity.resolved_digest, "resolved_record": resolved,
+        "argv": resolved["argv"], "environment": {}, "scratch_directory": str(scratch),
+        "runner_uid": identity.runner_uid, "runner_gid": identity.runner_gid,
+    }
+    if case == "wrong_digest":
+        source.write_bytes(b"x" * len(raw))
+    fd = os.open(tmp_path if case == "directory" else source,
+                 os.O_RDWR if case == "writable" else os.O_RDONLY)
+    server, client = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with server, client:
+            outgoing = [] if case == "missing" else [fd, fd] if case == "extra" else [fd]
+            ancillary = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", outgoing))] if outgoing else []
+            client.sendmsg([json.dumps(request).encode()], ancillary)
+            broker._serve_connection(server)
+            reply = json.loads(client.recv(4096))
+    finally:
+        os.close(fd)
+    if case == "valid":
+        assert launched == [True]
+        assert reply == {"ok": False, "error": "broker_operation_failed"}
+        assert inputs.is_dir()
+        assert scratch.is_dir()
+        broker._remove_scratch(identity.attempt_id)
+    else:
+        assert not launched
+        assert not scratch.exists()
+        assert reply == {"ok": False, "prelaunch_refusal": broker_module.prelaunch_binding(request)}
+    assert not inputs.exists()
+
+
+@pytest.mark.parametrize("binding", ["match", "wrong_attempt", "non_root", "ordinary_error"])
+def test_execute_refusal_requires_exact_authenticated_response(tmp_path, monkeypatch, binding) -> None:
+    from media_generation import systemd_attempts as attempts
+
+    runner = SystemdAttemptRunner(
+        tmp_path / "broker.sock", scratch_root=tmp_path, runner_uid=970, runner_gid=970,
+    )
+    identity = _identity()
+    monkeypatch.setattr(attempts, "sys_platform_linux", lambda: True)
+    monkeypatch.setattr(attempts, "_validate_broker_socket", lambda _: None)
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+
+    class Connection:
+        def connect(self, address):
+            return None
+
+        def close(self):
+            return None
+
+        def sendmsg(self, buffers):
+            self.request = json.loads(buffers[0])
+            return len(buffers[0])
+
+        def getsockopt(self, *_args):
+            return struct.pack("3i", 123, 1000 if binding == "non_root" else 0, 0)
+
+        def recvmsg(self, *_args):
+            refusal = attempts.prelaunch_binding(self.request)
+            if binding == "wrong_attempt":
+                refusal["attempt_id"] = "att_" + "e" * 32
+            if binding == "ordinary_error":
+                return b'{"ok":false,"error":"broker_operation_failed"}', [], 0, None
+            return json.dumps({"ok": False, "prelaunch_refusal": refusal}).encode(), [], 0, None
+
+    monkeypatch.setattr(attempts.socket, "socket", lambda *_: Connection())
+    expected = attempts.SystemdAttemptPrelaunchRefusal if binding == "match" else RuntimeError
+    with pytest.raises(expected):
+        runner._request({
+            "operation": "execute", "job_id": identity.job_id, "attempt_id": identity.attempt_id,
+            "owner_id": identity.owner_id, "claim_epoch": identity.claim_epoch,
+            "resolved_digest": identity.resolved_digest,
+        })
+
+
+def test_confirmed_broker_prelaunch_refusal_releases_without_cgroup(tmp_path) -> None:
+    from media_generation.systemd_attempts import SystemdAttemptPrelaunchRefusal
+
+    class RefusingRunner(_SyntheticSystemdAttemptRunner):
+        def execute_attempt(self, claim, prepared):
+            raise SystemdAttemptPrelaunchRefusal("broker refused before launch")
+
+    service, _ = _systemd_service(tmp_path, RefusingRunner(tmp_path / "broker-scratch"))
+    queued = service.enqueue(
+        "confirmed-broker-refusal", _request(), workload_demand=heavy_workload_demand(),
+    )
+    service.work()
+    result = service.get_provenance(queued.job_id)
+    assert result["attempt"]["failure_class"] == "terminal"
+    assert result["execution"]["failure_message"] == (
+        "execution_preparation_failed: broker_prelaunch_refusal: rejected"
+    )
+    assert result["artifact"] is None
+    assert service.get_execution(queued.job_id)["state"] == "resolved"
+    assert service._store.resource_snapshot()["state"] == "available"
+
+@pytest.mark.parametrize("canceled", [False, True])
+def test_broker_refusal_blocks_launch_across_broker_replacement(
+    tmp_path, monkeypatch, canceled,
+) -> None:
+    store, claim, identity, service = _claimed_systemd_attempt(tmp_path, return_service=True)
+    monkeypatch.setattr(store_module.os, "geteuid", lambda: 0)
+    broker = object.__new__(SystemdAttemptBroker)
+    broker.store = store
+    fields = (claim.job_id, claim.attempt_id, claim.owner_id, claim.claim_epoch)
+    broker._require_current_claim(*fields)
+    if canceled:
+        assert store.cancel_execution(claim.job_id, _now()) == "requested"
+    assert not store.record_broker_prelaunch_refusal(*fields, "0" * 64)
+    assert not store.record_broker_prelaunch_refusal(
+        claim.job_id, claim.attempt_id, "wrong-owner", claim.claim_epoch, identity.resolved_digest
+    )
+    assert store.record_broker_prelaunch_refusal(*fields, identity.resolved_digest)
+    if not canceled:
+        assert not store.record_broker_prelaunch_refusal(*fields, identity.resolved_digest)
+    replacement = object.__new__(SystemdAttemptBroker)
+    replacement.store = store_module.SQLiteStore(service.database_path)
+    with pytest.raises(PermissionError, match="stale or not systemd-qualified"):
+        replacement._require_current_claim(*fields)
+    assert store.resource_snapshot()["state"] == "claimed"
+    assert store.fail_execution(
+        claim.job_id, claim.attempt_id, "confirmed refusal", _now(),
+        attempt_owner_id=claim.owner_id, claim_epoch=claim.claim_epoch,
+        failure_class="canceled" if canceled else "terminal",
+        prelaunch_refusal=True, termination_proven=True,
+    )
+    assert store.resource_snapshot()["state"] == "available"

@@ -15,10 +15,14 @@ import os
 import re
 import socket
 import stat
+import struct
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Mapping
+
+from .systemd_protocol import received_descriptors
 
 
 SYSTEMD_CGROUP_CONTAINMENT_CONTRACT = "systemd-cgroup-v2/v1"
@@ -48,6 +52,20 @@ _IDENTITY_FIELDS = frozenset(
 _TERMINATION_FIELDS = frozenset(
     {"version", "identity", "source", "populated", "observed_monotonic_ns", "observed_at"}
 )
+
+
+def staged_reference_directory(scratch: Path) -> Path:
+    """Locate the broker-owned inputs beside the runner's writable scratch."""
+    if not _ATTEMPT_ID.fullmatch(scratch.name):
+        raise ValueError("invalid attempt scratch name")
+    return scratch.with_name(scratch.name + ".inputs")
+
+
+def prelaunch_binding(request: Mapping[str, object]) -> dict[str, object]:
+    """Identify the exact execute request that a broker refusal covers."""
+    return {key: request[key] for key in (
+        "job_id", "attempt_id", "owner_id", "claim_epoch", "resolved_digest",
+    )}
 
 
 def _require_text(value: object, field: str) -> str:
@@ -253,6 +271,10 @@ class SystemdAttemptPreRpcError(Exception):
     """Mark local request validation that failed before the broker RPC began."""
 
 
+class SystemdAttemptPrelaunchRefusal(Exception):
+    """Report an authenticated refusal before the broker attempted launch."""
+
+
 class SystemdAttemptRunner:
     """Typed client for the root-owned systemd attempt broker.
 
@@ -314,36 +336,45 @@ class SystemdAttemptRunner:
         request call starts, a failure may follow broker acceptance and remains
         an ambiguous execution outcome.
         """
-        try:
-            resolved_record = getattr(prepared, "resolved_record")
-            argv = getattr(prepared, "argv")
-            environment = getattr(prepared, "environment")
-            scratch = Path(getattr(prepared, "scratch_directory")).absolute()
-            if not scratch.is_relative_to(self.scratch_root):
-                raise ValueError(
-                    "resolved scratch directory is outside broker scratch root"
-                )
-            if not isinstance(resolved_record, Mapping):
-                raise ValueError("prepared invocation has no resolved record")
-            request = {
-                "operation": "execute",
-                "job_id": getattr(claim, "job_id"),
-                "attempt_id": getattr(claim, "attempt_id"),
-                "owner_id": getattr(claim, "owner_id"),
-                "claim_epoch": getattr(claim, "claim_epoch"),
-                "resolved_digest": identity_digest_from_record(resolved_record),
-                "resolved_record": dict(resolved_record),
-                "argv": list(argv),
-                "environment": dict(environment),
-                "scratch_directory": str(scratch),
-                "runner_uid": self.runner_uid,
-                "runner_gid": self.runner_gid,
-            }
-        except Exception as error:
-            raise SystemdAttemptPreRpcError(
-                "attempt request validation failed"
-            ) from error
-        response, output_fd = self._request(request)
+        with ExitStack() as opened:
+            reference_fds: list[int] = []
+            try:
+                resolved_record = getattr(prepared, "resolved_record")
+                argv = getattr(prepared, "argv")
+                environment = getattr(prepared, "environment")
+                scratch = Path(getattr(prepared, "scratch_directory")).absolute()
+                if not scratch.is_relative_to(self.scratch_root):
+                    raise ValueError(
+                        "resolved scratch directory is outside broker scratch root"
+                    )
+                if not isinstance(resolved_record, Mapping):
+                    raise ValueError("prepared invocation has no resolved record")
+                request = {
+                    "operation": "execute",
+                    "job_id": getattr(claim, "job_id"),
+                    "attempt_id": getattr(claim, "attempt_id"),
+                    "owner_id": getattr(claim, "owner_id"),
+                    "claim_epoch": getattr(claim, "claim_epoch"),
+                    "resolved_digest": identity_digest_from_record(resolved_record),
+                    "resolved_record": dict(resolved_record),
+                    "argv": list(argv),
+                    "environment": dict(environment),
+                    "scratch_directory": str(scratch),
+                    "runner_uid": self.runner_uid,
+                    "runner_gid": self.runner_gid,
+                }
+                for reference in getattr(claim, "references", ()):
+                    fd = os.open(reference.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    opened.callback(os.close, fd)
+                    reference_fds.append(fd)
+            except Exception as error:
+                raise SystemdAttemptPreRpcError(
+                    "attempt request validation failed"
+                ) from error
+            if reference_fds:
+                response, output_fd = self._request(request, reference_fds=reference_fds)
+            else:
+                response, output_fd = self._request(request)
         try:
             identity = AttemptUnitIdentity.from_mapping(response["identity"])
             raw_termination = response.get("termination_evidence")
@@ -460,7 +491,9 @@ class SystemdAttemptRunner:
         if response.get("acknowledged") is not True:
             raise RuntimeError("broker did not acknowledge recovery cleanup")
 
-    def _request(self, request: Mapping[str, object]) -> tuple[dict[str, object], int | None]:
+    def _request(
+        self, request: Mapping[str, object], *, reference_fds: list[int] | None = None,
+    ) -> tuple[dict[str, object], int | None]:
         if not sys_platform_linux():
             raise OSError("systemd attempt broker is available only on Linux")
         _validate_broker_socket(self.socket_path)
@@ -472,28 +505,32 @@ class SystemdAttemptRunner:
         client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
         try:
             client.connect(str(self.socket_path))
-            sent = client.sendmsg([payload])
+            sent = (
+                client.sendmsg([payload], [
+                    (socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", reference_fds))
+                ]) if reference_fds else client.sendmsg([payload])
+            )
             if sent != len(payload):
                 raise OSError("systemd broker packet was not sent atomically")
             response_data, ancillary, flags, _ = client.recvmsg(
                 1024 * 1024, socket.CMSG_SPACE(array.array("i").itemsize)
             )
+            descriptors = received_descriptors(ancillary, flags, limit=1)
+            output_fd = descriptors[0] if descriptors else None
+            try:
+                peer_uid = (
+                    struct.unpack("3i", client.getsockopt(
+                        socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                    ))[1]
+                    if request["operation"] == "execute" and hasattr(socket, "SO_PEERCRED")
+                    else None
+                )
+            except BaseException:
+                if output_fd is not None:
+                    os.close(output_fd)
+                raise
         finally:
             client.close()
-        if flags & getattr(socket, "MSG_TRUNC", 0):
-            raise ValueError("systemd broker response exceeded the protocol limit")
-        output_fd: int | None = None
-        for level, kind, raw in ancillary:
-            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-                descriptors = array.array("i")
-                descriptors.frombytes(raw[: len(raw) - (len(raw) % descriptors.itemsize)])
-                if len(descriptors) != 1 or output_fd is not None:
-                    for descriptor in descriptors:
-                        os.close(descriptor)
-                    if output_fd is not None:
-                        os.close(output_fd)
-                    raise ValueError("broker sent an unexpected descriptor set")
-                output_fd = descriptors[0]
         try:
             response = json.loads(response_data.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -507,6 +544,16 @@ class SystemdAttemptRunner:
         if not response["ok"]:
             if output_fd is not None:
                 os.close(output_fd)
+            if (
+                peer_uid == 0
+                and output_fd is None
+                and request["operation"] == "execute"
+                and set(response) == {"ok", "prelaunch_refusal"}
+                and isinstance(refusal := response["prelaunch_refusal"], dict)
+                and type(refusal.get("claim_epoch")) is int
+                and refusal == prelaunch_binding(request)
+            ):
+                raise SystemdAttemptPrelaunchRefusal("broker refused before launch")
             raise RuntimeError(str(response.get("error", "systemd broker rejected request")))
         return response, output_fd
 
