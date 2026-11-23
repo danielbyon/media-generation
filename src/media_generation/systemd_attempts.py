@@ -249,6 +249,10 @@ class SystemdAttemptCompletion:
             raise ValueError("runner_exit_signal must be a positive signal number")
 
 
+class SystemdAttemptPreRpcError(Exception):
+    """Mark local request validation that failed before the broker RPC began."""
+
+
 class SystemdAttemptRunner:
     """Typed client for the root-owned systemd attempt broker.
 
@@ -304,17 +308,24 @@ class SystemdAttemptRunner:
                 os.close(descriptor)
 
     def execute_attempt(self, claim: object, prepared: object) -> SystemdAttemptCompletion:
-        """Run the exact resolved invocation and receive its output only after proof."""
-        resolved_record = getattr(prepared, "resolved_record")
-        argv = getattr(prepared, "argv")
-        environment = getattr(prepared, "environment")
-        scratch = Path(getattr(prepared, "scratch_directory")).absolute()
-        if not scratch.is_relative_to(self.scratch_root):
-            raise ValueError("resolved scratch directory is outside broker scratch root")
-        if not isinstance(resolved_record, Mapping):
-            raise ValueError("prepared invocation has no resolved record")
-        response, output_fd = self._request(
-            {
+        """Validate the request locally, then run it through the broker.
+
+        Local validation failures are marked before entering the RPC. Once the
+        request call starts, a failure may follow broker acceptance and remains
+        an ambiguous execution outcome.
+        """
+        try:
+            resolved_record = getattr(prepared, "resolved_record")
+            argv = getattr(prepared, "argv")
+            environment = getattr(prepared, "environment")
+            scratch = Path(getattr(prepared, "scratch_directory")).absolute()
+            if not scratch.is_relative_to(self.scratch_root):
+                raise ValueError(
+                    "resolved scratch directory is outside broker scratch root"
+                )
+            if not isinstance(resolved_record, Mapping):
+                raise ValueError("prepared invocation has no resolved record")
+            request = {
                 "operation": "execute",
                 "job_id": getattr(claim, "job_id"),
                 "attempt_id": getattr(claim, "attempt_id"),
@@ -327,8 +338,12 @@ class SystemdAttemptRunner:
                 "scratch_directory": str(scratch),
                 "runner_uid": self.runner_uid,
                 "runner_gid": self.runner_gid,
-            },
-        )
+            }
+        except Exception as error:
+            raise SystemdAttemptPreRpcError(
+                "attempt request validation failed"
+            ) from error
+        response, output_fd = self._request(request)
         try:
             identity = AttemptUnitIdentity.from_mapping(response["identity"])
             raw_termination = response.get("termination_evidence")

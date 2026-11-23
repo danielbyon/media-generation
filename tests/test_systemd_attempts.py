@@ -5895,6 +5895,87 @@ def test_resolution_failure_leaves_no_broker_scratch_directory(
     assert runner.scratch_directory.exists() is False
 
 
+def test_local_runner_validation_refusal_is_diagnosed_before_broker_request(
+    tmp_path,
+) -> None:
+    class InvalidPreparedExecutionRunner(_SyntheticSystemdAttemptRunner):
+        def __init__(self, scratch_root):
+            super().__init__(scratch_root)
+            self.request_operations = []
+
+        def execute_attempt(self, claim, prepared):
+            invalid = SimpleNamespace(
+                resolved_record=prepared.resolved_record,
+                argv=prepared.argv,
+                environment=prepared.environment,
+                scratch_directory=self.scratch_root.parent / "outside-scratch",
+            )
+            return SystemdAttemptRunner.execute_attempt(self, claim, invalid)
+
+        def _request(self, request):
+            self.request_operations.append(request["operation"])
+            raise AssertionError("local validation must finish before broker RPC")
+
+    runner = InvalidPreparedExecutionRunner(tmp_path / "broker-scratch")
+    service, _ = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        "local-runner-validation-refusal",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+
+    report = service.work()
+    provenance = service.get_provenance(queued.job_id)
+    attempt_id = provenance["attempt"]["attempt_id"]
+
+    assert report["processed"] == 1
+    assert provenance["status"] == "failed"
+    assert provenance["attempt"]["failure_class"] == "terminal"
+    assert provenance["attempt"]["termination_proven"] is True
+    assert provenance["execution"]["failure_message"] == (
+        "execution_preparation_failed: attempt_request_validation: invalid_state"
+    )
+    assert service.get_execution(queued.job_id)["state"] == "resolved"
+    assert service._store.attempt_containment_identity(
+        queued.job_id, attempt_id
+    ) is None
+    assert runner.request_operations == []
+    assert service._store.resource_snapshot()["state"] == "available"
+
+
+def test_runner_rpc_failure_remains_ambiguous_after_request_entry(tmp_path) -> None:
+    class UncertainBrokerRequestRunner(_SyntheticSystemdAttemptRunner):
+        def __init__(self, scratch_root):
+            super().__init__(scratch_root)
+            self.request_operations = []
+
+        def execute_attempt(self, claim, prepared):
+            return SystemdAttemptRunner.execute_attempt(self, claim, prepared)
+
+        def _request(self, request):
+            self.request_operations.append(request["operation"])
+            raise OSError("broker response was lost")
+
+    runner = UncertainBrokerRequestRunner(tmp_path / "broker-scratch")
+    service, _ = _systemd_service(tmp_path, runner)
+    queued = service.enqueue(
+        "uncertain-runner-request",
+        _request(),
+        workload_demand=heavy_workload_demand(),
+    )
+
+    report = service.work()
+    provenance = service.get_provenance(queued.job_id)
+
+    assert report["processed"] == 1
+    assert provenance["status"] == "ambiguous"
+    assert provenance["attempt"]["failure_class"] == "ambiguous"
+    assert provenance["attempt"]["termination_proven"] is False
+    assert provenance["execution"]["failure_message"] == "execution_ambiguous"
+    assert runner.request_operations == ["execute"]
+    assert service._store.resource_snapshot()["state"] == "quarantined"
+
+
 def test_worker_validates_pinned_output_after_scratch_name_disappears(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

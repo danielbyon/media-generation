@@ -87,6 +87,7 @@ from .publication import PublicationManager, Checkpoint
 from .systemd_attempts import (
     SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
     SystemdAttemptCompletion,
+    SystemdAttemptPreRpcError,
     SystemdAttemptRunner,
 )
 
@@ -1368,6 +1369,15 @@ class GenerationService:
             )
             return None
         except Exception as error:
+            systemd_prelaunch_refusal = False
+            cursor: BaseException | None = error
+            while cursor is not None:
+                if isinstance(cursor, SystemdAttemptPreRpcError):
+                    systemd_prelaunch_refusal = True
+                    break
+                cursor = cursor.__cause__
+            if systemd_prelaunch_refusal:
+                prelaunch_stage = "attempt_request_validation"
             snapshot = self._store.get_provenance(claim.job_id)
             if snapshot["artifact"] is not None and snapshot["status"] == "succeeded":
                 return None
@@ -1376,7 +1386,8 @@ class GenerationService:
                     not adapter_dispatched
                     and not executed
                     and (
-                        not execute_entered
+                        systemd_prelaunch_refusal
+                        or not execute_entered
                         or (
                             supervisor is not None
                             and not supervisor.process_started
@@ -1414,7 +1425,8 @@ class GenerationService:
                     break
                 cursor = cursor.__cause__
             if not adapter_dispatched and (
-                not execute_entered
+                systemd_prelaunch_refusal
+                or not execute_entered
                 or (
                     not process_started
                     and supervisor is not None
