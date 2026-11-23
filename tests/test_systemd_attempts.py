@@ -825,6 +825,95 @@ def test_process_credentials_parser_reads_kernel_ids_and_groups(
     )
 
 
+@pytest.mark.parametrize(
+    ("uid", "gid", "expected_groups", "expected_cgroup"),
+    [
+        pytest.param(972, 972, {973}, None, id="worker"),
+        pytest.param(970, 970, {971, 973, 990}, "/system.slice/attempt.service", id="runner"),
+        pytest.param(
+            970, 970, {970, 971, 973, 990}, "/system.slice/attempt.service",
+            id="runner-primary-configured",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("scenario", "error"),
+    [
+        ("supplementary_only", None),
+        ("primary_in_groups", None),
+        ("missing_group", "supplementary groups"),
+        ("unexpected_group", "supplementary groups"),
+        *((f"uid_{i}", "UID or GID") for i in range(4)),
+        *((f"gid_{i}", "UID or GID") for i in range(4)),
+        ("malformed", "credentials cannot be verified"),
+        ("incomplete", "credentials cannot be verified"),
+        ("wrong_cgroup", "cgroup differs"),
+    ],
+)
+def test_broker_checks_kernel_process_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    uid: int,
+    gid: int,
+    expected_groups: set[int],
+    expected_cgroup: str | None,
+    scenario: str,
+    error: str | None,
+) -> None:
+    process = tmp_path / "4242"
+    process.mkdir()
+    uids, gids = [uid] * 4, [gid] * 4
+    groups = expected_groups | {gid}
+    cgroup = expected_cgroup or "/user.slice/worker.scope"
+    if scenario == "supplementary_only":
+        groups = expected_groups - {gid}
+    elif scenario == "missing_group":
+        groups.remove(973)
+    elif scenario == "unexpected_group":
+        groups.add(44)
+    elif scenario.startswith("uid_"):
+        uids[int(scenario[-1])] = 1000
+    elif scenario.startswith("gid_"):
+        gids[int(scenario[-1])] = 1000
+    elif scenario == "wrong_cgroup":
+        cgroup = "/system.slice/different-attempt.service"
+        if expected_cgroup is None:
+            error = None
+
+    group_field = "Groups: " + " ".join(map(str, sorted(groups))) + "\n"
+    if scenario == "malformed":
+        group_field = "Groups: invalid\n"
+    elif scenario == "incomplete":
+        group_field = ""
+    (process / "status").write_text(
+        "Pid: 4242\n"
+        + "Uid: " + " ".join(map(str, uids)) + "\n"
+        + "Gid: " + " ".join(map(str, gids)) + "\n"
+        + group_field,
+        encoding="ascii",
+    )
+    (process / "cgroup").write_text(f"0::{cgroup}\n", encoding="ascii")
+    reader = broker_module._read_process_credentials
+    monkeypatch.setattr(
+        broker_module, "_read_process_credentials", lambda pid: reader(pid, proc_root=tmp_path)
+    )
+
+    def verify() -> None:
+        broker_module._require_process_credentials(
+            4242,
+            uid=uid,
+            gid=gid,
+            supplementary_gids=frozenset(expected_groups),
+            cgroup_path=expected_cgroup,
+        )
+
+    if error is None:
+        verify()
+    else:
+        with pytest.raises(PermissionError, match=error):
+            verify()
+
+
 def test_broker_rejects_actual_process_groups_outside_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

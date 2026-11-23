@@ -2003,7 +2003,7 @@ def _require_process_credentials(
         raise PermissionError("process credentials cannot be verified") from error
     if uids != (uid, uid, uid, uid) or gids != (gid, gid, gid, gid):
         raise PermissionError("process UID or GID credentials differ from broker policy")
-    if groups != supplementary_gids:
+    if groups - {gid} != supplementary_gids - {gid}:
         raise PermissionError("process supplementary groups differ from broker policy")
     if cgroup_path is not None and observed_cgroup != cgroup_path:
         raise PermissionError("process cgroup differs from broker unit identity")
