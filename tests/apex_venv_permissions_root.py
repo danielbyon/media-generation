@@ -87,21 +87,25 @@ class BrokerFilesystemPermissionsTests(unittest.TestCase):
 
     @unittest.skipUnless(Path("/run/systemd/system").is_dir(), "requires a live systemd manager")
     def test_transient_runner_sees_only_its_own_scratch_and_inputs(self) -> None:
+        runner = pwd.getpwuid(int(os.environ["SUDO_UID"])) if "SUDO_UID" in os.environ else pwd.getpwnam("nobody")
+        self.assertNotEqual(runner.pw_uid, 0)
+        self.assertNotEqual(runner.pw_uid, self.worker_uid)
         attempt = "att_" + uuid.uuid4().hex
+        unit = f"media-generation-test-{attempt[4:]}.service"
         storage = self.root / "scratch"
         storage.mkdir(mode=0o710)
-        os.chown(storage, 0, self.runner_uid)
+        os.chown(storage, 0, runner.pw_gid)
         scratch = storage / attempt
         scratch.mkdir(mode=0o770)
-        os.chown(scratch, 0, self.runner_uid)
+        os.chown(scratch, 0, runner.pw_gid)
         inputs = storage / (attempt + ".inputs")
         sibling = storage / ("att_" + uuid.uuid4().hex + ".inputs")
         for directory in (inputs, sibling):
             directory.mkdir(mode=0o750)
-            os.chown(directory, 0, self.runner_uid)
+            os.chown(directory, 0, runner.pw_gid)
             path = directory / "0.png"
             path.write_bytes(b"reference")
-            os.chown(path, 0, self.runner_uid)
+            os.chown(path, 0, runner.pw_gid)
             path.chmod(0o440)
         private = self.root / "artifacts"
         private.mkdir(mode=0o700)
@@ -111,7 +115,6 @@ class BrokerFilesystemPermissionsTests(unittest.TestCase):
         self.assertNotEqual(self._open_as(self.worker_uid, inputs / "0.png", "rb"), 0)
         self.assertNotEqual(self._open_as(self.worker_uid, scratch / "new", "wb"), 0)
         check = """
-import os
 import sys
 from pathlib import Path
 reference, scratch, sibling, artifact = map(Path, sys.argv[1:])
@@ -129,9 +132,9 @@ for action in (lambda: reference.write_bytes(b"bad"), reference.unlink, artifact
         result = subprocess.run(
             [
                 "/usr/bin/systemd-run", "--quiet", "--pipe", "--wait", "--collect",
-                f"--unit=media-generation-test-{attempt[4:]}",
+                f"--unit={unit}",
                 "--service-type=exec", "--property=ProtectSystem=strict",
-                f"--property=User={self.runner_uid}", f"--property=Group={self.runner_uid}",
+                f"--property=User={runner.pw_name}", f"--property=Group={runner.pw_gid}",
                 f"--working-directory={scratch}",
                 *(f"--property={property_}" for property_ in _attempt_mount_properties(scratch)),
                 "--", "/usr/bin/python3", "-I", "-c", check, str(inputs / "0.png"),
@@ -139,7 +142,12 @@ for action in (lambda: reference.write_bytes(b"bad"), reference.unlink, artifact
             ],
             capture_output=True, text=True, check=False, timeout=30,
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        if result.returncode:
+            journal = subprocess.run(
+                ["/usr/bin/journalctl", "--no-pager", "-u", unit, "-n", "20"],
+                capture_output=True, text=True, check=False, timeout=10,
+            )
+            self.fail(f"systemd-run exit {result.returncode}: {result.stderr}\n{journal.stdout}")
         self.assertEqual((scratch / "runner-output").read_bytes(), b"output")
 
 
