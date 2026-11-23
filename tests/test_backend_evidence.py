@@ -28,6 +28,7 @@ from media_generation.domain import GenerationPlan, GenerationRequest
 from media_generation.errors import (
     BackendEvidenceError,
     BackendPreparationError,
+    GenerationError,
     GenerationExecutionError,
     InputValidationError,
     RecordNotFoundError,
@@ -435,6 +436,50 @@ def test_pre_dispatch_refusal_is_terminal_without_ambiguous_quarantine(
     assert service._store.resource_snapshot()["state"] == "available"
     with pytest.raises(RecordNotFoundError):
         service.get_execution(queued.job_id)
+
+
+def test_untyped_pre_dispatch_refusal_records_sanitized_stage_and_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = build_bundle(tmp_path)
+    service = _service(tmp_path, bundle)
+    queued = service.enqueue(
+        "untyped-refusal", _request(), workload_demand=heavy_workload_demand()
+    )
+    sensitive_values = (
+        "/private/models/secret.gguf",
+        "credential=hidden-token",
+        "ROCM_PATH=/private/runtime",
+    )
+
+    def fail_execution_resolution(plan: GenerationPlan) -> object:
+        del plan
+        try:
+            raise PermissionError("access denied: " + " ".join(sensitive_values))
+        except PermissionError as cause:
+            raise GenerationError(
+                "execution resolution failed: " + " ".join(sensitive_values)
+            ) from cause
+
+    monkeypatch.setattr(
+        service.adapter, "resolve_execution", fail_execution_resolution
+    )
+
+    report = service.work()
+    provenance = service.get_provenance(queued.job_id)
+    failure_message = provenance["execution"]["failure_message"]
+
+    assert report["processed"] == 1
+    assert failure_message == (
+        "execution_preparation_failed: execution_resolution: access_denied"
+    )
+    assert provenance["attempt"]["failure_class"] == "terminal"
+    assert provenance["attempt"]["termination_proven"] is True
+    assert provenance["backend_execution"] is None
+    assert service._store.resource_snapshot()["state"] == "available"
+    for sensitive_value in sensitive_values:
+        assert sensitive_value not in json.dumps(provenance)
+        assert sensitive_value not in json.dumps(report)
 
 
 def test_residual_descendant_quarantines_a_successful_execution(

@@ -1188,6 +1188,7 @@ class GenerationService:
         supervisor: ProcessSupervisor | None = None
         systemd_completion: SystemdAttemptCompletion | None = None
         systemd_output_fd_consumed = False
+        prelaunch_stage = "execution_plan"
         try:
             plan = GenerationPlan(
                 job_id=claim.job_id,
@@ -1200,16 +1201,22 @@ class GenerationService:
                 output_slot=claim.output_slot,
                 output_slot_id=claim.output_slot_id,
             )
+            prelaunch_stage = "reference_artifact_validation"
             self._validate_reference_artifacts(claim.references)
             if self._backend_execution_contract is not None:
                 if self._attempt_runner is not None:
+                    prelaunch_stage = "attempt_containment_setup"
                     scratch_directory = self._attempt_runner.prepare_attempt(claim)
+                prelaunch_stage = "execution_resolution"
+                if self._attempt_runner is not None:
                     prepared_execution = self.adapter.resolve_execution(
                         plan, scratch_directory=scratch_directory
                     )
                 else:
                     prepared_execution = self.adapter.resolve_execution(plan)
+                prelaunch_stage = "execution_privacy_validation"
                 self._require_execution_privacy(prepared_execution, claim=claim)
+                prelaunch_stage = "execution_evidence_persistence"
                 self._store.insert_resolved_execution(
                     job_id=claim.job_id,
                     attempt_id=claim.attempt_id,
@@ -1218,13 +1225,16 @@ class GenerationService:
                     record=prepared_execution.resolved_record,
                     timestamp=_now(),
                 )
+            prelaunch_stage = "artifact_publication_setup"
             generated_artifact_id = _new_id("art")
 
             def write_image(destination: Path, staged: BinaryIO) -> None:
                 nonlocal metadata, adapter_dispatched, execute_entered, executed
                 nonlocal supervisor, systemd_completion
                 nonlocal systemd_output_fd_consumed
+                nonlocal prelaunch_stage
                 if prepared_execution is not None:
+                    prelaunch_stage = "engine_dispatch"
                     execute_entered = True
                     if self._attempt_runner is None:
                         supervisor = ProcessSupervisor(
@@ -1342,6 +1352,7 @@ class GenerationService:
                     created_at=_now(),
                 )
 
+            prelaunch_stage = "artifact_publication_setup"
             self._publication.publish(
                 write_image,
                 make_artifact,
@@ -1416,6 +1427,24 @@ class GenerationService:
                 if preparation_error is not None:
                     preparation_message = (
                         f"execution_preparation_failed: {preparation_error.code}"
+                    )
+                else:
+                    # Persist fixed labels only; exception text can expose paths or secrets.
+                    category = "unknown"
+                    cursor = error
+                    while cursor is not None:
+                        if isinstance(cursor, PermissionError):
+                            category = "access_denied"
+                        elif isinstance(cursor, FileNotFoundError):
+                            category = "missing_resource"
+                        elif isinstance(cursor, ValueError):
+                            category = "invalid_state"
+                        if category != "unknown":
+                            break
+                        cursor = cursor.__cause__
+                    preparation_message = (
+                        "execution_preparation_failed: "
+                        f"{prelaunch_stage}: {category}"
                     )
                 self._store.fail_execution(
                     claim.job_id,

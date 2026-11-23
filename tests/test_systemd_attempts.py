@@ -5862,6 +5862,13 @@ def test_resolution_failure_leaves_no_broker_scratch_directory(
 ) -> None:
     runner = _SyntheticSystemdAttemptRunner(tmp_path / "broker-scratch")
     service, runner = _systemd_service(tmp_path, runner)
+    dispatched_attempts: list[str] = []
+
+    def record_dispatch(claim, _prepared):
+        dispatched_attempts.append(claim.attempt_id)
+        raise AssertionError("execution resolution failed before runner dispatch")
+
+    monkeypatch.setattr(runner, "execute_attempt", record_dispatch)
 
     def refuse_resolution(*_args, **_kwargs):
         raise RuntimeError("synthetic resolution failure")
@@ -5876,7 +5883,14 @@ def test_resolution_failure_leaves_no_broker_scratch_directory(
     report = service.work()
 
     assert report["processed"] == 1
-    assert service.get_provenance(queued.job_id)["status"] == "failed"
+    provenance = service.get_provenance(queued.job_id)
+    attempt_id = provenance["attempt"]["attempt_id"]
+    assert provenance["status"] == "failed"
+    assert provenance["backend_execution"] is None
+    assert dispatched_attempts == []
+    assert service._store.attempt_containment_identity(
+        queued.job_id, attempt_id
+    ) is None
     assert runner.scratch_directory is not None
     assert runner.scratch_directory.exists() is False
 
