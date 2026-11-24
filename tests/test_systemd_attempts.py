@@ -703,7 +703,9 @@ def test_broker_ignores_unrelated_host_group_membership(
 
 
 
+@pytest.mark.parametrize("case", ["activation", "wrong-credentials", "timeout", "replacement"])
 def test_broker_checks_actual_runner_credentials_before_binding_containment(
+    case: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -713,7 +715,7 @@ def test_broker_checks_actual_runner_credentials_before_binding_containment(
     cgroup_directory.mkdir()
     (cgroup_directory / "cgroup.events").write_text("populated 1\n", encoding="ascii")
     bound: list[AttemptUnitIdentity] = []
-    credential_checks: list[tuple[int, dict[str, object]]] = []
+    credential_checks: list[str] = []
 
     class Store:
         @staticmethod
@@ -738,17 +740,46 @@ def test_broker_checks_actual_runner_credentials_before_binding_containment(
         "ControlGroup": identity.cgroup_path,
         "MainPID": "4242",
     }
-    monkeypatch.setattr(
-        broker_module,
-        "_unit_properties",
-        lambda _unit: expected_properties,
-    )
-    monkeypatch.setattr(
-        broker_module,
-        "_require_process_credentials",
-        lambda pid, **kwargs: credential_checks.append((pid, kwargs)),
-        raising=False,
-    )
+    ready = {**expected_properties, "ActiveState": "active", "SubState": "running"}
+    activating = {**expected_properties, "ActiveState": "activating", "SubState": "start"}
+    samples = {
+        "activation": [activating, ready, ready],
+        "wrong-credentials": [ready],
+        "timeout": [activating],
+        "replacement": [activating, {**ready, "InvocationID": "f" * 32}],
+    }[case]
+    current = samples[0]
+    queries = 0
+    elapsed = 0.0
+
+    def unit_properties(unit: str) -> dict[str, str]:
+        nonlocal current, queries
+        assert unit == identity.unit_name
+        current = samples[min(queries, len(samples) - 1)]
+        queries += 1
+        return current
+
+    def read_credentials(pid: int):
+        assert pid == 4242
+        assert not bound
+        credential_checks.append(current["SubState"])
+        if current is activating or case == "wrong-credentials":
+            return (0,) * 4, (0,) * 4, frozenset(), identity.cgroup_path
+        return (
+            (configuration.runner_uid,) * 4,
+            (configuration.runner_gid,) * 4,
+            frozenset(configuration.runner_supplementary_gids),
+            identity.cgroup_path,
+        )
+
+    def sleep(interval: float) -> None:
+        nonlocal elapsed
+        assert interval == 0.02
+        elapsed += interval
+
+    monkeypatch.setattr(broker_module, "_unit_properties", unit_properties)
+    monkeypatch.setattr(broker_module, "_read_process_credentials", read_credentials)
+    monkeypatch.setattr(broker_module, "time", SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep))
     monkeypatch.setattr(
         broker_module,
         "_boot_id",
@@ -766,7 +797,7 @@ def test_broker_checks_actual_runner_credentials_before_binding_containment(
     monkeypatch.setattr(broker_module.os, "open", open_cgroup)
     process = SimpleNamespace(poll=lambda: None)
 
-    observed, events_fd = broker._wait_for_containment(
+    args = (
         process,
         identity.unit_name,
         identity.job_id,
@@ -775,23 +806,28 @@ def test_broker_checks_actual_runner_credentials_before_binding_containment(
         identity.claim_epoch,
         identity.resolved_digest,
     )
-    os.close(events_fd)
+    if case == "activation":
+        observed, events_fd = broker._wait_for_containment(*args)
+        try:
+            assert observed.unit_name == identity.unit_name
+            assert observed.invocation_id == identity.invocation_id
+            assert bound == [observed]
+            assert queries == 3
+            assert broker_module._read_populated(events_fd) == 1
+        finally:
+            os.close(events_fd)
+        assert credential_checks == ["running"]
+    else:
+        error, message, checks = {
+            "wrong-credentials": (PermissionError, "UID or GID credentials differ", ["running"]),
+            "timeout": (TimeoutError, "did not establish its unit identity", []),
+            "replacement": (BackendEvidenceError, "invocation changed", []),
+        }[case]
+        with pytest.raises(error, match=message):
+            broker._wait_for_containment(*args)
+        assert not bound
+        assert credential_checks == checks
 
-    assert observed.unit_name == identity.unit_name
-    assert bound == [observed]
-    assert credential_checks == [
-        (
-            4242,
-            {
-                "uid": configuration.runner_uid,
-                "gid": configuration.runner_gid,
-                "supplementary_gids": frozenset(
-                    configuration.runner_supplementary_gids
-                ),
-                "cgroup_path": identity.cgroup_path,
-            },
-        )
-    ]
 
 
 def test_process_credentials_parser_reads_kernel_ids_and_groups(
@@ -1517,6 +1553,8 @@ def test_exited_launcher_can_bind_loaded_runner_and_clean_only_after_cgroup_proo
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
         "NoNewPrivileges": "yes",
+        "ActiveState": "failed",
+        "SubState": "failed",
         "MainPID": "0",
         "ExecMainPID": "4901",
         "ExecMainCode": "1",
@@ -1650,6 +1688,8 @@ def test_exited_launcher_can_bind_a_still_running_service_runner(
         "ProtectSystem": "strict",
         "ProtectHome": "read-only",
         "NoNewPrivileges": "yes",
+        "ActiveState": "active",
+        "SubState": "running",
         "MainPID": "4901",
         "ExecMainPID": "4901",
         "ExecMainCode": "0",
@@ -5502,6 +5542,8 @@ def test_containment_binding_failure_preserves_pinned_identity_for_cleanup(
     properties = {
         "InvocationID": identity.invocation_id,
         "ControlGroup": cgroup,
+        "ActiveState": "active",
+        "SubState": "running",
         "MainPID": "4321",
         "ExecMainPID": "4321",
         "ExecMainCode": "0",
@@ -6731,6 +6773,8 @@ def test_containment_event_descriptor_stays_bound_to_opened_cgroup(
         lambda _unit: {
             "InvocationID": template.invocation_id,
             "ControlGroup": template.cgroup_path,
+            "ActiveState": "active",
+            "SubState": "running",
             "MainPID": "4242",
         },
     )

@@ -915,6 +915,8 @@ class SystemdAttemptBroker:
         resolved_digest: str,
     ) -> tuple[AttemptUnitIdentity, int]:
         deadline = time.monotonic() + 10.0
+        expected_cgroup = f"/system.slice/{unit}"
+        startup_invocation: str | None = None
         while time.monotonic() < deadline:
             properties = _unit_properties(unit)
             if properties is None:
@@ -927,7 +929,14 @@ class SystemdAttemptBroker:
             _validate_unit_policy(properties, self.configuration)
             invocation = properties.get("InvocationID", "")
             cgroup = properties.get("ControlGroup", "")
-            expected_cgroup = f"/system.slice/{unit}"
+            if _is_invocation_id(invocation):
+                if startup_invocation is not None and startup_invocation != invocation:
+                    raise BackendEvidenceError(
+                        "systemd unit invocation changed during startup"
+                    )
+                startup_invocation = invocation
+            if cgroup and cgroup != expected_cgroup:
+                raise BackendEvidenceError("systemd unit cgroup differs from the attempt path")
             if not _is_invocation_id(invocation) or cgroup != expected_cgroup:
                 if process.poll() is not None:
                     raise BackendEvidenceError(
@@ -951,6 +960,12 @@ class SystemdAttemptBroker:
                 time.sleep(0.02)
                 continue
             if main_pid > 0:
+                # Type=exec can expose MainPID before systemd applies runner credentials.
+                if (properties.get("ActiveState"), properties.get("SubState")) != (
+                    "active", "running"
+                ):
+                    time.sleep(0.02)
+                    continue
                 _require_process_credentials(
                     main_pid,
                     uid=self.configuration.runner_uid,
@@ -1886,7 +1901,7 @@ def _unit_properties(unit: str) -> dict[str, str] | None:
         completed = subprocess.run(
             [
                 "/usr/bin/systemctl", "show", "--no-pager",
-                "--property=LoadState",
+                "--property=LoadState", "--property=ActiveState", "--property=SubState",
                 "--property=InvocationID", "--property=ControlGroup",
                 "--property=User", "--property=Group",
                 "--property=KillMode", "--property=Delegate",
