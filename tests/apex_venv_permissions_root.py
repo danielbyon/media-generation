@@ -93,38 +93,45 @@ class BrokerFilesystemPermissionsTests(unittest.TestCase):
     def test_broker_binds_worker_owned_database_in_sticky_directory(self) -> None:
         protected_regular = Path("/proc/sys/fs/protected_regular")
         print(f"fs.protected_regular={protected_regular.read_text().strip()}", flush=True)
+        # CI checkouts need not be traversable by the synthetic test UIDs.
+        worker_uid = self.worker_uid
+        worker_gid = self.worker_uid
+        sudo_uid = int(os.environ.get("SUDO_UID", "0"))
+        if sudo_uid:
+            account = pwd.getpwuid(sudo_uid)
+            worker_uid, worker_gid = account.pw_uid, account.pw_gid
         db_dir = self.root / "db"
         ledger_dir = self.root / "systemd-evidence"
         work = self.root / "worker"
         for path, uid, mode in (
             (db_dir, 0, 0o1770),
             (ledger_dir, 0, 0o750),
-            (work, self.worker_uid, 0o700),
+            (work, worker_uid, 0o700),
         ):
             path.mkdir()
-            os.chown(path, uid, self.worker_uid)
+            os.chown(path, uid, worker_gid)
             path.chmod(mode)
         database = db_dir / "jobs.sqlite3"
 
         def worker(action: str) -> str:
             result = subprocess.run(
                 [sys.executable, "-B", __file__, action, str(self.root)],
-                user=self.worker_uid, group=self.worker_uid, extra_groups=[],
+                user=worker_uid, group=worker_gid, extra_groups=[],
                 capture_output=True, text=True, check=False, timeout=30,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             return result.stdout
 
         identity = AttemptUnitIdentity.from_mapping(json.loads(worker("prepare-claim")))
-        expected_db = (self.worker_uid, self.worker_uid, 0o660)
+        expected_db = (worker_uid, worker_gid, 0o660)
         original = database.stat()
         self.assertEqual((original.st_uid, original.st_gid, original.st_mode & 0o7777), expected_db)
         store = SQLiteStore(database)
-        store.initialize_systemd_evidence_ledger(worker_gid=self.worker_uid)
+        store.initialize_systemd_evidence_ledger(worker_gid=worker_gid)
         ledger = SystemdEvidenceLedger(SystemdEvidenceLedger.path_for(database))
         ledger_stat = ledger.path.stat()
         self.assertEqual((ledger_stat.st_uid, ledger_stat.st_gid, ledger_stat.st_mode & 0o7777),
-                         (0, self.worker_uid, 0o640))
+                         (0, worker_gid, 0o640))
         try:
             store.bind_attempt_containment(identity, timestamp=_now())
         except sqlite3.Error as error:
