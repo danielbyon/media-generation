@@ -832,6 +832,7 @@ class SQLiteStore:
         transaction: bool = False,
         *,
         read_transaction: bool = False,
+        initialize: bool = False,
     ) -> Iterator[sqlite3.Connection]:
         if transaction and read_transaction:
             raise ValueError(
@@ -839,17 +840,15 @@ class SQLiteStore:
             )
         if transaction and self.read_only:
             raise sqlite3.OperationalError("read-only store cannot open a write transaction")
-        if self.read_only:
-            connection = sqlite3.connect(
-                f"{self.database_path.as_uri()}?mode=ro",
-                timeout=30,
-                isolation_level=None,
-                uri=True,
-            )
-        else:
-            connection = sqlite3.connect(
-                str(self.database_path), timeout=30, isolation_level=None
-            )
+        # Existing databases may be owned by the worker in a sticky directory.
+        # Opening them without CREATE also prevents replacing a missing database.
+        mode = "ro" if self.read_only else "rwc" if initialize else "rw"
+        connection = sqlite3.connect(
+            f"{self.database_path.as_uri()}?mode={mode}",
+            timeout=30,
+            isolation_level=None,
+            uri=True,
+        )
         connection.row_factory = sqlite3.Row
         connection.create_function(
             _WRITER_EPOCH_FUNCTION, 0, lambda: _WRITER_EPOCH, deterministic=True
@@ -873,7 +872,7 @@ class SQLiteStore:
 
     def _initialize(self) -> None:
         """Create the complete current schema in one SQLite transaction."""
-        with self._connection(transaction=True) as connection:
+        with self._connection(transaction=True, initialize=True) as connection:
             existing_objects = connection.execute(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"

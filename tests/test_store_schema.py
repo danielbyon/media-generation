@@ -183,6 +183,19 @@ def test_fresh_database_initializes_complete_current_schema(tmp_path: Path) -> N
     SQLiteStore(database)
 
 
+def test_existing_store_does_not_recreate_a_missing_database(tmp_path: Path) -> None:
+    database = tmp_path / "studio #?.sqlite3"
+    database.touch()
+    store = SQLiteStore(database)
+    assert store.resource_snapshot()["state"] == "available"
+    assert SQLiteStore(database, read_only=True).resource_snapshot()["state"] == "available"
+
+    database.unlink()
+    with pytest.raises(sqlite3.OperationalError, match="unable to open database file"):
+        store.resource_snapshot()
+    assert not database.exists()
+
+
 def test_failed_initialization_rolls_back_the_complete_schema(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
