@@ -9,7 +9,9 @@ import os
 import signal
 import sqlite3
 import stat
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -28,7 +30,6 @@ from media_generation.domain import GenerationPlan, GenerationRequest
 from media_generation.errors import (
     BackendEvidenceError,
     BackendPreparationError,
-    GenerationError,
     GenerationExecutionError,
     InputValidationError,
     RecordNotFoundError,
@@ -53,16 +54,13 @@ def synthetic_rocm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _service(
-    tmp_path: Path, bundle, *, adapter=None, attempt_runner=None
-) -> GenerationService:
+def _service(tmp_path: Path, bundle, *, adapter=None) -> GenerationService:
     output = tmp_path / "images"
     return GenerationService(
         tmp_path / "studio.sqlite3",
         output,
         adapter=adapter or _adapter(bundle, output),
         admission_profile=heavy_admission_profile(),
-        attempt_runner=attempt_runner,
     )
 
 
@@ -272,47 +270,6 @@ def test_successful_execution_persists_complete_observed_evidence(tmp_path: Path
     }
     assert resolved["runtime"]["rocm_version"] == RUNTIME["rocm_version"]
     assert resolved["output_basename"] == "output.png"
-    legacy_record = dict(resolved)
-    legacy_record["environment"] = dict(resolved["environment"])
-    legacy_record["environment"].pop("sha256")
-    backend_provenance.validate_resolved_record(legacy_record)
-
-
-@pytest.mark.parametrize(
-    "changed_name",
-    [
-        "LD_LIBRARY_PATH",
-        "PATH",
-        "ROCM_PATH",
-        "HIP_VISIBLE_DEVICES",
-        "HSA_OVERRIDE_GFX_VERSION",
-    ],
-)
-def test_environment_record_binds_every_effective_value_without_storing_paths(
-    changed_name: str,
-) -> None:
-    environment = {
-        "LD_LIBRARY_PATH": "/srv/runtime/lib",
-        "PATH": "/usr/bin",
-        "ROCM_PATH": "/srv/runtime/rocm",
-        "HIP_VISIBLE_DEVICES": "0",
-        "HSA_OVERRIDE_GFX_VERSION": "11.0.0",
-    }
-    changed = dict(environment)
-    changed[changed_name] += ".changed"
-
-    record = backend_provenance.environment_record(environment)
-    changed_record = backend_provenance.environment_record(changed)
-
-    assert record != changed_record
-    assert set(record["values"]) == {
-        "HIP_VISIBLE_DEVICES",
-        "HSA_OVERRIDE_GFX_VERSION",
-    }
-    serialized = json.dumps(record)
-    assert "/srv/runtime/lib" not in serialized
-    assert "/usr/bin" not in serialized
-    assert "/srv/runtime/rocm" not in serialized
 
 
 def test_failed_reaped_execution_is_terminal_and_releases_resource(
@@ -438,51 +395,7 @@ def test_pre_dispatch_refusal_is_terminal_without_ambiguous_quarantine(
         service.get_execution(queued.job_id)
 
 
-def test_untyped_pre_dispatch_refusal_records_sanitized_stage_and_category(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    bundle = build_bundle(tmp_path)
-    service = _service(tmp_path, bundle)
-    queued = service.enqueue(
-        "untyped-refusal", _request(), workload_demand=heavy_workload_demand()
-    )
-    sensitive_values = (
-        "/private/models/secret.gguf",
-        "credential=hidden-token",
-        "ROCM_PATH=/private/runtime",
-    )
-
-    def fail_execution_resolution(plan: GenerationPlan) -> object:
-        del plan
-        try:
-            raise PermissionError("access denied: " + " ".join(sensitive_values))
-        except PermissionError as cause:
-            raise GenerationError(
-                "execution resolution failed: " + " ".join(sensitive_values)
-            ) from cause
-
-    monkeypatch.setattr(
-        service.adapter, "resolve_execution", fail_execution_resolution
-    )
-
-    report = service.work()
-    provenance = service.get_provenance(queued.job_id)
-    failure_message = provenance["execution"]["failure_message"]
-
-    assert report["processed"] == 1
-    assert failure_message == (
-        "execution_preparation_failed: execution_resolution: access_denied"
-    )
-    assert provenance["attempt"]["failure_class"] == "terminal"
-    assert provenance["attempt"]["termination_proven"] is True
-    assert provenance["backend_execution"] is None
-    assert service._store.resource_snapshot()["state"] == "available"
-    for sensitive_value in sensitive_values:
-        assert sensitive_value not in json.dumps(provenance)
-        assert sensitive_value not in json.dumps(report)
-
-
-def test_residual_descendant_quarantines_a_successful_execution(
+def test_residual_descendant_prevents_publication(
     tmp_path: Path,
 ) -> None:
     """A grandchild that keeps the pipes open prevents termination proof."""
@@ -490,18 +403,23 @@ def test_residual_descendant_quarantines_a_successful_execution(
     bundle.set_mode(behavior="grandchild")
     service = _service(tmp_path, bundle)
 
-    result = service.submit(
-        "grandchild", _request(), workload_demand=heavy_workload_demand()
-    )
+    with pytest.raises(GenerationExecutionError) as raised:
+        service.submit("grandchild", _request(), workload_demand=heavy_workload_demand())
+    job_id = raised.value.job_id
 
-    provenance = service.get_provenance(result.job_id)
-    assert provenance["status"] == "succeeded"
-    assert provenance["artifact"] is not None
+    provenance = service.get_provenance(job_id)
+    assert provenance["status"] == "ambiguous"
+    assert provenance["artifact"] is None
     assert provenance["attempt"]["termination_proven"] is False
-    record = service.get_execution(result.job_id)
+    record = service.get_execution(job_id)
     assert record["observed"]["direct_child_reaped"] is True
     assert record["observed"]["inherited_streams_retained_after_reap"] is True
     assert service._store.resource_snapshot()["state"] == "quarantined"
+    successor = service.enqueue(
+        "after-grandchild", _request(), workload_demand=heavy_workload_demand()
+    )
+    assert service.work()["status"] == "attention_required"
+    assert service._store.current_attempt(successor.job_id) is None
 
 
 def test_nul_prompt_is_refused_before_any_backend_attempt(
@@ -1262,7 +1180,7 @@ def test_runtime_fingerprint_falls_back_to_amdgpu_srcversion(
 def test_runtime_fingerprint_returns_none_when_markers_are_unreadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Missing diagnostic markers stay null."""
+    """Unavailable runtime markers stay null and do not block Linux dispatch."""
 
     _isolate_runtime_markers(tmp_path, monkeypatch)
     monkeypatch.delenv("ROCM_PATH", raising=False)
@@ -1271,6 +1189,7 @@ def test_runtime_fingerprint_returns_none_when_markers_are_unreadable(
 
     assert runtime["rocm_version"] is None
     assert runtime["amdgpu_version"] is None
+    engine._validate_runtime({**runtime, "platform": "linux"})
 
 
 def test_drain_failure_kills_and_reaps_child(
@@ -1453,16 +1372,16 @@ def test_read_error_while_draining_keeps_the_attempt_ambiguous(
 
     monkeypatch.setattr(ProcessSupervisor, "_drain_until_reaped", draining_with_phase)
 
-    result = service.submit(
-        "drain-read-error", _request(), workload_demand=heavy_workload_demand()
-    )
+    with pytest.raises(GenerationExecutionError) as raised:
+        service.submit("drain-read-error", _request(), workload_demand=heavy_workload_demand())
+    job_id = raised.value.job_id
 
     assert state["failed"] is True
-    observed = _observed_record(service, result.job_id)
+    observed = _observed_record(service, job_id)
     assert observed["direct_child_reaped"] is True
     assert observed["stream_state_unknown"] is True
     assert observed["inherited_streams_retained_after_reap"] is False
-    provenance = service.get_provenance(result.job_id)
+    provenance = service.get_provenance(job_id)
     assert provenance["attempt"]["termination_proven"] is False
     assert service._store.resource_snapshot()["state"] == "quarantined"
 
@@ -1499,16 +1418,16 @@ def test_read_error_during_the_post_reap_probe_keeps_the_attempt_ambiguous(
         ProcessSupervisor, "_streams_still_open", staticmethod(probing_with_phase)
     )
 
-    result = service.submit(
-        "probe-read-error", _request(), workload_demand=heavy_workload_demand()
-    )
+    with pytest.raises(GenerationExecutionError) as raised:
+        service.submit("probe-read-error", _request(), workload_demand=heavy_workload_demand())
+    job_id = raised.value.job_id
 
     assert state["failed"] is True
-    observed = _observed_record(service, result.job_id)
+    observed = _observed_record(service, job_id)
     assert observed["direct_child_reaped"] is True
     assert observed["stream_state_unknown"] is True
     assert observed["inherited_streams_retained_after_reap"] is False
-    provenance = service.get_provenance(result.job_id)
+    provenance = service.get_provenance(job_id)
     assert provenance["attempt"]["termination_proven"] is False
     assert service._store.resource_snapshot()["state"] == "quarantined"
 
@@ -1932,3 +1851,159 @@ def test_selector_construction_failure_reaps_child_and_closes_pipes(
     child_pid = int(pid_path.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(child_pid, 0)
+
+
+def test_group_supervision_confirms_abnormal_child_exit() -> None:
+    argv = [sys.executable, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"]
+    authority = _TestAuthority("att_group_exit")
+    observation = ProcessSupervisor(
+        authority,
+        expected_argv=argv,
+        expected_environment={},
+        stop_requested=lambda: False,
+    ).run(argv, env={}, cwd=Path.cwd())
+    assert observation.exit_code is None
+    assert observation.to_mapping()["process_group_terminated"] is True
+    assert authority.observations == [observation]
+
+
+def test_running_native_cancel_reaps_only_the_claimed_process_group(tmp_path: Path) -> None:
+    bundle = build_bundle(tmp_path)
+    bundle.set_mode(behavior="sleep", sleep_seconds=30)
+    service = _service(tmp_path, bundle)
+    job_id = service.enqueue(
+        "cancel-active-native", _request(), workload_demand=heavy_workload_demand()
+    ).job_id
+    worker = threading.Thread(target=service.work, daemon=True)
+    unrelated = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        worker.start()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            attempt = service._store.current_attempt(job_id)
+            if attempt is not None:
+                record = service._store.get_backend_execution(job_id, attempt["attempt_id"])
+                if record is not None and record["state"] == "launched":
+                    break
+            time.sleep(0.02)
+        else:
+            pytest.fail("native child did not record its launch")
+        assert service.cancel(job_id)["outcome"] == "requested"
+        worker.join(timeout=10)
+        assert not worker.is_alive()
+        assert unrelated.poll() is None
+        assert service.cancel(job_id)["outcome"] == "acknowledged"
+        assert service.get_execution(job_id)["observed"]["process_group_terminated"] is True
+        assert service.get_provenance(job_id)["artifact"] is None
+        assert service._store.resource_snapshot()["state"] == "available"
+    finally:
+        unrelated.kill()
+        unrelated.wait()
+        if worker.is_alive():
+            service.cancel(job_id)
+            worker.join(timeout=10)
+
+
+def test_cancel_between_spawn_and_launch_record_can_settle(tmp_path: Path, monkeypatch) -> None:
+    bundle = build_bundle(tmp_path)
+    bundle.set_mode(behavior="sleep", sleep_seconds=30)
+    service = _service(tmp_path, bundle)
+    job_id = service.enqueue(
+        "cancel-before-launch-record", _request(), workload_demand=heavy_workload_demand()
+    ).job_id
+    record_launch = service._store.mark_execution_launched
+
+    def cancel_then_record(**kwargs):
+        assert service.cancel(job_id)["outcome"] == "requested"
+        return record_launch(**kwargs)
+
+    monkeypatch.setattr(service._store, "mark_execution_launched", cancel_then_record)
+    service.work()
+    assert service.cancel(job_id)["outcome"] == "acknowledged"
+    assert service.get_execution(job_id)["observed"]["process_group_terminated"] is True
+    assert service.get_provenance(job_id)["artifact"] is None
+    assert service._store.resource_snapshot()["state"] == "available"
+
+
+def test_unreviewed_native_binary_replacement_is_refused_at_dispatch(tmp_path: Path) -> None:
+    bundle = build_bundle(tmp_path)
+    service = _service(tmp_path, bundle)
+    job_id = service.enqueue(
+        "replaced-executable", _request(), workload_demand=heavy_workload_demand()
+    ).job_id
+    with bundle.engine_path.open("ab") as binary:
+        binary.write(b"\n# different installed executable\n")
+    service.work()
+    assert service.get_provenance(job_id)["status"] == "failed"
+    assert service.get_provenance(job_id)["artifact"] is None
+    assert service._store.resource_snapshot()["state"] == "available"
+    attempt = service._store.current_attempt(job_id)
+    assert service._store.get_backend_execution(job_id, attempt["attempt_id"]) is None
+
+
+def test_cancel_escalates_after_group_leader_exits(tmp_path: Path, monkeypatch) -> None:
+    ready = tmp_path / "helper-ready"
+    argv = [
+        sys.executable, "-c",
+        "import os, signal, sys, time\n"
+        "from pathlib import Path\n"
+        "if os.fork() == 0:\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "    Path(sys.argv[1]).touch()\n"
+        "    time.sleep(8)\n"
+        "else:\n"
+        "    signal.pause()\n",
+        str(ready),
+    ]
+    signals = []
+    signal_group = ProcessSupervisor._signal_group
+
+    def observe_signal(pid, signum):
+        signals.append(signum)
+        signal_group(pid, signum)
+
+    monkeypatch.setattr(ProcessSupervisor, "_signal_group", staticmethod(observe_signal))
+    observation = ProcessSupervisor(
+        _TestAuthority("att_escalating_group"),
+        expected_argv=argv,
+        expected_environment={},
+        stop_requested=ready.exists,
+    ).run(argv, env={}, cwd=tmp_path)
+    assert observation.signal == signal.SIGTERM
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert not observation.inherited_streams_retained_after_reap
+
+
+def test_interrupted_reap_revokes_group_signal_authority(monkeypatch) -> None:
+    argv = [sys.executable, "-c", "pass"]
+    real_poll = subprocess.Popen.poll
+    interrupted = False
+
+    def interrupted_poll(process):
+        nonlocal interrupted
+        status = real_poll(process)
+        if status is not None and not interrupted:
+            interrupted = True
+            process.returncode = None
+            raise KeyboardInterrupt
+        return status
+
+    signals = []
+    monkeypatch.setattr(subprocess.Popen, "poll", interrupted_poll)
+    monkeypatch.setattr(
+        ProcessSupervisor, "_signal_group",
+        staticmethod(lambda pid, signum: signals.append((pid, signum))),
+    )
+    supervisor = ProcessSupervisor(
+        _TestAuthority("att_interrupted_reap"),
+        expected_argv=argv,
+        expected_environment={},
+        stop_requested=lambda: False,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        supervisor.run(argv, env={}, cwd=Path.cwd())
+    assert interrupted
+    assert signals == []

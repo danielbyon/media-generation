@@ -1077,6 +1077,7 @@ def _digest(value: object) -> str:
 LOCAL_INFERENCE_CONFIGURATION_VERSION = "sd-cpp-local/v1"
 # Historical SD-C++ profile label. Keep it stable for stored privacy evidence.
 LOCAL_INFERENCE_ENGINE_VERSION = "master-975-95b3090-2-gb13a482"
+NATIVE_IMAGE_ADAPTER_ID = "stable-diffusion-cpp-local-v1"
 COMFYUI_ADAPTER_ID = "comfyui-local-v1"
 COMFYUI_CONFIGURATION_VERSION = "comfyui-local/v2"
 COMFYUI_TOOL_ID = "comfyui"
@@ -2052,7 +2053,7 @@ class LocalInferencePrivacyRegistration:
 
 APPLICATION_PRIVACY_REGISTRATIONS = (
     LocalInferencePrivacyRegistration(
-        adapter_id="stable-diffusion-cpp-local-v1",
+        adapter_id=NATIVE_IMAGE_ADAPTER_ID,
         tool_id="stable-diffusion.cpp",
         tool_version=LOCAL_INFERENCE_ENGINE_VERSION,
         configuration_version=LOCAL_INFERENCE_CONFIGURATION_VERSION,

@@ -29,6 +29,3 @@ jobs:
         run: make check PYTHON=./.venv/bin/python
       - name: Inspect cleanup plan without changing files
         run: make clean-dry-run PYTHON=./.venv/bin/python
-      - name: Check broker filesystem boundaries with real credentials
-        if: runner.os == 'Linux'
-        run: sudo "$PWD/.venv/bin/python" tests/apex_venv_permissions_root.py

@@ -2752,6 +2752,9 @@ def validate_observed_record(value: object) -> None:
     """Validate one supervisor observation or raise BackendEvidenceError."""
 
     record = _mapping(value, label="observation record")
+    if "process_group_terminated" in record:
+        _boolean(record["process_group_terminated"], label="observed.process_group_terminated")
+        record = {key: entry for key, entry in record.items() if key != "process_group_terminated"}
     _exact_keys(
         record,
         {

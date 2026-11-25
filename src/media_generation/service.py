@@ -37,7 +37,6 @@ from .domain import (
     GenerationRequest,
     ResolvedReference,
 )
-from .engine import StableDiffusionCppAdapter
 from .errors import (
     AmbiguousBackendOutcome,
     BackendEvidenceError,
@@ -55,6 +54,7 @@ from .errors import (
     UnsupportedCapabilityError,
 )
 from .privacy import (
+    NATIVE_IMAGE_ADAPTER_ID,
     DEFAULT_PRIVACY_POLICY,
     PrivacyComplianceResult,
     PrivacyCompliancePolicy,
@@ -75,6 +75,7 @@ from .backend_provenance import (
     RESOLVED_RECORD_SCHEMA_VERSION,
     environment_record,
 )
+from .engine import StableDiffusionCppAdapter
 from .store import ExecutionClaim, QueuedExecution, SQLiteStore
 from .supervisor import (
     ExecutionEvidenceAuthority,
@@ -84,14 +85,6 @@ from .supervisor import (
 )
 from .images import ImageInfo, open_approved_source, copy_source
 from .publication import PublicationManager, Checkpoint
-from .systemd_attempts import (
-    SYSTEMD_CGROUP_CONTAINMENT_CONTRACT,
-    SystemdAttemptCompletion,
-    SystemdAttemptPreRpcError,
-    SystemdAttemptPrelaunchRefusal,
-    staged_reference_directory,
-    SystemdAttemptRunner,
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,36 +302,11 @@ class GenerationService:
         privacy_policy: PrivacyCompliancePolicy | None = None,
         require_privacy_pass: bool = False,
         admission_profile: AdmissionProfile | None = None,
-        attempt_runner: SystemdAttemptRunner | None = None,
     ) -> None:
         if lease_seconds <= 0 or heartbeat_seconds <= 0 or heartbeat_seconds >= lease_seconds:
             raise ValueError("heartbeat interval must be positive and shorter than the lease")
         self.adapter: GenerationAdapter = (
             adapter if adapter is not None else DeterministicCpuAdapter()
-        )
-        if attempt_runner is not None and not isinstance(
-            attempt_runner, SystemdAttemptRunner
-        ):
-            raise ValueError("attempt_runner must be a SystemdAttemptRunner")
-        if attempt_runner is not None and adapter is not None and not isinstance(
-            self.adapter, StableDiffusionCppAdapter
-        ):
-            raise ValueError(
-                "systemd attempt runner requires a StableDiffusionCppAdapter"
-            )
-        if (
-            attempt_runner is not None
-            and adapter is not None
-            and backend_execution_contract(self.adapter) is None
-        ):
-            raise ValueError(
-                "systemd attempt runner requires a backend execution adapter"
-            )
-        self._attempt_runner = attempt_runner
-        self._containment_contract = (
-            SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
-            if attempt_runner is not None
-            else trusted_containment_contract(self.adapter)
         )
         self._backend_execution_contract = backend_execution_contract(self.adapter)
         if self._backend_execution_contract is not None and (
@@ -547,7 +515,7 @@ class GenerationService:
             ),
             resolved_output_directory=str(self.output_directory),
             max_attempts=requested_max_attempts,
-            containment_contract=self._containment_contract,
+            containment_contract=trusted_containment_contract(self.adapter),
             timestamp=_now(),
             admission=pending_admission,
             allow_not_required=is_lightweight_cpu_adapter(self.adapter),
@@ -579,7 +547,6 @@ class GenerationService:
         containment contract. Incomplete publications also retain their
         diagnostic and recovery context.
         """
-        self._require_systemd_execution_adapter()
         queued = self._admit(
             idempotency_key,
             request,
@@ -634,7 +601,7 @@ class GenerationService:
             safe_message = (
                 message
                 if not admission_enabled
-                and self._containment_contract is not None
+                and trusted_containment_contract(self.adapter) is not None
                 else "execution_failed"
             )
         error = error_type(
@@ -677,29 +644,8 @@ class GenerationService:
         return self._run_jobs(limit=limit, job_id=None)
 
     def cancel(self, job_id: str) -> dict[str, object]:
-        """Fence publication, then ask the broker to stop the exact attempt."""
+        """Fence queued or active work and report whether it can continue."""
         outcome = self._store.cancel_execution(job_id, _now())
-        if outcome == "requested" and self._attempt_runner is not None:
-            attempt = self._store.current_attempt(job_id)
-            claim_epoch = None if attempt is None else attempt.get("claim_epoch")
-            if (
-                attempt is not None
-                and isinstance(attempt.get("owner_id"), str)
-                and isinstance(attempt.get("attempt_id"), str)
-                and type(claim_epoch) is int
-                and claim_epoch > 0
-            ):
-                try:
-                    outcome = self._attempt_runner.cancel_attempt(
-                        job_id=job_id,
-                        attempt_id=attempt["attempt_id"],
-                        owner_id=attempt["owner_id"],
-                        claim_epoch=claim_epoch,
-                    )
-                except (OSError, RuntimeError):
-                    # The durable fence remains in force. Recovery retries
-                    # the exact stop and quarantines capacity without proof.
-                    outcome = "requested"
         return {"job_id": job_id, "outcome": outcome}
 
     def retry(self, job_id: str) -> SubmissionResult:
@@ -716,10 +662,6 @@ class GenerationService:
             resource = self._store.resource_snapshot()
             state = str(resource["state"])
             if state == "quarantined":
-                job_id = resource.get("job_id")
-                attempt_id = resource.get("attempt_id")
-                if isinstance(job_id, str) and isinstance(attempt_id, str):
-                    return self._recover_quarantined_attempt(job_id, attempt_id)
                 return self._resource_result("attention_required")
             if state == "available":
                 report = self._publication.reconcile()
@@ -729,118 +671,12 @@ class GenerationService:
                     else "complete"
                 )
                 result["publications"] = report
-                # Cleanup rows only enter the queue after their exact attempt
-                # outcome is durable. An unrelated orphan must not starve it.
-                result["scratch_cleanups"] = (
-                    self._retry_pending_systemd_output_cleanups(limit=16)
-                )
                 return result
             job_id = resource.get("job_id")
             attempt_id = resource.get("attempt_id")
             if not isinstance(job_id, str) or not isinstance(attempt_id, str):
                 return self._resource_result("attention_required")
             return self._recover_attempt(job_id, attempt_id)
-
-    def _recover_quarantined_attempt(
-        self, job_id: str, attempt_id: str
-    ) -> dict[str, object]:
-        """Release a quarantined systemd attempt only after late proof and reconciliation."""
-        attempt = self._store.current_attempt(job_id)
-        if attempt is None or attempt["attempt_id"] != attempt_id:
-            return self._resource_result("attention_required")
-        if attempt.get("containment_contract") != SYSTEMD_CGROUP_CONTAINMENT_CONTRACT:
-            return self._resource_result("attention_required")
-        try:
-            mirror_persisted = self._store.attempt_termination_mirror_persisted(
-                job_id, attempt_id
-            )
-        except Exception:
-            return self._resource_result("attention_required")
-        if not mirror_persisted:
-            claim_epoch = attempt.get("claim_epoch")
-            if (
-                self._attempt_runner is None
-                or not isinstance(attempt.get("owner_id"), str)
-                or not isinstance(attempt.get("attempt_id"), str)
-                or type(claim_epoch) is not int
-                or claim_epoch < 1
-            ):
-                return self._resource_result("attention_required")
-            try:
-                self._attempt_runner.cancel_attempt(
-                    job_id=job_id,
-                    attempt_id=attempt_id,
-                    owner_id=attempt["owner_id"],
-                    claim_epoch=claim_epoch,
-                )
-            except (OSError, RuntimeError, ValueError):
-                return self._resource_result("attention_required")
-            try:
-                mirror_persisted = (
-                    self._store.attempt_termination_mirror_persisted(
-                        job_id, attempt_id
-                    )
-                )
-            except Exception:
-                return self._resource_result("attention_required")
-        if not mirror_persisted:
-            return self._resource_result("attention_required")
-        records = [
-            record
-            for record in self._store.publications(str(self.output_directory))
-            if record.get("job_id") == job_id
-            and record.get("attempt_id") == attempt_id
-        ]
-        for record in records:
-            publication_id = str(record["publication_id"])
-            state = str(record["state"])
-            if state == "ready":
-                if self._store.publication_authority_current(publication_id):
-                    return self._resource_result("attention_required")
-                self._store.revoke_ready_publication(
-                    publication_id,
-                    "fenced worker-loss attempt was recovered after cgroup proof",
-                )
-            elif state == "allocated":
-                self._store.abandon_publication(
-                    publication_id,
-                    "fenced worker-loss attempt was recovered before validation",
-                )
-        report = self._publication.reconcile()
-        if report.get("status") == "attention_required":
-            resource = self._store.resource_snapshot()
-            quarantine_is_only_issue = (
-                resource.get("state") == "quarantined"
-                and resource.get("job_id") == job_id
-                and resource.get("attempt_id") == attempt_id
-                and report.get("resource_state") == "quarantined"
-                and report.get("resource_reason") == resource.get("reason")
-                and report.get("publication_status") == "complete"
-            )
-            if not quarantine_is_only_issue:
-                return self._resource_result("attention_required")
-        elif report.get("status") != "complete":
-            return self._resource_result("attention_required")
-        identity = self._store.attempt_containment_identity(job_id, attempt_id)
-        if identity is None or self._attempt_runner is None:
-            return self._resource_result("attention_required")
-        try:
-            self._attempt_runner.cleanup_after_recovery(identity)
-        except (OSError, RuntimeError, ValueError):
-            return self._resource_result("attention_required")
-        try:
-            self._store.mark_systemd_output_cleanup_complete(
-                identity,
-                validated=False,
-                timestamp=_now(),
-            )
-        except Exception:
-            return self._resource_result("attention_required")
-        if not self._store.release_quarantined_attempt(
-            job_id, attempt_id, timestamp=_now()
-        ):
-            return self._resource_result("attention_required")
-        return self._resource_result("recovered")
 
     def _resource_result(self, outcome: str) -> dict[str, object]:
         """Return a recovery outcome whose clean status requires released capacity."""
@@ -857,40 +693,6 @@ class GenerationService:
         attempt = self._store.current_attempt(job_id)
         if attempt is None or attempt["attempt_id"] != attempt_id:
             return self._resource_result("complete")
-        recovery_fenced = False
-        if (
-            attempt.get("containment_contract")
-            == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
-            and attempt.get("job_status") == "running"
-        ):
-            if self._store.fence_attempt_for_recovery(
-                job_id, attempt_id, timestamp=_now()
-            ) is None:
-                return self._resource_result("attention_required")
-            recovery_fenced = True
-            attempt = self._store.current_attempt(job_id)
-            if attempt is None:
-                return self._resource_result("attention_required")
-        if (
-            attempt.get("containment_contract")
-            == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
-            and not self._store.attempt_termination_proven(job_id, attempt_id)
-            and self._attempt_runner is not None
-        ):
-            owner_id = attempt.get("owner_id")
-            claim_epoch = attempt.get("claim_epoch")
-            if isinstance(owner_id, str) and type(claim_epoch) is int and claim_epoch > 0:
-                try:
-                    self._attempt_runner.cancel_attempt(
-                        job_id=job_id,
-                        attempt_id=attempt_id,
-                        owner_id=owner_id,
-                        claim_epoch=claim_epoch,
-                    )
-                except (OSError, RuntimeError, ValueError):
-                    # The recovery fence is durable; missing broker evidence
-                    # leaves the resource quarantined below.
-                    pass
         publication = next(
             (
                 record
@@ -926,22 +728,6 @@ class GenerationService:
         owner_id = None if attempt["owner_id"] is None else str(attempt["owner_id"])
         epoch = int(attempt["claim_epoch"])
         contained = self._store.attempt_termination_proven(job_id, attempt_id)
-        recovery_cleanup_identity = None
-        if (
-            contained
-            and attempt.get("containment_contract")
-            == SYSTEMD_CGROUP_CONTAINMENT_CONTRACT
-        ):
-            if self._attempt_runner is None:
-                return self._resource_result("attention_required")
-            identity = self._store.attempt_containment_identity(job_id, attempt_id)
-            if identity is None:
-                return self._resource_result("attention_required")
-            try:
-                self._attempt_runner.cleanup_after_recovery(identity)
-            except (OSError, RuntimeError, ValueError):
-                return self._resource_result("attention_required")
-            recovery_cleanup_identity = identity
         timestamp = _now()
         if attempt["job_status"] == "canceled":
             finalized = self._store.fail_execution(
@@ -957,15 +743,6 @@ class GenerationService:
             )
             if not finalized:
                 return self._resource_result("attention_required")
-            if recovery_cleanup_identity is not None:
-                try:
-                    self._store.mark_systemd_output_cleanup_complete(
-                        recovery_cleanup_identity,
-                        validated=False,
-                        timestamp=_now(),
-                    )
-                except Exception:
-                    return self._resource_result("attention_required")
             return self._resource_result("canceled")
         if publication_was_fenced:
             finalized = self._store.fail_execution(
@@ -982,19 +759,9 @@ class GenerationService:
                 failure_class="terminal" if contained else "ambiguous",
                 termination_proven=contained,
                 _revoked_publication_id=str(publication["publication_id"]),
-                _recovery_fenced=recovery_fenced,
             )
             if not finalized:
                 return self._resource_result("attention_required")
-            if recovery_cleanup_identity is not None:
-                try:
-                    self._store.mark_systemd_output_cleanup_complete(
-                        recovery_cleanup_identity,
-                        validated=False,
-                        timestamp=_now(),
-                    )
-                except Exception:
-                    return self._resource_result("attention_required")
             return self._resource_result("attention_required")
         if contained:
             finalized = self._store.fail_execution(
@@ -1006,19 +773,9 @@ class GenerationService:
                 claim_epoch=epoch,
                 failure_class="crash",
                 termination_proven=True,
-                _recovery_fenced=recovery_fenced,
             )
             if not finalized:
                 return self._resource_result("attention_required")
-            if recovery_cleanup_identity is not None:
-                try:
-                    self._store.mark_systemd_output_cleanup_complete(
-                        recovery_cleanup_identity,
-                        validated=False,
-                        timestamp=_now(),
-                    )
-                except Exception:
-                    return self._resource_result("attention_required")
             return self._resource_result("complete")
         self._store.fail_execution(
             job_id,
@@ -1029,7 +786,6 @@ class GenerationService:
             claim_epoch=epoch,
             failure_class="ambiguous",
             termination_proven=False,
-            _recovery_fenced=recovery_fenced,
         )
         return self._resource_result("attention_required")
 
@@ -1040,7 +796,6 @@ class GenerationService:
         job_id: str | None,
         _failures: list[Exception] | None = None,
     ) -> dict[str, object]:
-        self._require_systemd_execution_adapter()
         with self._resource_lock() as locked:
             if not locked:
                 return {"status": "resource_busy", "processed": 0}
@@ -1076,8 +831,8 @@ class GenerationService:
                     adapter_configuration_json=adapter_configuration_json,
                     privacy_compliance_json=privacy_compliance_json,
                     resolved_output_directory=str(self.output_directory),
-                    process_contained=self._containment_contract is not None,
-                    containment_contract=self._containment_contract,
+                    process_contained=trusted_containment_contract(self.adapter) is not None,
+                    containment_contract=trusted_containment_contract(self.adapter),
                     timestamp=timestamp,
                     lease_expires_at=_lease_deadline(self._lease),
                     job_id=job_id,
@@ -1152,15 +907,6 @@ class GenerationService:
                 "resource_reason": reason,
             }
 
-    def _require_systemd_execution_adapter(self) -> None:
-        """Keep control-only broker clients from claiming engine work."""
-        if self._attempt_runner is not None and not isinstance(
-            self.adapter, StableDiffusionCppAdapter
-        ):
-            raise ValueError(
-                "systemd execution requires a StableDiffusionCppAdapter"
-            )
-
     def _execute_claim(self, claim: ExecutionClaim) -> Exception | None:
         stop_heartbeat = threading.Event()
 
@@ -1189,9 +935,6 @@ class GenerationService:
         executed = False
         prepared_execution = None
         supervisor: ProcessSupervisor | None = None
-        systemd_completion: SystemdAttemptCompletion | None = None
-        systemd_output_fd_consumed = False
-        prelaunch_stage = "execution_plan"
         try:
             plan = GenerationPlan(
                 job_id=claim.job_id,
@@ -1204,29 +947,10 @@ class GenerationService:
                 output_slot=claim.output_slot,
                 output_slot_id=claim.output_slot_id,
             )
-            prelaunch_stage = "reference_artifact_validation"
             self._validate_reference_artifacts(claim.references)
             if self._backend_execution_contract is not None:
-                if self._attempt_runner is not None:
-                    prelaunch_stage = "attempt_containment_setup"
-                    scratch_directory = self._attempt_runner.prepare_attempt(claim)
-                prelaunch_stage = "execution_resolution"
-                if self._attempt_runner is not None:
-                    protected_plan = plan
-                    if claim.references:
-                        inputs = staged_reference_directory(scratch_directory)
-                        protected_plan = replace(plan, references=tuple(
-                            replace(reference, path=inputs / f"{index}.png")
-                            for index, reference in enumerate(claim.references)
-                        ))
-                    prepared_execution = self.adapter.resolve_execution(
-                        protected_plan, scratch_directory=scratch_directory
-                    )
-                else:
-                    prepared_execution = self.adapter.resolve_execution(plan)
-                prelaunch_stage = "execution_privacy_validation"
+                prepared_execution = self.adapter.resolve_execution(plan)
                 self._require_execution_privacy(prepared_execution, claim=claim)
-                prelaunch_stage = "execution_evidence_persistence"
                 self._store.insert_resolved_execution(
                     job_id=claim.job_id,
                     attempt_id=claim.attempt_id,
@@ -1235,102 +959,28 @@ class GenerationService:
                     record=prepared_execution.resolved_record,
                     timestamp=_now(),
                 )
-            prelaunch_stage = "artifact_publication_setup"
             generated_artifact_id = _new_id("art")
 
             def write_image(destination: Path, staged: BinaryIO) -> None:
-                nonlocal metadata, adapter_dispatched, execute_entered, executed
-                nonlocal supervisor, systemd_completion
-                nonlocal systemd_output_fd_consumed
-                nonlocal prelaunch_stage
+                nonlocal metadata, adapter_dispatched, execute_entered, executed, supervisor
                 if prepared_execution is not None:
-                    prelaunch_stage = "engine_dispatch"
+                    authority = _StoreExecutionAuthority(self._store, claim)
+                    supervisor = ProcessSupervisor(
+                        authority,
+                        expected_argv=prepared_execution.argv,
+                        expected_environment=prepared_execution.environment,
+                        stop_requested=(
+                            lambda: not authority.verify_current()
+                        ) if claim.adapter_id == NATIVE_IMAGE_ADAPTER_ID else None,
+                    )
                     execute_entered = True
-                    if self._attempt_runner is None:
-                        supervisor = ProcessSupervisor(
-                            _StoreExecutionAuthority(self._store, claim),
-                            expected_argv=prepared_execution.argv,
-                            expected_environment=prepared_execution.environment,
-                        )
-                        metadata = self.adapter.execute(
-                            plan,
-                            staged,
-                            supervisor=supervisor,
-                        )
-                    else:
-                        systemd_completion = self._attempt_runner.execute_attempt(
-                            claim, prepared_execution
-                        )
-                        if systemd_completion.termination_evidence is None:
-                            raise AmbiguousBackendOutcome(
-                                "systemd attempt completed without whole-cgroup proof"
-                            )
-                        if (
-                            systemd_completion.launcher_exit_code != 0
-                            or systemd_completion.runner_exit_code != 0
-                            or systemd_completion.runner_exit_signal is not None
-                            or systemd_completion.unit_result != "success"
-                            or not systemd_completion.stream_complete
-                        ):
-                            raise BackendEvidenceError(
-                                "systemd runner, unit, or control stream did not complete cleanly"
-                            )
-                        observation = systemd_completion.engine_observation
-                        if not isinstance(observation, Mapping):
-                            raise BackendEvidenceError(
-                                "systemd runner omitted the engine observation"
-                            )
-                        durable_execution = self._store.get_backend_execution(
-                            claim.job_id, claim.attempt_id
-                        )
-                        # Match the completion to the observation saved under this claim.
-                        if (
-                            durable_execution is None
-                            or durable_execution.get("state") != "observed"
-                            or durable_execution.get("observed") != dict(observation)
-                        ):
-                            raise BackendEvidenceError(
-                                "systemd completion observation does not match durable engine evidence"
-                            )
-                        if (
-                            type(observation.get("exit_code")) is not int
-                            or observation.get("exit_code") != 0
-                            or observation.get("signal") is not None
-                        ):
-                            code = observation.get("exit_code")
-                            signum = observation.get("signal")
-                            detail = f"signal {signum}" if signum is not None else f"exit code {code}"
-                            raise GenerationError(f"declared engine failed with {detail}")
-                        if not self._store.attempt_termination_proven(
-                            claim.job_id, claim.attempt_id
-                        ):
-                            raise BackendEvidenceError(
-                                "broker completion has no durable whole-cgroup proof"
-                            )
-                        self._verify_execution_evidence(
-                            claim, prepared_execution, record=durable_execution
-                        )
-                        if systemd_completion.output_fd is None:
-                            raise BackendEvidenceError(
-                                "systemd broker omitted the pinned output descriptor"
-                            )
-                        output_source = os.fdopen(
-                            systemd_completion.output_fd, "rb", closefd=True
-                        )
-                        systemd_output_fd_consumed = True
-                        with output_source:
-                            metadata = self.adapter.stream_systemd_execution(
-                                prepared_execution, staged, output_source
-                            )
-                        self._store.record_systemd_stream_complete(
-                            systemd_completion.identity,
-                            owner_id=claim.owner_id,
-                            claim_epoch=claim.claim_epoch,
-                            timestamp=_now(),
-                        )
+                    metadata = self.adapter.execute(
+                        plan,
+                        staged,
+                        supervisor=supervisor,
+                    )
                     executed = True
-                    if self._attempt_runner is None:
-                        self._verify_execution_evidence(claim, prepared_execution)
+                    self._verify_execution_evidence(claim, prepared_execution)
                 else:
                     adapter_dispatched = True
                     metadata = self.adapter.generate(plan, staged)
@@ -1362,7 +1012,6 @@ class GenerationService:
                     created_at=_now(),
                 )
 
-            prelaunch_stage = "artifact_publication_setup"
             self._publication.publish(
                 write_image,
                 make_artifact,
@@ -1378,18 +1027,6 @@ class GenerationService:
             )
             return None
         except Exception as error:
-            systemd_prelaunch_refusal = False
-            cursor: BaseException | None = error
-            while cursor is not None:
-                if isinstance(cursor, SystemdAttemptPreRpcError):
-                    systemd_prelaunch_refusal = True
-                    prelaunch_stage = "attempt_request_validation"
-                    break
-                if isinstance(cursor, SystemdAttemptPrelaunchRefusal):
-                    systemd_prelaunch_refusal = True
-                    prelaunch_stage = "broker_prelaunch_refusal"
-                    break
-                cursor = cursor.__cause__
             snapshot = self._store.get_provenance(claim.job_id)
             if snapshot["artifact"] is not None and snapshot["status"] == "succeeded":
                 return None
@@ -1398,8 +1035,7 @@ class GenerationService:
                     not adapter_dispatched
                     and not executed
                     and (
-                        systemd_prelaunch_refusal
-                        or not execute_entered
+                        not execute_entered
                         or (
                             supervisor is not None
                             and not supervisor.process_started
@@ -1437,8 +1073,7 @@ class GenerationService:
                     break
                 cursor = cursor.__cause__
             if not adapter_dispatched and (
-                systemd_prelaunch_refusal
-                or not execute_entered
+                not execute_entered
                 or (
                     not process_started
                     and supervisor is not None
@@ -1451,24 +1086,6 @@ class GenerationService:
                 if preparation_error is not None:
                     preparation_message = (
                         f"execution_preparation_failed: {preparation_error.code}"
-                    )
-                else:
-                    # Persist fixed labels only; exception text can expose paths or secrets.
-                    category = "rejected" if prelaunch_stage == "broker_prelaunch_refusal" else "unknown"
-                    cursor = error
-                    while cursor is not None:
-                        if isinstance(cursor, PermissionError):
-                            category = "access_denied"
-                        elif isinstance(cursor, FileNotFoundError):
-                            category = "missing_resource"
-                        elif isinstance(cursor, ValueError):
-                            category = "invalid_state"
-                        if category != "unknown":
-                            break
-                        cursor = cursor.__cause__
-                    preparation_message = (
-                        "execution_preparation_failed: "
-                        f"{prelaunch_stage}: {category}"
                     )
                 self._store.fail_execution(
                     claim.job_id,
@@ -1530,48 +1147,9 @@ class GenerationService:
         finally:
             stop_heartbeat.set()
             heartbeat_thread.join(timeout=max(0.1, self._heartbeat_seconds * 2))
-            self._retry_pending_systemd_output_cleanups(
-                limit=1, attempt_id=claim.attempt_id
-            )
-            if (
-                systemd_completion is not None
-                and systemd_completion.output_fd is not None
-                and not systemd_output_fd_consumed
-            ):
-                os.close(systemd_completion.output_fd)
             cleanup = getattr(self.adapter, "cleanup_execution", None)
             if prepared_execution is not None and callable(cleanup):
                 cleanup(prepared_execution)
-
-    def _retry_pending_systemd_output_cleanups(
-        self, *, limit: int = 16, attempt_id: str | None = None
-    ) -> int:
-        """Retry a bounded set of broker cleanups after durable outcome checks."""
-        if self._attempt_runner is None:
-            return 0
-        try:
-            pending = self._store.pending_systemd_output_cleanups(
-                limit=limit, attempt_id=attempt_id
-            )
-        except Exception:
-            return 0
-        completed = 0
-        for cleanup in pending:
-            try:
-                self._attempt_runner.acknowledge_output(
-                    cleanup.identity, validated=cleanup.validated
-                )
-                self._store.mark_systemd_output_cleanup_complete(
-                    cleanup.identity,
-                    validated=cleanup.validated,
-                    timestamp=_now(),
-                )
-            except Exception:
-                # The attempt outcome remains durable; failed deletion stays
-                # pending for the next bounded recovery pass.
-                continue
-            completed += 1
-        return completed
 
     def _require_selected_candidate_binding(
         self,
@@ -1607,8 +1185,7 @@ class GenerationService:
                 "resolved execution engine identity missing"
             )
         installed_sd_cpp = isinstance(self.adapter, StableDiffusionCppAdapter)
-        fields = ("id",) if installed_sd_cpp else ("id", "version", "build", "executable_sha256")
-        for name in fields:
+        for name in ("id", "version", "build", "executable_sha256"):
             _require_selected_field(
                 record_engine, selected_engine, name, label=f"engine.{name}"
             )
@@ -1639,13 +1216,6 @@ class GenerationService:
             if not argv or argv[0] != str(self.adapter.selected_executable):
                 raise _resolved_execution_mismatch(
                     "resolved argv[0] does not match the selected executable path"
-                )
-            digest = self.adapter.observed_executable_digest(
-                str(record.get("attempt_id"))
-            )
-            if digest is None or record_engine.get("executable_sha256") != digest:
-                raise _resolved_execution_mismatch(
-                    "resolved executable digest does not match this attempt's observation"
                 )
             return
         self._require_selected_executable(
@@ -1888,21 +1458,14 @@ class GenerationService:
         if result.status is not PrivacyComplianceStatus.PASS:
             raise PrivacyComplianceError(result)
 
-    def _verify_execution_evidence(
-        self,
-        claim: ExecutionClaim,
-        prepared: object,
-        *,
-        record: Mapping[str, object] | None = None,
-    ) -> None:
+    def _verify_execution_evidence(self, claim: ExecutionClaim, prepared: object) -> None:
         """Reject publication unless persisted launch facts match resolution.
 
         The supervisor records the exact argv and environment it spawned. A
         mismatch with the resolved plan, a missing launch record, or a missing
         reaped-child observation fails closed before the publisher commits.
         """
-        if record is None:
-            record = self._store.get_backend_execution(claim.job_id, claim.attempt_id)
+        record = self._store.get_backend_execution(claim.job_id, claim.attempt_id)
         if record is None:
             raise BackendEvidenceError(
                 "backend execution evidence is missing after execution"

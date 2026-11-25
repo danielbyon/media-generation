@@ -193,12 +193,10 @@ the documented invocation contract cannot bind their required order and
 strength without guessing. Such a request finishes with
 `operation_unsupported`.
 
-New SD-C++ attempts reuse resolved record v2. `argv[0]` holds the selected
-executable path and `engine.executable_sha256` holds the observed digest.
-`engine.version` and `engine.build` say `unobserved` without a trustworthy
-version or build observation. Earlier v2 writers copied those values from the
-candidate declaration. Existing records retain their original meaning and
-bytes.
+SD-C++ attempts keep resolved record v2. The application verifies the
+executable against the reviewed candidate digest before dispatch. The record
+carries that digest, the selected absolute path, and the declared build and
+version. A replacement binary requires a reviewed candidate that pins it.
 
 `rocm_version` comes from the first readable marker at
 `$ROCM_PATH/.info/version` or `/opt/rocm/.info/version`. `amdgpu_version` comes
@@ -605,7 +603,8 @@ malformed row, unknown state, or failed observation write leaves the attempt
 uncertain. Failure finalization records `ambiguous`, quarantines the singleton
 resource, and causes the recovery report to return `attention_required`.
 
-A successful artifact may already be committed when required termination
+For adapters outside the native group contract, a successful artifact may
+already be committed when required termination
 evidence is unavailable. The artifact and job remain inspectable, and the
 resource stays quarantined. The service releases the singleton resource only
 when all of these conditions hold:
@@ -619,302 +618,23 @@ Process evidence changes the release input. It does not change attempt
 numbering, publisher ownership, fence epochs, retry eligibility, or
 no-clobber artifact publication.
 
+## Direct native inference lifecycle
 
-## Systemd-contained GPU attempts
+Stable Diffusion C++ runs as a direct child in a new session. This applies to
+the native image CLI contract. Managed ComfyUI execution keeps its own policy.
 
-For a systemd-enabled Stable Diffusion C++ attempt, the worker resolves the
-invocation once and persists its canonical record before dispatch. The broker
-checks the request against that exact record, then starts a fixed attempt
-runner in a transient system service. The runner receives the durable argv,
-environment, and broker-created scratch path. It does not resolve a new
-invocation or choose systemd properties.
+The finite supervisor owns signaling, pipe draining, and reaping. A cancellation request fences
+publication in SQLite. If the child has started, the supervisor signals only
+the session’s original process group while the unreaped child pins its ID.
+It stops sending signals after reap. An empty-group probe, a reaped child,
+and settled streams establish the termination result for that attempt. The
+supervisor records the result alongside the exit status or signal.
 
-The resolved environment record stores variable names and the selected GPU
-override values. A domain-separated SHA-256 also binds every effective
-environment value, including `PATH`, `LD_LIBRARY_PATH`, and `ROCM_PATH`, without
-copying those path values into public provenance. The broker and runner
-recompute the digest before launch. The broker's root-owned
-`environment_path_allowlist` names the exact directories that may appear in
-search-path variables. Empty entries, relative paths, symlinked directories,
-and paths outside that list are rejected. A configured `ROCM_PATH` must also
-contain a readable `.info/version` file.
+The claim holds GPU capacity through termination and publication settlement.
+An engine failure cannot publish. Cancellation becomes acknowledged after
+safe settlement. If the process group or its termination state is uncertain,
+the worker fences publication and leaves the resource quarantined. Recovery
+uses existing durable records and never signals a reconstructed PID.
 
-The runner owns `ProcessSupervisor` and the engine child. It records the
-existing `LaunchFact` after spawn and the existing `ProcessObservation` after
-the engine child is reaped. The broker writes those facts through the normal
-claim-owner and epoch checks while the attempt remains current. The supervisor
-continues to verify the exact argv and environment and stores only bounded,
-privacy-safe stream summaries. The runner itself starts with the private
-attempt directory as its working directory; it starts the engine with `/` as
-its working directory because the durable engine argv contains absolute input
-and output paths. Direct-child execution paths keep their existing evidence
-contract; this design does not infer process-tree containment from their
-observations.
-
-The result keeps six facts separate:
-
-| Fact | Evidence | What it establishes |
-| --- | --- | --- |
-| Launcher exit | `systemd-run` process return code | The systemd client returned. With `--wait`, systemd-run can propagate the service result; that result is the runner's status, not the engine's. See the [systemd-run manual](https://freedesktop.org/software/systemd/man/latest/systemd-run.html). |
-| Runner exit | The matching unit's `MainPID`, `ExecMainCode`, `ExecMainStatus`, and `Result` | The transient service's runner process exited and systemd classified its exit code or signal. |
-| Engine exit | `ProcessObservation` exit code, signal, and reaped-child fields | The exact supervised engine child exited. It does not establish that every cgroup process exited. |
-| Unit identity | Invocation ID, control-group path, boot ID, and cgroup device/inode | The service and cgroup belong to this attempt. Identity alone does not establish termination. |
-| Cgroup termination | `cgroup.events` reports `populated 0` through the descriptor pinned to the validated unit and cgroup | No process remains in that attempt cgroup. |
-| Stream completion | The runner control stream ended with a complete success record | The broker received the runner result without a lost or malformed control message. |
-
-The broker captures the unit invocation ID, control-group path, boot ID, and
-cgroup device/inode before accepting engine evidence. `RemainAfterExit=yes`
-keeps the completed service available until the broker explicitly stops it.
-The broker opens `cgroup.events` after validating those identities and keeps
-that descriptor through `StopUnit` and the empty check. After receiving a
-runner completion record, it waits until the matching unit reports `MainPID=0`
-and a terminal `ExecMainCode` before it stops the unit and samples
-`cgroup.events`. On cancellation or worker loss, it stops the unit first and
-then verifies that same runner exit before recording cgroup emptiness. The
-broker saves the unit result and exit status before `StopUnit`, because systemd
-may garbage-collect the completed unit afterward. If systemd removes the unit
-or cgroup path before the descriptor is pinned, termination is unproven.
-If the pinned event reports an empty cgroup, the broker durably records the
-proof even when systemd has since removed the unit name or cgroup path. Once
-the proof is durable, later unit garbage collection does not invalidate it. A
-worker or host restart loses an unpersisted descriptor; recovery then needs new
-independently verified evidence or keeps capacity quarantined.
-
-`systemd-run --pipe` connects the transient service's standard streams to the
-broker's launcher pipes. The worker communicates with the broker over its
-authenticated local socket; worker loss alone leaves the launch pipes open
-because the broker owns them. The broker's disconnect watcher fences the
-attempt and stops its exact unit. If the broker or runner loses a pipe endpoint,
-writes may fail with `EPIPE` or `SIGPIPE`; an incomplete control stream cannot
-stand in for engine evidence. The broker treats that result as incomplete and
-uses cgroup proof for cleanup. A worker that dies before it receives a result
-cannot publish the scratch image.
-
-Success requires all of the following: a valid engine observation with exit
-code zero and no signal; successful launcher and unit results; a complete
-runner stream; validated image bytes; verified cgroup-empty evidence; and
-current publication authority. The worker passes the broker's read-only output
-descriptor to the adapter's existing `stream_systemd_execution` method. That
-method validates the image and copies it into the publisher's original staging
-descriptor. The existing publication transaction remains the only path that
-creates the artifact and commits the job.
-
-Cancellation and worker-loss recovery use termination evidence independently
-of engine success evidence. The worker fences publication, the broker stops
-the exact authenticated unit, and recovery waits for the whole cgroup to empty.
-Recovery reconciles or revokes incomplete publication rows before applying the
-existing resource and admission checks. A missing engine observation prevents
-success; it does not by itself prove that a GPU process survived. Verified
-cgroup termination and safe publication state can release capacity for a
-canceled or failed attempt. Uncertain unit identity, missing cgroup proof, or
-unreconciled publication keeps the resource quarantined.
-
-The system service runs under the configured non-root runner UID and primary
-GID. Its supplementary groups are an exact allowlist: the GPU `render` and
-`video` groups when required by the configured device nodes, the private
-scratch group, and the read-only model/runtime group. The broker checks the
-runner's NSS memberships against that allowlist. The worker has its own primary
-publication group and only the read-only model/runtime group as a supplementary
-group; it never joins the scratch or GPU groups. The broker checks the worker's
-NSS memberships exactly. The shared read group relies on ordinary owner/group
-mode bits because broker validation does not evaluate named POSIX ACL entries.
-The mirrored runtime and model tree therefore has root-owned directories with
-group traversal/read permissions and root-owned read-only files. The engine
-executable is group-readable and executable so the runner can launch it; this
-also gives the worker execute permission on that file, but no GPU device or
-scratch access.
-
-At startup the broker checks private search-tree contents, including library
-symlink targets, for root ownership, write protection, runner access, and
-extended ACLs. The administrator maintains the system command tree. Per
-attempt the broker checks the configured search directories and the exact
-resolved invocation. The worker needs read access to candidate data it
-verifies. Private libraries may be accessible only to the runner.
-
-The broker allowlists the required GPU device nodes, model and input read
-roots, scratch directory, and runner executable, then supplies fixed
-`User=`, `Group=`, supplementary-group, device, filesystem, and kill-policy
-properties. The runner has no database access. The root broker opens the
-configured SQLite database to persist launch and engine-observation facts. It
-also maintains a root-owned evidence ledger in a dedicated protected
-directory at
-`<deployment root>/systemd-evidence/<database directory>-<database filename>.systemd-evidence.sqlite3`.
-For the APEX database, the path is
-`/var/lib/media-generation-v9/systemd-evidence/db-jobs.sqlite3.systemd-evidence.sqlite3`.
-The broker stores each
-immutable unit identity and cgroup-empty proof in this ledger, then mirrors the
-facts into the job database. The job database may be writable by the worker,
-so its copy alone is never accepted as proof of containment or termination.
-The ledger is owned by root, readable by the configured worker group, and not
-writable by that group. The directory is also outside the worker-writable
-database directory, so the worker cannot create or replace SQLite sidecars.
-The worker opens it read-only and requires its identity and termination records
-to match before resource release. Missing or conflicting ledger data fails
-closed.
-
-The root-owned broker is the systemd authorization boundary. It invokes
-`systemd-run --system` as root, so the system manager authorizes the broker's
-root credentials; polkit does not give this root process a narrow per-property
-allowlist. The worker receives no general systemd management privilege. A
-unit-name prefix only limits the namespace. The broker also checks peer
-credentials, exact request fields, claim and epoch, the durable resolved
-invocation, and live unit properties; it constructs every transient-unit
-property itself. The broker executable, its root-owned configuration, and
-the protected socket directory must not be writable by the worker.
-
-Broker configuration, runner executable, socket, scratch root, and database
-paths must sit beneath root-owned, nonreplaceable directory chains. The broker
-rejects symlinked or worker-owned ancestors and writable ancestors without a
-root-owned sticky bit. The sidecar ledger needs the same protected parent
-directory as the database, with root ownership and read access for the worker
-group. APEX must provide those paths and the required worker, runner,
-ROCm, model-read, GPU-device, model, scratch, database, and ledger access before
-qualification. Implementation does not apply host permission changes.
-Approving the broker software does not authorize installing it or changing
-systemd or host permissions on APEX. The owner must authorize the installation,
-service configuration, identities, directories, and device access. Until then,
-the APEX backend remains unqualified.
-
-Published image staging files use mode `0600`. The runner is intentionally not
-a member of the worker publication group, so the current broker cannot read a
-published artifact used as an engine `-r` reference. Do not solve this by
-adding the runner to the worker group or broadening every artifact's mode. A
-reference-conditioned APEX run remains blocked until a separately reviewed
-per-attempt read-only input handoff gives the runner only the selected input.
-The deployment manifest covers model/runtime access and reference-free runs;
-it does not claim the reference-conditioned path is qualified.
-
-## Pre-dispatch refusals
-
-An adapter prepares and resolves the execution before it marks the attempt as
-dispatched. If preparation raises a `BackendPreparationError` before resolution
-completes, the service finalizes a terminal preparation failure without creating
-backend evidence and without classifying an inference process as ambiguous. If
-preparation fails after the resolved row is written but before a child starts,
-the service retains that row in the resolved state with no launch or observation
-and finalizes a terminal preparation failure. The persisted message includes one
-stable code:
-
-Request validation rejects NUL bytes in the submitted prompt before
-admission, so an invalid argv cannot reach the supervisor. As defense
-in depth, an invalid resolved invocation that raises `ValueError` during
-spawn is also classified as `engine_launch_failed`: no child started, no
-launch evidence exists, and the attempt is a terminal preparation failure.
-
-| Code | Meaning |
-| --- | --- |
-| `bundle_missing` | A declared required file is absent. |
-| `bundle_corrupt` | A file, control document, or identity no longer matches. |
-| `bundle_incompatible` | The declared engine, roles, or compatibility contract cannot execute the operation. |
-| `bundle_unverified` | Independent trusted evidence is absent or does not verify. |
-| `runtime_platform_mismatch` | The selected runtime is not the required platform. |
-| `runtime_evidence_incomplete` | Required runtime markers cannot be read. |
-| `engine_launch_failed` | The verified executable could not be started, or the resolved invocation was rejected before spawn. |
-| `recipe_invalid` | The invocation recipe is malformed or violates its strict schema. |
-| `operation_unsupported` | The selected profile cannot represent the requested operation. |
-| `resolved_execution_mismatch` | The resolved record does not match the candidate and executable selected at admission. |
-
-## Scratch output and publication
-
-The engine writes to `output.png` in a private directory created with
-`tempfile.mkdtemp` mode 0700. The directory is outside the configured output
-directory and outside a detected Git worktree. The adapter validates the image
-format and dimensions through a no-follow file handle before copying bytes into
-the publisher's already-open staging descriptor. The existing publisher then
-performs its normal full-image validation, filesystem synchronization, lineage
-insertion, and no-clobber publication.
-
-The C++ engine subprocess starts in `/`. glibc resolves an empty RUNPATH
-component against the current directory ([GNU libc source](https://sourceware.org/pipermail/libc-stable/2017-January/000518.html)),
-so writable attempt scratch is outside that library search. The adapter resolves
-model, reference, and output paths before building the engine arguments.
-
-The adapter removes the scratch directory in `finally` after success or failure.
-The service also removes it if publication fails after resolution but before
-`execute` opens the publisher's staging descriptor. A process crash can leave the
-system temporary directory for external cleanup; it does not create a named
-staging file in the artifact directory.
-
-## Privacy and admission
-
-The real-engine privacy profile is application-owned. Its required controls
-assert that the application does not configure an external API, cloud or
-fallback inference path, telemetry, content upload, automatic network fetch or
-update, remote endpoint, or proxy. The child environment is rebuilt from a
-fixed allowlist and contains no proxy or credential variables.
-
-The adapter does not supply these control values. The application derives them
-from the resolved argument vector and the environment it will pass to the
-child. A URL scheme, a remote, host, listen, server, API, proxy, download,
-update, telemetry, or fallback token in the invocation marks the matching
-control prohibited, and any proxy variable in the environment does the same.
-The application selects the SD-C++ privacy profile by the supported adapter,
-engine family, and configuration and invocation contracts. The original tool
-version remains the stored profile label. ComfyUI retains its signed runtime
-version requirement.
-
-Before inserting the resolved record or launching the engine, the service
-recomputes privacy from the exact argv and environment. It requires a pass and
-checks the record against the claimed selection. For SD-C++, the full
-executable path must match the selected declaration, and the digest must match
-the observation captured for this attempt. Candidate and declaration identity,
-the recipe, component identities, and invocation contracts must also match.
-The adapter supplies the mapping from component identities to argv paths.
-The supervisor separately records the argv and environment actually passed to
-the child.
-
-These controls describe application configuration only. They do not prove that
-the executable contains no network code and do not provide operating-system
-network confinement. Missing or unrecognized control values remain
-`unverified` and block the configuration-compliant execution profile.
-Prohibited values fail admission.
-
-Heavyweight execution still requires a current T06 admission decision and the
-single heavyweight reservation. Workers use the admission evidence persisted at
-submission; they do not accept capacity documents. A worker configures the same
-candidate and privacy configuration that it will claim, and an exact
-configuration mismatch is an error rather than a fallback selection.
-
-## Command-line use and inspection
-
-`submit`, `enqueue`, and `worker` accept `--engine-candidate` and optional
-`--engine-trusted-evidence`. Supplying no engine flags keeps the deterministic
-CPU adapter. Supplying trusted evidence without a candidate is invalid.
-
-`submit` and `enqueue` also accept the T06 inventory, policy, and workload
-demand files. `worker` has no capacity-file arguments because claim validation
-uses the evidence stored with the queued job.
-
-The full validated records for the current attempt are available through:
-
-```sh
-media-generation execution --db ./studio.sqlite3 --job-id <job-id>
-media-generation execution --db ./studio.sqlite3 --job-id <job-id> \
-  --attempt-id <attempt-id>
-```
-
-The provenance snapshot contains a compact `backend_execution` value with the
-attempt ID, state, resolved digest, and observation timestamp, or `null` when
-the current attempt has no backend record.
-
-## Reopen validation
-
-Reading an execution row parses and validates every present stage, checks that
-its attempt identity agrees with the row, checks the engine and recipe
-identities stored in columns, and recomputes the resolved digest from canonical
-JSON. A malformed or digest-mismatched row raises `BackendEvidenceError`; it is
-never treated as a missing row or downgraded to an unproven state.
-
-## Unverified boundaries
-
-The software path and synthetic conformance executable establish argument
-mapping, process supervision, evidence persistence, failure handling, and
-publication behavior. They do not establish that a particular Qwen checkpoint
-loads on APEX, that ROCm execution succeeds, that image quality is acceptable,
-that a survivor process is contained, or that the engine cannot access a
-network. Those remain runtime and qualification concerns outside this evidence
-layer.
-
-The adapter verifies model hashes and observes the selected executable before
-launch. The resolved record describes that check. The engine opens its own
-files after launch.
+See [the direct supervision ADR](../adr/0007-direct-native-supervision.md)
+for the supported process contract and its limits.

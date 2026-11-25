@@ -154,8 +154,7 @@ def test_ci_runs_the_aggregate_gate_once_per_platform() -> None:
     assert "run: make test" not in workflow
     assert "run: make smoke" not in workflow
     assert "media-generation --help" not in workflow
-    assert "if: runner.os == 'Linux'" in workflow
-    assert "tests/apex_venv_permissions_root.py" in workflow
+    assert "run: sudo" not in workflow
 
 
 def test_cleanup_documentation_covers_operations_and_limits() -> None:
