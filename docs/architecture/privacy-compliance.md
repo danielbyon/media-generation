@@ -195,11 +195,10 @@ argv and environment must also match that prepared invocation.
 
 The gate binds the recorded engine ID, candidate and declaration digests,
 recipe, component identities, adapters, and invocation contracts to the claim.
-For SD-C++, `argv[0]` must match the full selected executable path.
-`engine.executable_sha256` must equal the SHA-256 captured during resolution of
-the same attempt. The service compares it with the adapter's pending
-observation without rehashing the executable. Engine version and build are
-diagnostic fields. The trusted adapter derives model
+For SD-C++, resolution verifies the selected executable against the reviewed
+candidate digest. The service binds the resolved executable identity to the
+admitted candidate and checks that `argv[0]` matches the selected executable’s
+full path. The trusted adapter derives model
 paths from the candidate. The service validates the component identity rows
 and exact prepared argv. It does not independently match each model-path
 argument to the corresponding component pin.

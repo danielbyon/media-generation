@@ -422,6 +422,39 @@ def test_residual_descendant_prevents_publication(
     assert service._store.current_attempt(successor.job_id) is None
 
 
+def test_unconfirmed_process_group_termination_blocks_publication_and_dispatch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = build_bundle(tmp_path)
+    service = _service(tmp_path, bundle)
+    monkeypatch.setattr(ProcessSupervisor, "_wait_group_empty", lambda self, pid: False)
+
+    with pytest.raises(GenerationExecutionError) as raised:
+        service.submit(
+            "unconfirmed-group", _request(), workload_demand=heavy_workload_demand()
+        )
+    job_id = raised.value.job_id
+    observed = service.get_execution(job_id)["observed"]
+    assert observed["exit_code"] == 0
+    assert observed["signal"] is None
+    assert observed["direct_child_reaped"] is True
+    assert observed["stream_state_unknown"] is False
+    assert observed["inherited_streams_retained_after_reap"] is False
+    assert observed["process_group_terminated"] is False
+
+    provenance = service.get_provenance(job_id)
+    assert provenance["attempt"]["termination_proven"] is False
+    assert provenance["artifact"] is None
+    assert service._store.resource_snapshot()["state"] == "quarantined"
+
+    successor = service.enqueue(
+        "after-unconfirmed-group", _request(), workload_demand=heavy_workload_demand()
+    )
+    assert successor.status == "queued"
+    assert service.work()["status"] == "attention_required"
+    assert service._store.current_attempt(successor.job_id) is None
+
+
 def test_nul_prompt_is_refused_before_any_backend_attempt(
     tmp_path: Path,
 ) -> None:
