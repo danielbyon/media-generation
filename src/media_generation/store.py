@@ -46,7 +46,11 @@ from .errors import (
     RecordNotFoundError,
     UnknownReferenceError,
 )
-from .privacy import COMFYUI_ADAPTER_ID, is_privacy_compliance_record
+from .privacy import (
+    COMFYUI_ADAPTER_ID,
+    NATIVE_IMAGE_ADAPTER_ID,
+    is_privacy_compliance_record,
+)
 
 _RESOLVED_OUTPUT_DIRECTORY_KEY = "_resolved_output_directory"
 _MALFORMED_STORED_PRIVACY_EVIDENCE = "stored privacy-compliance evidence is malformed"
@@ -75,9 +79,9 @@ def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
             "persisted ComfyUI adapter configuration has no workflow approval pin"
         )
     return configuration["workflow_approval"]
-_WRITER_EPOCH = 7
+_WRITER_EPOCH = 9
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_CURRENT_SCHEMA_VERSION = 7
+_CURRENT_SCHEMA_VERSION = 10
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
@@ -94,6 +98,8 @@ _WRITER_GUARDS = (
     ("execution_admissions", "UPDATE"),
     ("backend_executions", "INSERT"),
     ("backend_executions", "UPDATE"),
+    ("execution_cancellations", "INSERT"),
+    ("execution_cancellations", "UPDATE"),
 ("generation_batches", "INSERT"),
 ("generation_batches", "UPDATE"),
 ("generation_batch_slots", "INSERT"),
@@ -500,6 +506,45 @@ BEGIN
     SELECT RAISE(ABORT, 'artifact lineage is sealed');
 END"""
 
+_EXECUTION_CANCELLATIONS_DDL = """CREATE TABLE execution_cancellations (
+    cancellation_id INTEGER PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
+    attempt_id TEXT REFERENCES execution_attempts(attempt_id),
+    claim_epoch INTEGER NOT NULL CHECK (claim_epoch >= 1),
+    state TEXT NOT NULL CHECK (state IN ('requested','acknowledged','too_late')),
+    requested_at TEXT,
+    acknowledged_at TEXT,
+    too_late_at TEXT,
+    CHECK ((state = 'requested' AND requested_at IS NOT NULL
+                AND acknowledged_at IS NULL AND too_late_at IS NULL)
+        OR (state = 'acknowledged' AND acknowledged_at IS NOT NULL
+                AND too_late_at IS NULL)
+        OR (state = 'too_late' AND too_late_at IS NOT NULL
+                AND acknowledged_at IS NULL)),
+    UNIQUE (job_id, claim_epoch)
+)"""
+
+_EXECUTION_CANCELLATIONS_TRANSITION_DDL = """CREATE TRIGGER execution_cancellations_transition
+BEFORE UPDATE ON execution_cancellations
+BEGIN
+    SELECT RAISE(ABORT, 'cancellation identity is immutable')
+    WHERE NEW.cancellation_id IS NOT OLD.cancellation_id
+       OR NEW.job_id IS NOT OLD.job_id
+       OR NEW.attempt_id IS NOT OLD.attempt_id
+       OR NEW.claim_epoch IS NOT OLD.claim_epoch
+       OR NEW.requested_at IS NOT OLD.requested_at;
+    SELECT RAISE(ABORT, 'cancellation transition is invalid')
+    WHERE NOT (OLD.state = 'requested' AND NEW.state = 'acknowledged'
+        AND OLD.acknowledged_at IS NULL AND NEW.acknowledged_at IS NOT NULL
+        AND NEW.too_late_at IS NULL);
+END"""
+
+_EXECUTION_CANCELLATIONS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER execution_cancellations_immutable_delete
+BEFORE DELETE ON execution_cancellations
+BEGIN
+    SELECT RAISE(ABORT, 'cancellation evidence is immutable');
+END"""
+
 _EXECUTION_TABLE_DDL: dict[str, str] = {
     "execution_jobs": _EXECUTION_JOBS_DDL,
     "execution_attempts": _EXECUTION_ATTEMPTS_DDL,
@@ -507,6 +552,7 @@ _EXECUTION_TABLE_DDL: dict[str, str] = {
     "artifact_publication_authority": _ARTIFACT_PUBLICATION_AUTHORITY_DDL,
     "execution_admissions": _EXECUTION_ADMISSIONS_DDL,
     "backend_executions": _BACKEND_EXECUTIONS_DDL,
+    "execution_cancellations": _EXECUTION_CANCELLATIONS_DDL,
 }
 
 
@@ -554,6 +600,8 @@ _STATIC_TRIGGER_DDL: dict[str, str] = {
     "backend_executions_stage_insert": _BACKEND_EXECUTIONS_STAGE_INSERT_DDL,
     "backend_executions_stage_transition": _BACKEND_EXECUTIONS_STAGE_TRANSITION_DDL,
     "backend_executions_immutable_delete": _BACKEND_EXECUTIONS_IMMUTABLE_DELETE_DDL,
+    "execution_cancellations_transition": _EXECUTION_CANCELLATIONS_TRANSITION_DDL,
+    "execution_cancellations_immutable_delete": _EXECUTION_CANCELLATIONS_IMMUTABLE_DELETE_DDL,
     "generation_batches_identity_immutable": (
         _GENERATION_BATCHES_IDENTITY_IMMUTABLE_DDL
     ),
@@ -647,6 +695,7 @@ class SQLiteStore:
         transaction: bool = False,
         *,
         read_transaction: bool = False,
+        initialize: bool = False,
     ) -> Iterator[sqlite3.Connection]:
         if transaction and read_transaction:
             raise ValueError(
@@ -654,17 +703,15 @@ class SQLiteStore:
             )
         if transaction and self.read_only:
             raise sqlite3.OperationalError("read-only store cannot open a write transaction")
-        if self.read_only:
-            connection = sqlite3.connect(
-                f"{self.database_path.as_uri()}?mode=ro",
-                timeout=30,
-                isolation_level=None,
-                uri=True,
-            )
-        else:
-            connection = sqlite3.connect(
-                str(self.database_path), timeout=30, isolation_level=None
-            )
+        # Existing databases may be owned by the worker in a sticky directory.
+        # Opening them without CREATE also prevents replacing a missing database.
+        mode = "ro" if self.read_only else "rwc" if initialize else "rw"
+        connection = sqlite3.connect(
+            f"{self.database_path.as_uri()}?mode={mode}",
+            timeout=30,
+            isolation_level=None,
+            uri=True,
+        )
         connection.row_factory = sqlite3.Row
         connection.create_function(
             _WRITER_EPOCH_FUNCTION, 0, lambda: _WRITER_EPOCH, deterministic=True
@@ -688,7 +735,7 @@ class SQLiteStore:
 
     def _initialize(self) -> None:
         """Create the complete current schema in one SQLite transaction."""
-        with self._connection(transaction=True) as connection:
+        with self._connection(transaction=True, initialize=True) as connection:
             existing_objects = connection.execute(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
@@ -1821,11 +1868,13 @@ END"""
             )
 
     def cancel_execution(self, job_id: str, timestamp: str) -> str:
-        """Durably fence a queued or running execution and report its outcome."""
+        """Fence publication and durably record the cancellation lifecycle."""
         with self._connection(transaction=True) as connection:
             row = connection.execute(
                 """SELECT execution.status AS execution_status,
                           execution.current_attempt_id,
+                          execution.fence_epoch,
+                          attempts.claim_epoch AS attempt_claim_epoch,
                           resource.state AS resource_state,
                           attempts.status AS attempt_status
                    FROM execution_jobs AS execution
@@ -1837,15 +1886,43 @@ END"""
             ).fetchone()
             if row is None:
                 raise RecordNotFoundError(f"job not found: {job_id}")
-            if row["execution_status"] in {"succeeded"}:
-                return "too_late"
             if row["execution_status"] == "canceled":
-                if (
-                    row["resource_state"] == "claimed"
-                    and row["attempt_status"] == "running"
-                ):
-                    return "accepted"
-                return "acknowledged"
+                prior_cancellation = connection.execute(
+                    """SELECT state FROM execution_cancellations
+                       WHERE job_id = ? AND attempt_id IS ?
+                       ORDER BY claim_epoch DESC LIMIT 1""",
+                    (job_id, row["current_attempt_id"]),
+                ).fetchone()
+                if prior_cancellation is not None:
+                    return str(prior_cancellation["state"])
+            cancellation_epoch = (
+                int(row["fence_epoch"]) + 1
+                if row["execution_status"] == "queued"
+                or (
+                    row["execution_status"] == "canceled"
+                    and not (
+                        row["resource_state"] == "claimed"
+                        and row["attempt_status"] == "running"
+                    )
+                )
+                or row["attempt_claim_epoch"] is None
+                else int(row["attempt_claim_epoch"])
+            )
+            prior = connection.execute(
+                """SELECT state FROM execution_cancellations
+                   WHERE job_id = ? AND claim_epoch = ?""",
+                (job_id, cancellation_epoch),
+            ).fetchone()
+            if prior is not None:
+                return str(prior["state"])
+            if row["execution_status"] in {"succeeded"}:
+                connection.execute(
+                    """INSERT INTO execution_cancellations
+                       (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                       VALUES (?,?,?,'too_late',NULL,NULL,?)""",
+                    (job_id, row["current_attempt_id"], cancellation_epoch, timestamp),
+                )
+                return "too_late"
             if row["execution_status"] == "queued":
                 connection.execute(
                     """UPDATE execution_jobs
@@ -1859,21 +1936,53 @@ END"""
                     (timestamp, job_id),
                 )
                 AdmissionPersistence.cancel_before_dispatch(connection, job_id, timestamp)
+                connection.execute(
+                    """INSERT INTO execution_cancellations
+                       (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                       VALUES (?,NULL,?,'acknowledged',?,?,NULL)""",
+                    (job_id, cancellation_epoch, timestamp, timestamp),
+                )
                 return "acknowledged"
             if row["execution_status"] == "running":
+                current_fence_epoch = int(row["fence_epoch"])
+                attempt_claim_epoch = row["attempt_claim_epoch"]
+                if attempt_claim_epoch is None:
+                    cancellation_fence_epoch = current_fence_epoch + 1
+                else:
+                    attempt_claim_epoch = int(attempt_claim_epoch)
+                    if current_fence_epoch not in {
+                        attempt_claim_epoch,
+                        attempt_claim_epoch + 1,
+                    }:
+                        raise BackendEvidenceError(
+                            "cancellation found an unexpected publication fence epoch"
+                        )
+                    cancellation_fence_epoch = attempt_claim_epoch + 1
                 connection.execute(
                     """UPDATE execution_jobs
-                       SET status = 'canceled', fence_epoch = fence_epoch + 1,
+                       SET status = 'canceled', fence_epoch = ?,
                            retry_eligible = 0,
                            failure_message = 'canceled during adapter invocation',
                            updated_at = ? WHERE job_id = ? AND status = 'running'""",
-                    (timestamp, job_id),
+                    (cancellation_fence_epoch, timestamp, job_id),
                 )
                 connection.execute(
                     "UPDATE generation_jobs SET status = 'failed', updated_at = ? WHERE job_id = ?",
                     (timestamp, job_id),
                 )
-                return "accepted"
+                connection.execute(
+                    """INSERT INTO execution_cancellations
+                       (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                       VALUES (?,?,?,'requested',?,NULL,NULL)""",
+                    (job_id, row["current_attempt_id"], cancellation_epoch, timestamp),
+                )
+                return "requested"
+            connection.execute(
+                """INSERT INTO execution_cancellations
+                   (job_id,attempt_id,claim_epoch,state,requested_at,acknowledged_at,too_late_at)
+                   VALUES (?,?,?,'too_late',NULL,NULL,?)""",
+                (job_id, row["current_attempt_id"], cancellation_epoch, timestamp),
+            )
             return "too_late"
 
     def retry_execution(self, job_id: str, timestamp: str) -> bool:
@@ -1947,6 +2056,7 @@ END"""
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT attempts.*, execution.status AS job_status,
+                          execution.failure_message AS job_failure_message,
                           execution.max_attempts, execution.fence_epoch,
                           execution.containment_contract AS job_containment_contract
                    FROM execution_jobs AS execution
@@ -2067,6 +2177,32 @@ END"""
             adapter_id=admitted_adapter_id,
         )
 
+    @staticmethod
+    def _uses_native_group(connection: sqlite3.Connection, job_id: str) -> bool:
+        row = connection.execute(
+            "SELECT adapter_id FROM generation_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        return row is not None and row[0] == NATIVE_IMAGE_ADAPTER_ID
+
+    @staticmethod
+    def _native_group_empty(
+        connection: sqlite3.Connection, job_id: str, attempt_id: str
+    ) -> bool:
+        row = connection.execute(
+            "SELECT observed_json FROM backend_executions "
+            "WHERE job_id = ? AND attempt_id = ? AND state = 'observed'",
+            (job_id, attempt_id),
+        ).fetchone()
+        if row is None or row[0] is None:
+            return False
+        observed = json.loads(row[0])
+        validate_observed_record(observed)
+        return (
+            observed["attempt_id"] == attempt_id
+            and observation_proves_reaped_child(observed)
+            and observed.get("process_group_terminated") is True
+        )
+
     @classmethod
     def _resource_release_proven(
         cls,
@@ -2090,6 +2226,10 @@ END"""
         """
         if prelaunch_refusal:
             return effective_termination_proven and not cls._attempt_has_launch_evidence(
+                connection, job_id, attempt_id
+            )
+        if cls._uses_native_group(connection, job_id):
+            return effective_termination_proven and cls._native_group_empty(
                 connection, job_id, attempt_id
             )
         if cls._attempt_requires_process_tree_resource_release(
@@ -2176,6 +2316,8 @@ END"""
         job_id: str,
         attempt_id: str,
     ) -> bool:
+        if cls._uses_native_group(connection, job_id):
+            return cls._native_group_empty(connection, job_id, attempt_id)
         direct_child_termination_proven = cls._attempt_termination_evidence(
             connection, job_id, attempt_id
         )
@@ -2376,11 +2518,35 @@ END"""
         attempt_id: str,
         owner_id: str | None,
         claim_epoch: int | None,
+        *,
+        settle_cancellation: bool = False,
     ) -> None:
         """Refuse evidence writes from a stale owner, epoch, or attempt."""
-        if not SQLiteStore._attempt_authorized(
+        if SQLiteStore._attempt_authorized(
             connection, job_id, attempt_id, owner_id, claim_epoch
         ):
+            return
+        # A canceled owner may still report the child it already started. This
+        # evidence cannot authorize dispatch or restore publication authority.
+        canceled_native_attempt = (
+            settle_cancellation
+            and SQLiteStore._uses_native_group(connection, job_id)
+            and connection.execute(
+                """SELECT 1 FROM execution_jobs AS jobs
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = jobs.current_attempt_id
+                   JOIN execution_resource AS resource ON resource.id = 1
+                   WHERE jobs.job_id = ? AND jobs.status = 'canceled'
+                     AND jobs.current_attempt_id = ? AND jobs.fence_epoch = ? + 1
+                     AND attempts.status = 'running' AND attempts.owner_id = ?
+                     AND attempts.claim_epoch = ? AND resource.state = 'claimed'
+                     AND resource.job_id = jobs.job_id
+                     AND resource.attempt_id = attempts.attempt_id
+                     AND resource.owner_id = attempts.owner_id""",
+                (job_id, attempt_id, claim_epoch, owner_id, claim_epoch),
+            ).fetchone() is not None
+        )
+        if not canceled_native_attempt:
             raise BackendEvidenceError(
                 "attempt ownership, epoch, or current-job authority is stale; "
                 "execution evidence was not written"
@@ -2469,7 +2635,8 @@ END"""
             raise BackendEvidenceError("launch evidence identifies a different attempt")
         with self._connection(transaction=True) as connection:
             self._require_backend_authority(
-                connection, job_id, attempt_id, owner_id, claim_epoch
+                connection, job_id, attempt_id, owner_id, claim_epoch,
+                settle_cancellation=True,
             )
             updated = connection.execute(
                 """UPDATE backend_executions
@@ -2498,7 +2665,8 @@ END"""
             raise BackendEvidenceError("observation evidence identifies a different attempt")
         with self._connection(transaction=True) as connection:
             self._require_backend_authority(
-                connection, job_id, attempt_id, owner_id, claim_epoch
+                connection, job_id, attempt_id, owner_id, claim_epoch,
+                settle_cancellation=True,
             )
             updated = connection.execute(
                 """UPDATE backend_executions
@@ -2546,6 +2714,10 @@ END"""
                 raise RuntimeError(
                     f"attempt {artifact.attempt_id} for job {artifact.job_id} is not running"
                 )
+            if self._uses_native_group(connection, artifact.job_id) and not self._native_group_empty(
+                connection, artifact.job_id, artifact.attempt_id
+            ):
+                raise BackendEvidenceError("native attempt lacks confirmed group termination")
             if publication_id is None:
                 raise RuntimeError(
                     "generated artifact completion requires a publication journal row"
@@ -3175,6 +3347,14 @@ END"""
                     job_id,
                 ),
             )
+            if failure_class == "canceled" and resource_release_proven:
+                connection.execute(
+                    """UPDATE execution_cancellations
+                       SET state = 'acknowledged', acknowledged_at = ?
+                       WHERE job_id = ? AND attempt_id = ? AND claim_epoch = ?
+                         AND state = 'requested'""",
+                    (timestamp, job_id, attempt_id, claim_epoch),
+                )
             resource_state = (
                 "quarantined"
                 if failure_class == "ambiguous" or not resource_release_proven

@@ -448,7 +448,7 @@ def test_comfyui_recovery_reports_attention_after_direct_child_observation(
         timestamp=_now(),
     ) is None
     if canceled:
-        assert service.cancel(job_id)["outcome"] == "accepted"
+        assert service.cancel(job_id)["outcome"] == "requested"
 
     report = service.recover()
 
@@ -652,12 +652,15 @@ def _finalize(service: GenerationService, claim, prepared) -> None:
         record=_launch(prepared),
         timestamp=_now(),
     )
+    observation = _observed(claim.attempt_id)
+    if isinstance(service.adapter, engine.StableDiffusionCppAdapter):
+        observation["process_group_terminated"] = True
     service._store.mark_execution_observed(
         job_id=claim.job_id,
         attempt_id=claim.attempt_id,
         owner_id="owner_manual",
         claim_epoch=claim.claim_epoch,
-        record=_observed(claim.attempt_id),
+        record=observation,
         timestamp=_now(),
     )
     assert service._store.fail_execution(
@@ -691,7 +694,7 @@ def _claim(service: GenerationService, job_id: str, attempt_id: str):
     return claim
 
 
-def test_v2_and_v3_records_share_schema_seven_and_survive_restart(tmp_path: Path) -> None:
+def test_v2_and_v3_records_share_current_schema_and_survive_restart(tmp_path: Path) -> None:
     bundle = build_bundle(tmp_path / "v2")
     service = _service(tmp_path, bundle)
 
@@ -731,7 +734,7 @@ def test_v2_and_v3_records_share_schema_seven_and_survive_restart(tmp_path: Path
             "SELECT resolved_json FROM backend_executions WHERE attempt_id = ?",
             (v2_claim.attempt_id,),
         ).fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
 
     restarted = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "images")
     v2 = restarted.get_execution(v2_job)
@@ -758,7 +761,7 @@ def test_v2_and_v3_records_share_schema_seven_and_survive_restart(tmp_path: Path
     comfy_service.adapter.cleanup_execution(v3_prepared)
 
 
-def test_v2_v3_v4_records_share_schema_seven_and_survive_restart(
+def test_v2_v3_v4_records_share_current_schema_and_survive_restart(
     tmp_path: Path,
 ) -> None:
     v2_root = tmp_path / "v2"
@@ -836,7 +839,7 @@ def test_v2_v3_v4_records_share_schema_seven_and_survive_restart(
 
     for root in (v2_root, legacy_root, current_root):
         with sqlite3.connect(root / "studio.sqlite3") as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 7
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
 
     restarted = GenerationService(
         v2_root / "studio.sqlite3", v2_root / "images"

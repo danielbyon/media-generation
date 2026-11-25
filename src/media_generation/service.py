@@ -54,6 +54,7 @@ from .errors import (
     UnsupportedCapabilityError,
 )
 from .privacy import (
+    NATIVE_IMAGE_ADAPTER_ID,
     DEFAULT_PRIVACY_POLICY,
     PrivacyComplianceResult,
     PrivacyCompliancePolicy,
@@ -74,6 +75,7 @@ from .backend_provenance import (
     RESOLVED_RECORD_SCHEMA_VERSION,
     environment_record,
 )
+from .engine import StableDiffusionCppAdapter
 from .store import ExecutionClaim, QueuedExecution, SQLiteStore
 from .supervisor import (
     ExecutionEvidenceAuthority,
@@ -962,10 +964,14 @@ class GenerationService:
             def write_image(destination: Path, staged: BinaryIO) -> None:
                 nonlocal metadata, adapter_dispatched, execute_entered, executed, supervisor
                 if prepared_execution is not None:
+                    authority = _StoreExecutionAuthority(self._store, claim)
                     supervisor = ProcessSupervisor(
-                        _StoreExecutionAuthority(self._store, claim),
+                        authority,
                         expected_argv=prepared_execution.argv,
                         expected_environment=prepared_execution.environment,
+                        stop_requested=(
+                            lambda: not authority.verify_current()
+                        ) if claim.adapter_id == NATIVE_IMAGE_ADAPTER_ID else None,
                     )
                     execute_entered = True
                     metadata = self.adapter.execute(
@@ -1156,9 +1162,8 @@ class GenerationService:
         Resolution performs the T07 evaluation and builds the resolved record.
         The record cannot be its own authority: every field that selects a
         candidate, engine, recipe, or component must match the restart-stable
-        configuration selected for the attempt. The pinned backend executable
-        must also appear at its contract-defined argv position, so an adapter
-        cannot obtain a privacy pass for a different program.
+        configuration selected for the attempt. Check the full selected
+        SD-C++ path, or the pinned executable for other adapter contracts.
         """
         record = getattr(prepared, "resolved_record", None)
         if not isinstance(record, dict):
@@ -1179,6 +1184,7 @@ class GenerationService:
             raise _resolved_execution_mismatch(
                 "resolved execution engine identity missing"
             )
+        installed_sd_cpp = isinstance(self.adapter, StableDiffusionCppAdapter)
         for name in ("id", "version", "build", "executable_sha256"):
             _require_selected_field(
                 record_engine, selected_engine, name, label=f"engine.{name}"
@@ -1205,6 +1211,13 @@ class GenerationService:
             configuration.get("adapters"),
             label="adapters",
         )
+        if installed_sd_cpp:
+            argv = tuple(getattr(prepared, "argv", ()))
+            if not argv or argv[0] != str(self.adapter.selected_executable):
+                raise _resolved_execution_mismatch(
+                    "resolved argv[0] does not match the selected executable path"
+                )
+            return
         self._require_selected_executable(
             record_engine,
             selected_engine,
@@ -1285,9 +1298,8 @@ class GenerationService:
         settings from the argv and environment it is about to spawn, requires
         that the record matches that recomputation, and requires the
         application-owned policy to return PASS. The profile is selected by
-        the application-owned registry from the exact adapter identity, engine
-        identity, engine version, and configuration version; a policy object
-        exposed by the adapter is never consulted. A caller-supplied policy
+        the application-owned registry using the adapter's supported contract.
+        ComfyUI also binds its signed engine version. A caller-supplied policy
         cannot relax this gate, and ``require_privacy_pass=False`` does not
         apply to backend execution adapters.
 
@@ -1402,7 +1414,10 @@ class GenerationService:
                 )
         if (
             engine.get("id") != registration.tool_id
-            or engine.get("version") != registration.tool_version
+            or (
+                not isinstance(self.adapter, StableDiffusionCppAdapter)
+                and engine.get("version") != registration.tool_version
+            )
         ):
             raise PrivacyComplianceError(
                 replace(

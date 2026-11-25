@@ -61,11 +61,12 @@ from .errors import BackendPreparationError, GenerationError, InputValidationErr
 from .images import copy_source, open_regular, validate_image
 from .privacy import (
     LOCAL_INFERENCE_CONFIGURATION_VERSION,
+    NATIVE_IMAGE_ADAPTER_ID,
     invocation_privacy_settings,
 )
 from .supervisor import ProcessSupervisor
 
-ADAPTER_ID = "stable-diffusion-cpp-local-v1"
+ADAPTER_ID = NATIVE_IMAGE_ADAPTER_ID
 BACKEND_KIND = "local-inference"
 INVOCATION_CONTRACT = "sd-cpp-exec-v1"
 SUPPORTED_ENGINE_ID = "stable-diffusion.cpp"
@@ -77,7 +78,7 @@ ZERO_CONDITIONING_FLAG = "qwen_image_zero_cond_t"
 MAX_MODEL_ARGS = 8
 OUTPUT_BASENAME = "output.png"
 VERIFICATION_WINDOW_STATEMENT = (
-    "The application hashed every pinned executable, declared component, "
+    "The application verified the executable and components against the declaration, "
     "recipe, and evidence file before launch. The engine opens those paths "
     "itself after launch and may observe different bytes, so this record does "
     "not claim the engine loaded the hashed bytes."
@@ -676,9 +677,8 @@ def _static_configuration(candidate: EngineCandidate) -> dict[str, object]:
     Timestamps, absolute paths, verification observation identity, and values
     derived by hashing the configuration itself are excluded so independent
     submissions and workers compare the same candidate selections.
-    The executable pin and required operation roles are retained so dispatch
-    can compare an adapter resolution with the selected candidate without
-    repeating the T07 file hashing pass.
+    The original executable metadata stays in the selection for queued jobs.
+    Dispatch records the currently installed executable in the attempt instead.
     """
     declaration = candidate.declaration
     return {
@@ -864,16 +864,11 @@ def _environment_record(environment: Mapping[str, str]) -> dict[str, object]:
 
 
 def _validate_runtime(runtime: Mapping[str, object]) -> None:
-    """Refuse dispatch unless the declared ROCm runtime markers are readable."""
+    """Require Linux for the native ROCm invocation."""
     if runtime.get("platform") != "linux":
         raise BackendPreparationError(
             "runtime_platform_mismatch",
-            "the pinned engine requires a Linux ROCm host",
-        )
-    if not runtime.get("rocm_version") or not runtime.get("amdgpu_version"):
-        raise BackendPreparationError(
-            "runtime_evidence_incomplete",
-            "ROCm and amdgpu version markers are required before dispatch",
+            "the engine requires a Linux ROCm host",
         )
 
 
@@ -1020,13 +1015,18 @@ class StableDiffusionCppAdapter:
 
         return _static_configuration(self._candidate)
 
+    @property
+    def selected_executable(self) -> Path:
+        """Return the full executable path from the admitted candidate selection."""
+        declaration = self._candidate.declaration
+        return declaration.engine.executable.resolved_path(declaration.root_index)
+
     def resolve_execution(self, plan: GenerationPlan) -> ResolvedExecution:
         """Re-evaluate the candidate and return one immutable pre-dispatch plan.
 
-        Every pinned declaration, recipe, component, and trusted evidence file is
-        read again through the T07 evaluator. The fresh verification identity is
-        retained only in the attempt-scoped resolved record; it never enters the
-        restart-stable adapter configuration used to match queued candidates.
+        Recheck the recipe, model components, and trusted evidence. Record the
+        installed executable and the fresh verification identity on this
+        attempt. Queued jobs still match the original candidate configuration.
         """
         if not isinstance(plan, GenerationPlan):
             raise ValueError("plan must be a GenerationPlan")
@@ -1041,6 +1041,7 @@ class StableDiffusionCppAdapter:
         evaluation = evaluate_candidate(
             candidate.declaration,
             trusted_evidence=candidate.trusted_evidence,
+            selected_backend_kind=BACKEND_KIND,
         )
         if evaluation.status != READY:
             raise BackendPreparationError(
@@ -1188,8 +1189,14 @@ class StableDiffusionCppAdapter:
             process_observation = supervisor.run(
                 resolved.argv,
                 env=resolved.environment,
-                cwd=resolved.scratch_directory,
+                cwd=Path("/"),
             )
+            if process_observation.process_group_terminated is not None and (
+                not process_observation.process_group_terminated
+                or process_observation.stream_state_unknown
+                or process_observation.inherited_streams_retained_after_reap
+            ):
+                raise GenerationError("native attempt process group termination is unconfirmed")
             if (
                 process_observation.exit_code != 0
                 or process_observation.signal is not None

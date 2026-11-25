@@ -29,14 +29,13 @@ restart-stable candidate identity and declared capabilities. Construction does
 not load a model, hash model component files, start a process, inspect Git, or
 capture host runtime facts.
 
-Before every dispatch `resolve_execution` performs the authoritative offline T07
-evaluation. Static preparation and independent evidence authority must both be
-`ready`, and every pinned declaration, recipe, component, executable, and trusted
-evidence file is read and re-hashed. The selected candidate's stable
-`candidate_id` must still match the identity captured in the adapter
-configuration. A failure is refused before any process starts; the service never
-substitutes another bundle. The fresh `verification_id` belongs to that resolved
-attempt only and is excluded from the restart-stable static configuration.
+Before dispatch, the adapter verifies the recipe, model components, and trusted
+evidence through the T07 evaluator. The candidate must match the selection
+captured in the adapter configuration. For SD-C++ execution, the evaluator
+observes the installed executable at the selected path and records its digest.
+The declaration's original executable metadata remains part of the stable
+selection for queued jobs. Offline T07 inspection still compares the
+historical artifact pins. The fresh `verification_id` belongs to the attempt.
 
 T07 declaration schema version 1 has no field that references a prepared
 manifest or an acquisition journal. The adapter therefore re-evaluates the
@@ -194,30 +193,20 @@ the documented invocation contract cannot bind their required order and
 strength without guessing. Such a request finishes with
 `operation_unsupported`.
 
-The engine version stored in the resolved record is copied from the candidate
-declaration. The application-owned registration pins the real
-stable-diffusion.cpp identity to `master-975-95b3090-2-gb13a482`, the exact
-`git describe --tags` identity of commit
-`b13a48219d5cdf408edcb93da6cd69b612ed03d3`. Exact string matching remains
-mandatory at configuration evaluation and dispatch; a different describe
-string, branch, or commit identifies different engine source and is refused.
+SD-C++ attempts keep resolved record v2. The application verifies the
+executable against the reviewed candidate digest before dispatch. The record
+carries that digest, the selected absolute path, and the declared build and
+version. A replacement binary requires a reviewed candidate that pins it.
 
-Runtime markers are read without mutation. `rocm_version` is read from
-`$ROCM_PATH/.info/version` when `ROCM_PATH` names a readable installation
-marker, then from `/opt/rocm/.info/version`. `amdgpu_version` is read from
-`/sys/module/amdgpu/version` when readable, then from
-`/sys/module/amdgpu/srcversion`. The srcversion file is an opaque loaded-module
-build identifier, not a semantic driver version; the application records it
-under the existing field name and does not parse or order it. If neither
-amdgpu marker is readable, or neither ROCm marker is readable, the
-corresponding value is `null` and dispatch validation refuses the execution.
+`rocm_version` comes from the first readable marker at
+`$ROCM_PATH/.info/version` or `/opt/rocm/.info/version`. `amdgpu_version` comes
+from `/sys/module/amdgpu/version` or the opaque `srcversion` fallback. A missing
+marker is recorded as `null`. Linux remains required. The configured runtime
+must satisfy the invocation and produce a valid image.
 
-Verification happens before launch. The resolved record states that the pinned
-bytes were verified before the process started and that the engine may open
-different bytes afterwards, because no retained file handle is kept across the
-launch. That fact is stored as the `verification_window` object with its
-`verified_before_launch` and `engine_may_open_different_bytes_after_launch`
-flags. The application does not claim that the engine loaded the hashed bytes.
+The `verification_window` records the prelaunch check. The engine opens its own
+files after launch, so the digest describes the executable observed before
+dispatch. Administrators update the protected runtime between attempts.
 
 ## ComfyUI graph execution and resolved record v3
 
@@ -614,7 +603,8 @@ malformed row, unknown state, or failed observation write leaves the attempt
 uncertain. Failure finalization records `ambiguous`, quarantines the singleton
 resource, and causes the recovery report to return `attention_required`.
 
-A successful artifact may already be committed when required termination
+For adapters outside the native group contract, a successful artifact may
+already be committed when required termination
 evidence is unavailable. The artifact and job remain inspectable, and the
 resource stays quarantined. The service releases the singleton resource only
 when all of these conditions hold:
@@ -628,161 +618,23 @@ Process evidence changes the release input. It does not change attempt
 numbering, publisher ownership, fence epochs, retry eligibility, or
 no-clobber artifact publication.
 
+## Direct native inference lifecycle
 
-## Pre-dispatch refusals
+Stable Diffusion C++ runs as a direct child in a new session. This applies to
+the native image CLI contract. Managed ComfyUI execution keeps its own policy.
 
-An adapter prepares and resolves the execution before it marks the attempt as
-dispatched. If preparation raises a `BackendPreparationError` before resolution
-completes, the service finalizes a terminal preparation failure without creating
-backend evidence and without classifying an inference process as ambiguous. If
-preparation fails after the resolved row is written but before a child starts,
-the service retains that row in the resolved state with no launch or observation
-and finalizes a terminal preparation failure. The persisted message includes one
-stable code:
+The finite supervisor owns signaling, pipe draining, and reaping. A cancellation request fences
+publication in SQLite. If the child has started, the supervisor signals only
+the session’s original process group while the unreaped child pins its ID.
+It stops sending signals after reap. An empty-group probe, a reaped child,
+and settled streams establish the termination result for that attempt. The
+supervisor records the result alongside the exit status or signal.
 
-Request validation rejects NUL bytes in the submitted prompt before
-admission, so an invalid argv cannot reach the supervisor. As defense
-in depth, an invalid resolved invocation that raises `ValueError` during
-spawn is also classified as `engine_launch_failed`: no child started, no
-launch evidence exists, and the attempt is a terminal preparation failure.
+The claim holds GPU capacity through termination and publication settlement.
+An engine failure cannot publish. Cancellation becomes acknowledged after
+safe settlement. If the process group or its termination state is uncertain,
+the worker fences publication and leaves the resource quarantined. Recovery
+uses existing durable records and never signals a reconstructed PID.
 
-| Code | Meaning |
-| --- | --- |
-| `bundle_missing` | A declared required file is absent. |
-| `bundle_corrupt` | A file, control document, or identity no longer matches. |
-| `bundle_incompatible` | The declared engine, roles, or compatibility contract cannot execute the operation. |
-| `bundle_unverified` | Independent trusted evidence is absent or does not verify. |
-| `runtime_platform_mismatch` | The selected runtime is not the required platform. |
-| `runtime_evidence_incomplete` | Required runtime markers cannot be read. |
-| `engine_launch_failed` | The verified executable could not be started, or the resolved invocation was rejected before spawn. |
-| `recipe_invalid` | The invocation recipe is malformed or violates its strict schema. |
-| `operation_unsupported` | The selected profile cannot represent the requested operation. |
-| `resolved_execution_mismatch` | The resolved record does not match the candidate and executable selected at admission. |
-
-## Scratch output and publication
-
-The engine writes to `output.png` in a private directory created with
-`tempfile.mkdtemp` mode 0700. The directory is outside the configured output
-directory and outside a detected Git worktree. The adapter validates the image
-format and dimensions through a no-follow file handle before copying bytes into
-the publisher's already-open staging descriptor. The existing publisher then
-performs its normal full-image validation, filesystem synchronization, lineage
-insertion, and no-clobber publication.
-
-The adapter removes the scratch directory in `finally` after success or failure.
-The service also removes it if publication fails after resolution but before
-`execute` opens the publisher's staging descriptor. A process crash can leave the
-system temporary directory for external cleanup; it does not create a named
-staging file in the artifact directory.
-
-## Privacy and admission
-
-The real-engine privacy profile is application-owned. Its required controls
-assert that the application does not configure an external API, cloud or
-fallback inference path, telemetry, content upload, automatic network fetch or
-update, remote endpoint, or proxy. The child environment is rebuilt from a
-fixed allowlist and contains no proxy or credential variables.
-
-The adapter does not supply these control values. The application derives them
-from the resolved argument vector and the environment it will pass to the
-child. A URL scheme, a remote, host, listen, server, API, proxy, download,
-update, telemetry, or fallback token in the invocation marks the matching
-control prohibited, and any proxy variable in the environment does the same.
-The privacy profile is selected by the application, not by the adapter. An
-application-owned registry maps the exact adapter identifier to the engine
-identity, engine version, and configuration version it covers, and the service
-reads the profile from that registry. A policy object exposed by an adapter is
-ignored, so an adapter cannot widen the controls that apply to it. Adding an
-adapter identity to the registry is an application change.
-
-Invocation or environment settings the application cannot classify remain
-`unverified` and block execution.
-
-The service evaluates the record at the dispatch boundary before it inserts the
-resolved row and before it spawns a child. It requires the record's argv and
-environment to match the prepared invocation, recomputes the privacy settings
-from that argv and environment, requires the recorded map to match the
-recomputation, requires the adapter to declare an identity present in the
-application-owned privacy registry, requires the record's declared engine
-identity and version to match that registration, and requires the
-application-owned policy to return `pass`. A prohibited token in the argv or a
-proxy variable in the environment fails this gate.
-
-The gate also binds the record to the restart-stable adapter configuration
-persisted with the claim. Candidate identity, declaration digest, engine
-identity and executable digest, recipe identity and document digest, required
-component rows, adapters, and the CLI and invocation contracts must match that
-admission selection. The `argv[0]` path must end with the selected executable
-pin, and that one file is read again to confirm the pinned SHA-256; model and
-component files are not hashed a second time. The gate compares the reported
-component rows but does not bind the model-path values in the remaining `argv`
-entries to the corresponding component artifact pins; that path mapping remains
-inside the in-process adapter boundary. Substitutions of the candidate,
-declaration, executable build or bytes, recipe, required component rows,
-adapters, or contracts fail closed as `resolved_execution_mismatch` before the
-resolved row is inserted or a child starts. An engine identity or version
-mismatch against the application-owned registration fails earlier with the
-privacy reason `resolved_engine_mismatch`.
-The binding still consumes the configuration the adapter exposes at admission,
-so an adapter that fabricates both its configuration and its resolution remains
-an in-process trust boundary. The launch record captures the argv and
-environment the supervisor passed; it does not prove that the process opened
-the same bytes the application verified, because the engine opens those paths
-itself after launch.
-
-These controls describe application configuration only. They do not prove that
-the executable contains no network code and do not provide operating-system
-network confinement. Missing or unrecognized control values remain
-`unverified` and block the configuration-compliant execution profile.
-Prohibited values fail admission.
-
-Heavyweight execution still requires a current T06 admission decision and the
-single heavyweight reservation. Workers use the admission evidence persisted at
-submission; they do not accept capacity documents. A worker configures the same
-candidate and privacy configuration that it will claim, and an exact
-configuration mismatch is an error rather than a fallback selection.
-
-## Command-line use and inspection
-
-`submit`, `enqueue`, and `worker` accept `--engine-candidate` and optional
-`--engine-trusted-evidence`. Supplying no engine flags keeps the deterministic
-CPU adapter. Supplying trusted evidence without a candidate is invalid.
-
-`submit` and `enqueue` also accept the T06 inventory, policy, and workload
-demand files. `worker` has no capacity-file arguments because claim validation
-uses the evidence stored with the queued job.
-
-The full validated records for the current attempt are available through:
-
-```sh
-media-generation execution --db ./studio.sqlite3 --job-id <job-id>
-media-generation execution --db ./studio.sqlite3 --job-id <job-id> \
-  --attempt-id <attempt-id>
-```
-
-The provenance snapshot contains a compact `backend_execution` value with the
-attempt ID, state, resolved digest, and observation timestamp, or `null` when
-the current attempt has no backend record.
-
-## Reopen validation
-
-Reading an execution row parses and validates every present stage, checks that
-its attempt identity agrees with the row, checks the engine and recipe
-identities stored in columns, and recomputes the resolved digest from canonical
-JSON. A malformed or digest-mismatched row raises `BackendEvidenceError`; it is
-never treated as a missing row or downgraded to an unproven state.
-
-## Unverified boundaries
-
-The software path and synthetic conformance executable establish argument
-mapping, process supervision, evidence persistence, failure handling, and
-publication behavior. They do not establish that a particular Qwen checkpoint
-loads on APEX, that ROCm execution succeeds, that image quality is acceptable,
-that a survivor process is contained, or that the engine cannot access a
-network. Those remain runtime and qualification concerns outside this evidence
-layer.
-
-Component and executable hashes are verified before launch. Because no retained
-descriptor spans the launch, the bytes the engine opens afterwards may differ
-from the bytes that were hashed; the resolved record states this window
-explicitly.
+See [the direct supervision ADR](../adr/0007-direct-native-supervision.md)
+for the supported process contract and its limits.

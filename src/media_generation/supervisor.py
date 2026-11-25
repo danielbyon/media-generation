@@ -4,8 +4,9 @@ The supervisor starts exactly one direct child without a shell, drains both
 output pipes while the child runs, reaps the child, and records transport-level
 facts: exit status, byte counts, complete output digests, and a bounded
 text-free output classification. Captured output never reaches a persisted
-record. It makes no claim about descendant processes, filesystem confinement,
-or network isolation.
+record. For the local process-group contract, it also checks that the original
+group is empty after reaping. This does not establish filesystem or network
+isolation or account for processes that leave the group.
 
 The execution service constructs the supervisor and binds it to one claimed
 attempt, the exact argument vector and child environment produced by pre-dispatch
@@ -20,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import os
 import selectors
+import signal
 import subprocess
 import threading
 import time
@@ -102,6 +104,7 @@ class ProcessObservation:
     stderr_codes: tuple[str, ...]
     inherited_streams_retained_after_reap: bool
     stream_state_unknown: bool
+    process_group_terminated: bool | None = None
 
     def to_mapping(self) -> dict[str, object]:
         """Return the versioned observation record persisted by the service."""
@@ -127,6 +130,8 @@ class ProcessObservation:
                 self.inherited_streams_retained_after_reap
             ),
             "stream_state_unknown": self.stream_state_unknown,
+            **({"process_group_terminated": self.process_group_terminated}
+               if self.process_group_terminated is not None else {}),
         }
 
 
@@ -304,6 +309,7 @@ class ProcessSupervisor:
         expected_argv: Sequence[str],
         expected_environment: Mapping[str, str],
         drain_timeout_seconds: float = _DEFAULT_DRAIN_TIMEOUT_SECONDS,
+        stop_requested: Callable[[], bool] | None = None,
     ) -> None:
         if not isinstance(authority, ExecutionEvidenceAuthority):
             raise TypeError("authority must implement ExecutionEvidenceAuthority")
@@ -327,6 +333,8 @@ class ProcessSupervisor:
         self._expected_argv = argv
         self._expected_environment = dict(expected_environment)
         self._drain_timeout_seconds = float(drain_timeout_seconds)
+        self._stop_requested = stop_requested
+        self._group_signal_safe = False
         self._used = False
         self._process_started = False
         self._lock = threading.Lock()
@@ -393,6 +401,8 @@ class ProcessSupervisor:
             or not 0.0 <= float(shutdown_timeout_seconds) <= 60.0
         ):
             raise ValueError("shutdown_timeout_seconds must be between 0 and 60")
+        if self._stop_requested is not None:
+            raise ValueError("process-group supervision requires a finite child invocation")
         actual_argv, actual_environment, started = self._begin_invocation(
             argv,
             env,
@@ -472,6 +482,7 @@ class ProcessSupervisor:
                 "the resolved engine invocation could not be started",
             ) from error
         self._process_started = True
+        self._group_signal_safe = self._stop_requested is not None
         try:
             self._authority.record_launch(
                 LaunchFact(
@@ -483,7 +494,7 @@ class ProcessSupervisor:
                 )
             )
         except BaseException as error:
-            if not self._terminate_after_drain_failure(process):
+            if not self._abort_child(process):
                 raise BackendEvidenceError(
                     "direct child termination could not be proven after launch recording failed"
                 ) from error
@@ -523,53 +534,58 @@ class ProcessSupervisor:
             except BaseException as error:
                 drain_error.append(error)
 
-        drain_thread = threading.Thread(
-            target=drain,
-            name=f"managed-process-drain-{self._authority.attempt_id}",
-            daemon=True,
-        )
-        try:
-            drain_thread.start()
-        except BaseException as error:
-            if not self._terminate_after_drain_failure(process):
-                raise BackendEvidenceError(
-                    "direct child termination could not be proven after drain startup failed"
-                ) from error
-            raise
         callback_result: object = None
         callback_error: BaseException | None = None
         termination_error: BaseException | None = None
-        if session is None:
-            try:
-                drain_thread.join()
-            except BaseException:
-                self._terminate_after_drain_failure(process)
-                raise
+        if self._stop_requested is not None:
+            # The finite invocation has no concurrent protocol callback.
+            # Keep signaling, pipe draining, and reaping with one owner.
+            drain()
         else:
-            control = ManagedProcessControl(
-                process, self._authority, listener_owner_pid
+            drain_thread = threading.Thread(
+                target=drain,
+                name=f"managed-process-drain-{self._authority.attempt_id}",
+                daemon=True,
             )
             try:
-                callback_result = session(control)
+                drain_thread.start()
             except BaseException as error:
-                callback_error = error
-            finally:
+                if not self._terminate_after_drain_failure(process):
+                    raise BackendEvidenceError(
+                        "direct child termination could not be proven after drain startup failed"
+                    ) from error
+                raise
+            if session is None:
                 try:
-                    control.terminate(timeout_seconds=shutdown_timeout_seconds)
-                except BaseException as error:
-                    termination_error = error
-                drain_thread.join(
-                    timeout=shutdown_timeout_seconds + self._drain_timeout_seconds + 5.0
+                    drain_thread.join()
+                except BaseException:
+                    self._terminate_after_drain_failure(process)
+                    raise
+            else:
+                control = ManagedProcessControl(
+                    process, self._authority, listener_owner_pid
                 )
-                if drain_thread.is_alive():
+                try:
+                    callback_result = session(control)
+                except BaseException as error:
+                    callback_error = error
+                finally:
                     try:
-                        process.kill()
-                    except OSError:
-                        pass
-                    drain_thread.join(timeout=2.0)
+                        control.terminate(timeout_seconds=shutdown_timeout_seconds)
+                    except BaseException as error:
+                        termination_error = error
+                    drain_thread.join(
+                        timeout=shutdown_timeout_seconds + self._drain_timeout_seconds + 5.0
+                    )
+                    if drain_thread.is_alive():
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        drain_thread.join(timeout=2.0)
 
         if drain_error:
-            self._terminate_after_drain_failure(process)
+            self._abort_child(process)
             raise drain_error[0]
         if not drain_result:
             raise BackendEvidenceError(
@@ -603,6 +619,9 @@ class ProcessSupervisor:
             stderr_codes=stderr_classification.codes,
             inherited_streams_retained_after_reap=inherited_streams_retained,
             stream_state_unknown=stream_state_unknown,
+            process_group_terminated=(
+                self._wait_group_empty(process.pid) if self._stop_requested is not None else None
+            ),
         )
         self._authority.record_observation(observation)
         if callback_error is not None:
@@ -643,6 +662,9 @@ class ProcessSupervisor:
         open_streams = 0
         returncode: int | None = None
         deadline: float | None = None
+        stop_at: float | None = None
+        kill_sent = False
+        next_check = 0.0
         stream_state_unknown = False
         try:
             selector = selectors.DefaultSelector()
@@ -651,7 +673,25 @@ class ProcessSupervisor:
             open_streams = 2
             while True:
                 if returncode is None:
-                    returncode = process.poll()
+                    now = time.monotonic()
+                    if self._stop_requested is not None and now >= next_check:
+                        next_check = now + 0.25
+                        if stop_at is None and self._stop_requested():
+                            self._signal_group(process.pid, signal.SIGTERM)
+                            stop_at = time.monotonic()
+                        elif stop_at is not None and now >= stop_at + 10:
+                            raise TimeoutError("attempt process did not exit after cancellation")
+                        elif stop_at is not None and not kill_sent and now >= stop_at + 5:
+                            self._signal_group(process.pid, signal.SIGKILL)
+                            kill_sent = True
+                    # An unreaped leader pins the group through escalation,
+                    # even if the leader exits before its helpers do.
+                    if stop_at is None or kill_sent:
+                        # poll() can reap before setting Popen.returncode.
+                        # An interrupt in that window must revoke signal authority.
+                        self._group_signal_safe = False
+                        returncode = process.poll()
+                        self._group_signal_safe = self._stop_requested is not None and returncode is None
                     if returncode is not None:
                         deadline = time.monotonic() + self._drain_timeout_seconds
                 timeout = 0.05
@@ -725,6 +765,46 @@ class ProcessSupervisor:
                 if budget <= 0:
                     return True, stream_state_unknown
         return False, stream_state_unknown
+
+    @staticmethod
+    def _signal_group(pid: int, signum: int) -> None:
+        try:
+            os.killpg(pid, signum)
+        except (ProcessLookupError, PermissionError):
+            # Some systems reject signals to a group containing only zombies.
+            # Even a successful signal can leave members, so the later probe
+            # controls whether termination is recorded.
+            pass
+
+    @staticmethod
+    def _group_is_empty(pid: int) -> bool:
+        # Group IDs cannot be reused while the old group has members.
+        # Reuse can make this check conservatively reject release. An absent
+        # group cannot hide surviving members of the original group.
+        try:
+            os.killpg(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
+    def _wait_group_empty(self, pid: int) -> bool:
+        deadline = time.monotonic() + self._drain_timeout_seconds
+        while not self._group_is_empty(pid):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+        return True
+
+    def _abort_child(self, process: subprocess.Popen[bytes]) -> bool:
+        if self._group_signal_safe:
+            try:
+                self._signal_group(process.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        return self._terminate_after_drain_failure(process)
 
     @staticmethod
     def _terminate_after_drain_failure(process: subprocess.Popen[bytes]) -> bool:

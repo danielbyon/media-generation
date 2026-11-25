@@ -15,7 +15,7 @@ relative filename, observed source identity and timestamps, and import time.
 The source bytes are copied unchanged, including metadata and orientation.
 Later edits to the source file cannot change the stored artifact.
 
-The current schema is `user_version = 7`. A new database creates artifact,
+The current schema is `user_version = 10`. A new database creates artifact,
 lineage, publication, execution, backend-evidence, privacy, admission, and
 batch-coordination structures directly in one transaction. An existing
 database reopens through a read-only connection and must match the complete
@@ -33,7 +33,7 @@ incompatible. A `not_required` admission is accepted only for the exact bundled
 The store also creates immutable-artifact and writer-epoch triggers. Every
 connection registers the connection-local
 `media_generation_writer_epoch()` function. `BEFORE INSERT/UPDATE` guards on
-current mutation tables require epoch 7. A client that lacks the function, or
+current mutation tables require epoch 9. A client that lacks the function, or
 that reports a different epoch, aborts on its first guarded mutation.
 Validation compares every table, index, trigger definition, singleton resource
 row, execution sidecar, admission row, batch table, and batch slot. Unknown
@@ -320,7 +320,7 @@ changes, but do not protect against an adversary controlling the storage host.
 ## 7. Durable batch coordination
 
 `GenerationBatchService` stores a batch manifest and ordered slot rows in the
-same schema-v7 database as T04. It commits each slot's request, stable slot ID,
+same current database as artifact publication. It commits each slot's request, stable slot ID,
 T04 idempotency key, attempt budget, and per-slot admission profile and demand
 before admitting a GenerationJob. The T04 service remains the only component
 that admits, executes, retries, recovers, or publishes a single output.
