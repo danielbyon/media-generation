@@ -1077,7 +1077,8 @@ def _parse_request(source: str) -> GenerationRequest:
 def _parse_inference_request_file(source: Path) -> LlamaCppRequest:
     """Read a bounded inference request file without placing its prompt in argv."""
     try:
-        raw = source.read_bytes()
+        with source.open("rb") as stream:
+            raw = stream.read(MAX_INFERENCE_REQUEST_FILE_BYTES + 1)
     except OSError as error:
         raise InputValidationError("cannot read inference request file") from error
     if len(raw) > MAX_INFERENCE_REQUEST_FILE_BYTES:

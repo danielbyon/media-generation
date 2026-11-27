@@ -62,21 +62,6 @@ _REQUEST_SCHEMA_VERSION = 1
 _CONTAINMENT_CONTRACT = "process-contained/v1"
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _MAX_DEADLINE_SECONDS = 300.0
-_PUBLIC_SECRET_KEYS = frozenset(
-    {
-        "prompt",
-        "prompt_text",
-        "image_path",
-        "image_identity",
-        "request_json",
-        "stdout",
-        "stdout_prefix",
-        "response_bytes",
-        "argv",
-        "path",
-        "value",
-    }
-)
 
 
 class _PreflightBlocked(Exception):
@@ -238,25 +223,6 @@ def _hash_regular_file(path: Path) -> tuple[int, str]:
             size += len(block)
             digest.update(block)
     return size, digest.hexdigest()
-
-
-def _public_json(value: object) -> object:
-    """Remove request, response, and filesystem path data from public provenance."""
-    if isinstance(value, Mapping):
-        result: dict[str, object] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                continue
-            normalized = key.lower()
-            if normalized in _PUBLIC_SECRET_KEYS or normalized.endswith("_path"):
-                continue
-            result[key] = _public_json(item)
-        return result
-    if isinstance(value, (list, tuple)):
-        return [_public_json(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    return None
 
 
 class _InferenceExecutionAuthority(ExecutionEvidenceAuthority):
@@ -587,11 +553,9 @@ class InferenceService:
     def provenance(self, job_id: str) -> dict[str, object]:
         """Return durable outcomes without prompts, filesystem paths, or response content."""
         try:
-            result = self._store.get_inference_provenance(job_id)
+            return self._store.get_public_inference_provenance(job_id)
         except RecordNotFoundError:
             return {"job_id": job_id, "status": "not_found"}
-        safe = _public_json(result)
-        return safe if isinstance(safe, dict) else {"job_id": job_id}
 
     def _request_document(
         self,

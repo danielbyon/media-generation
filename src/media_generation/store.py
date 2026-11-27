@@ -65,6 +65,21 @@ _PRIVACY_CLAIM_EVIDENCE_REQUIRED = (
 _PRIVACY_CLAIM_CONFIGURATION_REQUIRED = (
     "protected execution claim requires exact adapter-configuration evidence"
 )
+_PUBLIC_INFERENCE_SECRET_KEYS = frozenset(
+    {
+        "prompt",
+        "prompt_text",
+        "image_path",
+        "image_identity",
+        "request_json",
+        "stdout",
+        "stdout_prefix",
+        "response_bytes",
+        "argv",
+        "path",
+        "value",
+    }
+)
 _MAX_INFERENCE_RESPONSE_BYTES = 1024 * 1024
 _REPAIRABLE_INFERENCE_CATEGORIES = frozenset(
     {
@@ -75,6 +90,28 @@ _REPAIRABLE_INFERENCE_CATEGORIES = frozenset(
         "generation_truncated",
     }
 )
+
+
+def _public_inference_provenance(value: object) -> object:
+    """Remove private prompt, response, and local path data from provenance."""
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            normalized = key.lower()
+            if (
+                normalized in _PUBLIC_INFERENCE_SECRET_KEYS
+                or normalized.endswith("_path")
+            ):
+                continue
+            result[key] = _public_inference_provenance(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_public_inference_provenance(item) for item in value]
+    if value is None or isinstance(value, (int, float, bool, str)):
+        return value
+    return None
 
 
 def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
@@ -4638,14 +4675,14 @@ END"""
         return self._artifact_from_row(row)
 
     def get_provenance(self, job_id: str) -> dict[str, object]:
-        """Return request, job, attempt history, artifact, and execution state."""
+        """Return job provenance with inference records reduced to public fields."""
         with self._connection() as connection:
             workload = connection.execute(
                 "SELECT workload_kind FROM execution_jobs WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
         if workload is not None and workload["workload_kind"] == "inference":
-            return self.get_inference_provenance(job_id)
+            return self.get_public_inference_provenance(job_id)
         with self._connection() as connection:
             job_row = connection.execute(
                 """SELECT jobs.*, artifacts.artifact_id,
@@ -4801,8 +4838,15 @@ resource.reason AS resource_reason
             raise RuntimeError("stored inference repair response failed integrity checks")
         return InferenceRepairContext(category, response_bytes)
 
+    def get_public_inference_provenance(self, job_id: str) -> dict[str, object]:
+        """Return inference provenance without prompts, responses, or local paths."""
+        result = _public_inference_provenance(
+            self.get_inference_provenance(job_id)
+        )
+        return result if isinstance(result, dict) else {"job_id": job_id}
+
     def get_inference_provenance(self, job_id: str) -> dict[str, object]:
-        """Return redacted request metadata and immutable inference outcomes."""
+        """Return internal inference provenance, including validated response values."""
         with self._connection() as connection:
             row = connection.execute(
                 """SELECT execution.*, requests.request_json,

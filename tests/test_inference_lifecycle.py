@@ -17,6 +17,7 @@ from PIL import Image
 import pytest
 
 import media_generation.inference_service as inference_service_module
+from media_generation.cli import main
 from media_generation.domain import GenerationRequest
 from media_generation.admission import (
     build_admission_profile,
@@ -374,6 +375,74 @@ def test_public_provenance_omits_validated_response_values(
     attempt_result = provenance["attempts"][0]["result"]
     assert "value" not in attempt_result
     assert "validation" in attempt_result
+
+
+def test_both_provenance_cli_commands_redact_persisted_inference_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    image_path = tmp_path / "private-image.png"
+    with Image.new("RGB", (3, 2), "blue") as image:
+        image.save(image_path, format="PNG")
+    response = {
+        "status": "ok",
+        "observations": [
+            {"label": "private vision result", "normalized_box": [0, 0, 1, 1]}
+        ],
+    }
+    prompt = "private vision prompt"
+    service, request, _ = _service(
+        tmp_path,
+        monkeypatch,
+        InferenceKind.VISION,
+        prompt,
+        [response],
+        image_path=image_path,
+    )
+    queued = service.enqueue("public-provenance", request)
+    job_id = str(queued["job_id"])
+    service.work(job_id=job_id)
+
+    internal = service._store.get_inference_provenance(job_id)
+    assert internal["attempts"][0]["result"]["value"] == response
+
+    command_arguments = (
+        ["provenance", "--db", str(service.database_path), "--job-id", job_id],
+        [
+            "inference",
+            "provenance",
+            "--db",
+            str(service.database_path),
+            "--job-id",
+            job_id,
+        ],
+    )
+    public_outputs = []
+    for arguments in command_arguments:
+        assert main(arguments) == 0
+        public_outputs.append(capsys.readouterr().out)
+
+    public_json = public_outputs[0]
+    private_values = (
+        prompt,
+        response["observations"][0]["label"],
+        json.dumps(response, separators=(",", ":")),
+        str(image_path),
+        str(service.configuration.executable_path),
+        str(service.configuration.model_component.path),
+        str(service.configuration.projector_component.path),
+    )
+    for private_value in private_values:
+        assert private_value not in public_json
+    assert json.loads(public_outputs[0]) == json.loads(public_outputs[1])
+
+    provenance = json.loads(public_json)
+    assert provenance["request"]["prompt_sha256"] == hashlib.sha256(
+        prompt.encode("utf-8")
+    ).hexdigest()
+    assert "validation" in provenance["attempts"][0]["result"]
+    assert "value" not in provenance["attempts"][0]["result"]
 
 
 def test_prelaunch_runtime_failure_persists_no_qualification_receipt(

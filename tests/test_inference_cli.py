@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from media_generation.cli import (
+    MAX_INFERENCE_REQUEST_FILE_BYTES,
     _load_llama_cpp_configuration,
     _load_inference_workload_demands,
     _parse_inference_request_file,
@@ -77,6 +78,44 @@ def test_request_file_rejects_duplicate_json_keys(tmp_path):
 
     with pytest.raises(InputValidationError, match="duplicate"):
         _parse_inference_request_file(request_file)
+
+
+def test_inference_request_file_reads_only_one_byte_past_its_limit(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pathlib import Path
+
+    source = tmp_path / "oversized-request.json"
+    source.write_bytes(b"x" * (MAX_INFERENCE_REQUEST_FILE_BYTES + 1))
+    read_sizes: list[int] = []
+    original_open = Path.open
+
+    class TrackingReader:
+        def __init__(self, handle) -> None:
+            self.handle = handle
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.handle.close()
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return self.handle.read(size)
+
+    def tracked_open(path, mode="r", *args, **kwargs):
+        return TrackingReader(original_open(path, mode, *args, **kwargs))
+
+    monkeypatch.setattr(
+        Path, "read_bytes", lambda *_args: pytest.fail("unbounded read_bytes was used")
+    )
+    monkeypatch.setattr(Path, "open", tracked_open)
+    with pytest.raises(InputValidationError, match="size limit"):
+        _parse_inference_request_file(source)
+
+    assert read_sizes == [MAX_INFERENCE_REQUEST_FILE_BYTES + 1]
 
 
 def test_runtime_configuration_resolves_component_paths_from_its_file(tmp_path):
