@@ -1177,4 +1177,3 @@ def test_reenqueuing_inference_reports_persisted_admission_decision(
     assert repeated["job_id"] == first["job_id"]
     assert repeated["created"] is False
     assert repeated["status"] == "queued"
-
