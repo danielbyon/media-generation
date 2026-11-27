@@ -232,7 +232,7 @@ def test_current_schema_contains_batch_tables_and_writer_guards(tmp_path: Path) 
     SQLiteStore(database)
 
     objects = _objects(database)
-    assert _CURRENT_SCHEMA_VERSION == 10
+    assert _CURRENT_SCHEMA_VERSION == 11
     assert {"generation_batches", "generation_batch_slots"} <= objects["table"]
     batch_guards = {
         SQLiteStore._writer_guard_sql(table, operation)[0]
@@ -241,6 +241,91 @@ def test_current_schema_contains_batch_tables_and_writer_guards(tmp_path: Path) 
     }
     assert batch_guards
     assert batch_guards <= objects["trigger"]
+
+
+def test_shared_execution_roots_own_generation_job_and_attempt_identity(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "studio.sqlite3"
+    SQLiteStore(database)
+
+    with sqlite3.connect(database) as connection:
+        execution_job_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(execution_jobs)"
+        ).fetchall()
+        generation_job_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(generation_jobs)"
+        ).fetchall()
+        execution_attempt_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(execution_attempts)"
+        ).fetchall()
+        generation_attempt_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(generation_attempts)"
+        ).fetchall()
+        inference_request_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(inference_requests)"
+        ).fetchall()
+        inference_result_foreign_keys = connection.execute(
+            "PRAGMA foreign_key_list(inference_attempt_results)"
+        ).fetchall()
+        execution_job_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(execution_jobs)")
+        }
+        generation_job_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(generation_jobs)")
+        }
+
+    assert not any(row[2] == "generation_jobs" for row in execution_job_foreign_keys)
+    assert any(
+        row[2:5] == ("execution_jobs", "job_id", "job_id")
+        for row in generation_job_foreign_keys
+    )
+    assert not any(
+        row[2] == "generation_attempts" for row in execution_attempt_foreign_keys
+    )
+    assert any(
+        row[2:5] == ("execution_attempts", "attempt_id", "attempt_id")
+        for row in generation_attempt_foreign_keys
+    )
+    assert "workload_kind" in execution_job_columns
+    assert "resolved_plan_json" not in execution_job_columns
+    assert "resolved_plan_json" in generation_job_columns
+    assert any(
+        row[2:5] == ("execution_jobs", "job_id", "job_id")
+        for row in inference_request_foreign_keys
+    )
+    assert any(
+        row[2:5] == ("execution_attempts", "attempt_id", "attempt_id")
+        for row in inference_result_foreign_keys
+    )
+
+
+def test_inference_execution_root_requires_its_workload_payload_without_mutation(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "studio.sqlite3"
+    SQLiteStore(database)
+
+    with sqlite3.connect(database) as connection:
+        connection.create_function(
+            _WRITER_EPOCH_FUNCTION,
+            0,
+            lambda: _WRITER_EPOCH,
+            deterministic=True,
+        )
+        connection.execute(
+            """INSERT INTO execution_jobs (
+                job_id,workload_kind,status,max_attempts,privacy_compliance_json,
+                created_at,updated_at
+            ) VALUES ('inference-root','inference','queued',2,'{}','now','now')"""
+        )
+
+    _assert_rejected_without_mutation(
+        database,
+        "inference job lacks its inference request: inference-root",
+    )
 
 
 def test_schema_v6_database_is_rejected_without_mutation(tmp_path: Path) -> None:

@@ -136,7 +136,9 @@ def _check_png_container(data: bytes) -> None:
     raise InputValidationError("PNG has an incomplete or invalid end chunk.")
 
 
-def _check_image(image: Image.Image) -> tuple[str, int, int]:
+def _check_image(
+    image: Image.Image, *, max_pixels: int = MAX_PIXELS
+) -> tuple[str, int, int]:
     """Check format, dimensions, and frame count before allocating pixel data."""
     image_format = image.format
     if image_format is None or image_format not in _MEDIA_TYPES:
@@ -144,8 +146,8 @@ def _check_image(image: Image.Image) -> tuple[str, int, int]:
     width, height = image.size
     if not (0 < width <= MAX_DIMENSION and 0 < height <= MAX_DIMENSION):
         raise InputValidationError("Image dimensions must be between 1 and 8192.")
-    if width * height > MAX_PIXELS:
-        raise InputValidationError("Image exceeds the 16,777,216 pixel limit.")
+    if width * height > max_pixels:
+        raise InputValidationError(f"Image exceeds the {max_pixels:,} pixel limit.")
     if (
         getattr(image, "n_frames", 1) != 1
         or getattr(image, "is_animated", False)
@@ -156,8 +158,13 @@ def _check_image(image: Image.Image) -> tuple[str, int, int]:
     return image_format, width, height
 
 
-def validate_image(file: BinaryIO) -> ImageInfo:
+def validate_image(
+    file: BinaryIO, *, max_pixels: int = MAX_PIXELS
+) -> ImageInfo:
     """Verify and fully decode one bounded, unchanged PNG or JPEG file.
+
+    Callers may set a smaller pixel limit for a narrower workload. The
+    shared 16,777,216-pixel ceiling remains the maximum accepted value.
 
     Read from offset zero without closing the caller's handle or moving its
     cursor. The digest includes all encoded bytes, including metadata
@@ -167,6 +174,13 @@ def validate_image(file: BinaryIO) -> ImageInfo:
     decoder limits or flags. Invalid content and unsafe input raise
     :class:`InputValidationError`.
     """
+    if (
+        isinstance(max_pixels, bool)
+        or not isinstance(max_pixels, int)
+        or not 1 <= max_pixels <= MAX_PIXELS
+    ):
+        raise ValueError(f"max_pixels must be between 1 and {MAX_PIXELS:,}")
+
     before = _bounded_stat(file)
     data = b"".join(_source_chunks(file, before))
     try:
@@ -176,15 +190,17 @@ def validate_image(file: BinaryIO) -> ImageInfo:
             warnings.simplefilter("error", Image.DecompressionBombWarning)
             warnings.simplefilter("error", UserWarning)
             with Image.open(io.BytesIO(data), formats=("PNG", "JPEG")) as image:
-                image_format, width, height = _check_image(image)
+                image_format, width, height = _check_image(
+                    image, max_pixels=max_pixels
+                )
                 if image_format == "PNG":
                     _check_png_container(data)
                 image.verify()
             # verify() consumes decoder state; reopen the same immutable bytes.
             with Image.open(io.BytesIO(data), formats=("PNG", "JPEG")) as image:
-                _check_image(image)
+                _check_image(image, max_pixels=max_pixels)
                 image.load()
-                _check_image(image)
+                _check_image(image, max_pixels=max_pixels)
         if ImageFile.LOAD_TRUNCATED_IMAGES:
             raise InputValidationError("Strict image decoding must be enabled.")
     except (

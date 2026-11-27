@@ -41,6 +41,7 @@ from .backend_provenance import (
 from .errors import BackendEvidenceError, BackendPreparationError
 
 _CAPTURE_BYTES = 2048
+_MAX_STDOUT_CAPTURE_BYTES = 1024 * 1024
 _READ_BYTES = 65536
 _PROBE_BYTES = 262144
 _DEFAULT_DRAIN_TIMEOUT_SECONDS = 1.0
@@ -133,6 +134,14 @@ class ProcessObservation:
             **({"process_group_terminated": self.process_group_terminated}
                if self.process_group_terminated is not None else {}),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class CapturedStdout:
+    """Return a bounded response prefix beside text-free process evidence."""
+
+    observation: ProcessObservation
+    stdout_prefix: bytes
 
 
 class ExecutionEvidenceAuthority(ABC):
@@ -247,17 +256,18 @@ class ManagedProcessControl:
 class _PipeCapture:
     """Drain one pipe while retaining a bounded prefix and a full digest."""
 
-    def __init__(self) -> None:
+    def __init__(self, prefix_limit_bytes: int = _CAPTURE_BYTES) -> None:
         self.byte_count = 0
         self._prefix = bytearray()
         self._digest = hashlib.sha256()
+        self._prefix_limit_bytes = prefix_limit_bytes
 
     def consume(self, chunk: bytes) -> None:
         """Record one chunk without unbounded buffering."""
 
         self.byte_count += len(chunk)
         self._digest.update(chunk)
-        remaining = _CAPTURE_BYTES - len(self._prefix)
+        remaining = self._prefix_limit_bytes - len(self._prefix)
         if remaining > 0:
             self._prefix.extend(chunk[:remaining])
 
@@ -367,12 +377,46 @@ class ProcessSupervisor:
             argv, env, already_used_message="supervisor run may be called only once"
         )
         process = self._spawn_and_record_launch(actual_argv, actual_environment, cwd)
-        _, observation = self._finish_child(
+        _, observation, _ = self._finish_child(
             process,
             actual_argv,
             started,
         )
         return observation
+
+    def run_capturing_stdout(
+        self,
+        argv: Sequence[str],
+        *,
+        env: Mapping[str, str],
+        cwd: Path,
+        max_stdout_bytes: int,
+    ) -> CapturedStdout:
+        """Run once and return a bounded stdout prefix in memory.
+
+        The persisted observation retains the full stream digest and byte count
+        without response text. Callers must compare the byte count with the
+        retained prefix length before parsing a possibly incomplete stream.
+        """
+        if (
+            isinstance(max_stdout_bytes, bool)
+            or not isinstance(max_stdout_bytes, int)
+            or not 1 <= max_stdout_bytes <= _MAX_STDOUT_CAPTURE_BYTES
+        ):
+            raise ValueError(
+                f"max_stdout_bytes must be between 1 and {_MAX_STDOUT_CAPTURE_BYTES}"
+            )
+        actual_argv, actual_environment, started = self._begin_invocation(
+            argv, env, already_used_message="supervisor run may be called only once"
+        )
+        process = self._spawn_and_record_launch(actual_argv, actual_environment, cwd)
+        _, observation, stdout_prefix = self._finish_child(
+            process,
+            actual_argv,
+            started,
+            stdout_capture_bytes=max_stdout_bytes,
+        )
+        return CapturedStdout(observation, stdout_prefix)
 
     def run_managed(
         self,
@@ -409,7 +453,7 @@ class ProcessSupervisor:
             already_used_message="supervisor execution may be called only once",
         )
         process = self._spawn_and_record_launch(actual_argv, actual_environment, cwd)
-        return self._finish_child(
+        callback_result, observation, _ = self._finish_child(
             process,
             actual_argv,
             started,
@@ -417,6 +461,7 @@ class ProcessSupervisor:
             listener_owner_pid=listener_owner_pid,
             shutdown_timeout_seconds=float(shutdown_timeout_seconds),
         )
+        return callback_result, observation
 
     def _begin_invocation(
         self,
@@ -454,6 +499,8 @@ class ProcessSupervisor:
                 "attempt ownership, epoch, or current-job authority is stale; "
                 "no process was started"
             )
+        if self._stop_requested is not None and self._stop_requested():
+            raise TimeoutError("execution stopped before child start")
         return actual_argv, actual_environment, time.monotonic()
 
     def _spawn_and_record_launch(
@@ -510,14 +557,17 @@ class ProcessSupervisor:
         session: Callable[[ManagedProcessControl], object] | None = None,
         listener_owner_pid: Callable[[str, int], int] | None = None,
         shutdown_timeout_seconds: float = 5.0,
-    ) -> tuple[object, ProcessObservation]:
+        stdout_capture_bytes: int = 0,
+    ) -> tuple[object, ProcessObservation, bytes]:
         """Drain, reap, and persist common direct-child completion evidence.
 
         ``run`` leaves a finite process to exit on its own. ``run_managed``
         executes its protocol callback while this same drain and evidence path
         runs, then terminates the direct child within the supplied bound.
         """
-        stdout_capture = _PipeCapture()
+        stdout_capture = _PipeCapture(
+            stdout_capture_bytes if stdout_capture_bytes else _CAPTURE_BYTES
+        )
         stderr_capture = _PipeCapture()
         drain_result: list[tuple[int, bool, bool]] = []
         drain_error: list[BaseException] = []
@@ -626,7 +676,10 @@ class ProcessSupervisor:
         self._authority.record_observation(observation)
         if callback_error is not None:
             raise callback_error
-        return callback_result, observation
+        captured_prefix = (
+            stdout_capture.prefix if stdout_capture_bytes else b""
+        )
+        return callback_result, observation, captured_prefix
 
     def _drain_until_reaped(
         self,

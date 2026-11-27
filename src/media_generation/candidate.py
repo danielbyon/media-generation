@@ -22,6 +22,7 @@ from ._candidate_contract import (
     parse_trusted_evidence,
 )
 from ._candidate_evaluation import (
+    LLAMA_CPP_BACKEND_KIND,
     candidate_exit_code,
     inspect_candidate,
     verify_candidate,
@@ -33,6 +34,7 @@ __all__ = [
     "CandidateError",
     "CandidateOutputError",
     "CandidateValidationError",
+    "LLAMA_CPP_BACKEND_KIND",
     "TrustedEvidence",
     "candidate_exit_code",
     "inspect_candidate",

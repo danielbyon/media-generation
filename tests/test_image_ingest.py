@@ -180,6 +180,20 @@ def test_unsafe_dimensions_are_rejected_before_decode(
         validate_image(source)
 
 
+def test_caller_pixel_limit_rejects_before_decoding_without_changing_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "inference-pixel-limit.png"
+    path.write_bytes(_png(4097, 2048, zlib.compress(b"\x00\x00\x00\x00")))
+
+    def forbidden_load(*args, **kwargs):
+        pytest.fail("Inference pixel limit must be checked before pixel decoding")
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", forbidden_load)
+    with path.open("rb") as source, pytest.raises(InputValidationError):
+        validate_image(source, max_pixels=8_388_608)
+
+
 def test_encoded_size_limit_is_inclusive_and_hashes_trailing_bytes(tmp_path: Path) -> None:
     """Decoder-accepted trailing bytes count toward both the size and digest."""
     path = tmp_path / "large.png"

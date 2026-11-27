@@ -1554,6 +1554,33 @@ def test_sd_cpp_qwen_policy_cannot_be_bypassed_by_comfyui_self_declaration(
     )
 
 
+def test_candidate_cli_supports_llama_cpp_specific_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    payload["engine"]["id"] = "llama.cpp"
+    payload["engine"]["build"] = "qwen-image-edit-2511"
+    payload["recipe"]["pipeline_version"] = "qwen-image-edit-2511@1.0"
+    _rewrite(declaration, payload)
+
+    exit_code = cli.main(
+        [
+            "candidate",
+            "inspect",
+            "--declaration",
+            str(declaration),
+            "--engine-backend",
+            "llama-cpp",
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code in {0, 3}
+    assert "recipe.compatibility.policy:qwen-image-edit-2511-zero-conditioning" not in _items(report)
+
+
 def test_inspect_candidate_scopes_zero_conditioning_to_sd_cpp(
     tmp_path: Path,
 ) -> None:
