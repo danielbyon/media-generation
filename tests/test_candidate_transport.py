@@ -621,7 +621,8 @@ def test_verified_https_redirect_scopes_credentials_and_ignores_environment_prox
     with _server(context, target) as (target_url, target_observations):
         def source(connection: Any, request: Any, stop: Any, observations: Any) -> None:
             connection.sendall(
-                b"HTTP/1.1 302 Found\r\nLocation: " + target_url.encode()
+                b"HTTP/1.1 302 Found\r\nLocation: "
+                + (target_url + "?X-Amz-Signature=signed-query-sentinel").encode()
                 + b"\r\nContent-Length: 0\r\n\r\n"
             )
 
@@ -651,7 +652,9 @@ def test_verified_https_redirect_scopes_credentials_and_ignores_environment_prox
             first = source_observations["requests"][0]
             second = target_observations["requests"][0]
             assert first.startswith(b"GET /artifact HTTP/1.1\r\n")
-            assert second.startswith(b"GET /artifact HTTP/1.1\r\n")
+            assert second.startswith(
+                b"GET /artifact?X-Amz-Signature=signed-query-sentinel HTTP/1.1\r\n"
+            )
             assert b"Authorization: Bearer source-secret\r\n" in first
             assert b"Authorization: Bearer target-secret\r\n" in second
             assert b"source-secret" not in second
@@ -660,6 +663,7 @@ def test_verified_https_redirect_scopes_credentials_and_ignores_environment_prox
             for output in ("prepared.json", "journal.json"):
                 document = (tmp_path / output).read_text()
                 assert "source-secret" not in document and "target-secret" not in document
+                assert "signed-query-sentinel" not in document
             _assert_reaped(processes)
 
 
