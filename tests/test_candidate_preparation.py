@@ -1554,6 +1554,33 @@ def test_sd_cpp_qwen_policy_cannot_be_bypassed_by_comfyui_self_declaration(
     )
 
 
+def test_candidate_cli_supports_llama_cpp_specific_validation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    payload["engine"]["id"] = "llama.cpp"
+    payload["engine"]["build"] = "qwen-image-edit-2511"
+    payload["recipe"]["pipeline_version"] = "qwen-image-edit-2511@1.0"
+    _rewrite(declaration, payload)
+
+    exit_code = cli.main(
+        [
+            "candidate",
+            "inspect",
+            "--declaration",
+            str(declaration),
+            "--engine-backend",
+            "llama-cpp",
+        ]
+    )
+    report = json.loads(capsys.readouterr().out)
+
+    assert exit_code in {0, 3}
+    assert "recipe.compatibility.policy:qwen-image-edit-2511-zero-conditioning" not in _items(report)
+
+
 def test_inspect_candidate_scopes_zero_conditioning_to_sd_cpp(
     tmp_path: Path,
 ) -> None:
@@ -4152,6 +4179,48 @@ def test_redirect_to_unlisted_origin_fails_without_leaking_url(
     assert "unlisted" not in journal_text
 
 
+def test_initial_acquisition_source_rejects_query_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    declaration = _fixture(tmp_path)
+    payload = _payload(declaration)
+    payload["acquisition"]["sources"][0]["url"] = (
+        "https://downloads.example/artifact?X-Amz-Signature=signed-query-sentinel"
+    )
+    _rewrite(declaration, payload)
+    config = _acquisition_config(tmp_path)
+    monkeypatch.setattr(
+        candidate._acquisition,
+        "_open_remote",
+        lambda *args, **kwargs: pytest.fail("invalid initial URL reached transport"),
+    )
+
+    with pytest.raises(
+        candidate.CandidateValidationError,
+        match=r"acquisition.sources\[0\].url must not contain a query string or fragment",
+    ):
+        candidate.prepare_candidate(
+            declaration,
+            manifest_output=tmp_path / "prepared.json",
+            journal_output=tmp_path / "journal.json",
+            acquire=True,
+            acquisition_config=config,
+        )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://downloads.example/artifact?signature=value",
+        "https://user:password@downloads.example/artifact?signature=value",
+        "https://downloads.example/artifact?signature=value#fragment",
+    ],
+)
+def test_redirect_target_query_permission_keeps_url_safety_checks(url: str) -> None:
+    with pytest.raises(candidate.CandidateAcquisitionError):
+        candidate._acquisition._url_origin(url, allow_query=True)
+
+
 @pytest.mark.parametrize(
     "location",
     (
@@ -4280,7 +4349,10 @@ def test_secret_in_acquisition_error_is_redacted_from_journal(
 
     def fail_download(**kwargs: object) -> object:
         raise candidate.CandidateAcquisitionError(
-            f"transport failed: {SECRET}; short secret q7"
+            "transport failed: "
+            f"{SECRET}; short secret q7;\n"
+            "(https://mirror.example/artifact?X-Amz-Signature=signed-query-sentinel),\n"
+            "http://mirror.example/artifact?token=http-query-sentinel suffix-query-sentinel"
         )
 
     monkeypatch.setattr(candidate._acquisition, "_download_to_staging", fail_download)
@@ -4298,6 +4370,12 @@ def test_secret_in_acquisition_error_is_redacted_from_journal(
     assert SECRET not in report_text
     assert "q7" not in journal_text
     assert "q7" not in report_text
+    assert "signed-query-sentinel" not in journal_text
+    assert "signed-query-sentinel" not in report_text
+    assert "http-query-sentinel" not in journal_text
+    assert "http-query-sentinel" not in report_text
+    assert "suffix-query-sentinel" not in journal_text
+    assert "suffix-query-sentinel" not in report_text
     assert "[redacted]" in journal_text
 
 

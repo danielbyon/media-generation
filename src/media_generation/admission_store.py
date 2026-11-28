@@ -34,6 +34,10 @@ _TRANSITION_SOURCES: dict[str, tuple[str, ...]] = {
 _MAX_SQLITE_BYTE_COUNT = (1 << 63) - 1
 
 
+class AdmissionEvidenceMismatchError(ValueError):
+    """Signal that worker preflight differs from persisted capacity evidence."""
+
+
 @dataclass(frozen=True, slots=True)
 class PendingAdmission:
     """Validated admission evidence supplied when creating a queued job."""
@@ -232,6 +236,8 @@ class AdmissionPersistence:
         profile_fingerprint: object,
         required_bytes_json: object,
         job_id: object,
+        *,
+        expected: PendingAdmission | None = None,
     ) -> None:
         """Validate typed pinned evidence and identity before dispatch."""
         try:
@@ -270,6 +276,30 @@ class AdmissionPersistence:
                 "queued admission required bytes do not match the capacity "
                 f"decision: {job_id}"
             )
+        if expected is not None:
+            expected_profile = expected.profile
+            same_capacity_profile = (
+                expected_profile is not None
+                and expected_profile.status == profile.status
+                and expected_profile.origin == profile.origin
+                and expected_profile.environment_fingerprint
+                == profile.environment_fingerprint
+                and expected_profile.topology == profile.topology
+                and expected_profile.pools == profile.pools
+                and expected_profile.shared_pool_ids == profile.shared_pool_ids
+                and expected_profile.unknown_reasons == profile.unknown_reasons
+            )
+            if (
+                expected.decision != "queued"
+                or not same_capacity_profile
+                or expected.demand != demand
+                or expected.required_bytes != required_bytes
+                or expected.unknown_reasons != decision.unknown_reasons
+            ):
+                raise AdmissionEvidenceMismatchError(
+                    "worker preflight admission differs from persisted evidence: "
+                    f"{job_id}"
+                )
 
     @staticmethod
     def validate_persisted(connection: sqlite3.Connection) -> None:

@@ -1,0 +1,10 @@
+--- a/tools/mtmd/mtmd-cli.cpp
++++ b/tools/mtmd/mtmd-cli.cpp
+@@ -298,6 +298,6 @@
+     mtmd_cli_context ctx(params);
+     LOG_INF("%s: loading model: %s\n", __func__, params.model.path.c_str());
+ 
+-    bool is_single_turn = !params.prompt.empty() && !params.image.empty();
++    bool is_single_turn = !params.prompt.empty();
+ 
+     int n_predict = params.n_predict < 0 ? INT_MAX : params.n_predict;

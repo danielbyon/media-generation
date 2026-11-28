@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "media-generation"
 version = "0.1.0"
-description = "A local, engine-neutral image generation service"
+description = "A local, engine-neutral media generation and inference service"
 requires-python = ">=3.14"
-dependencies = ["Pillow>=13.0.0"]
+dependencies = ["Pillow>=13.0.0", "jsonschema>=4.23,<5"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

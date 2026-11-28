@@ -60,9 +60,11 @@ _QWEN_IMAGE_EDIT = re.compile(
 _QWEN_2511_VERSION = re.compile(r"(?<!\d)2511(?!\d)")
 _QWEN_ZERO_CONDITIONING_FLAG = "qwen_image_zero_cond_t"
 _COMFYUI_BACKEND_KIND = "comfyui-local-http"
+LLAMA_CPP_BACKEND_KIND = "llama-cpp-local-cli"
+_LLAMA_CPP_ENGINE_ID = "llama.cpp"
 _SD_CPP_BACKEND_KIND = "local-inference"
 _KNOWN_BACKEND_KINDS = frozenset(
-    {_COMFYUI_BACKEND_KIND, _SD_CPP_BACKEND_KIND}
+    {_COMFYUI_BACKEND_KIND, LLAMA_CPP_BACKEND_KIND, _SD_CPP_BACKEND_KIND}
 )
 _COMFYUI_QWEN_POLICY_ARTIFACT = (
     "recipe.compatibility.policy:"
@@ -128,7 +130,16 @@ def _requires_sd_cpp_qwen_zero_conditioning(
         selected_backend_kind == _COMFYUI_BACKEND_KIND
         and declaration.engine.id == COMFYUI_ENGINE_ID
     )
-    return _declares_qwen_image_edit_2511(declaration) and not selected_comfyui
+    selected_llama_cpp = selected_backend_kind == LLAMA_CPP_BACKEND_KIND
+    if selected_llama_cpp and declaration.engine.id != _LLAMA_CPP_ENGINE_ID:
+        raise CandidateValidationError(
+            "llama.cpp candidate validation requires the llama.cpp engine identity"
+        )
+    return (
+        _declares_qwen_image_edit_2511(declaration)
+        and not selected_comfyui
+        and not selected_llama_cpp
+    )
 
 
 class _Evaluator:

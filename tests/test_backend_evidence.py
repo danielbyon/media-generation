@@ -970,6 +970,35 @@ def test_supervisor_classifies_output_and_hashes_every_byte() -> None:
     assert not {"stdout_excerpt", "stderr_excerpt"} & set(stored)
 
 
+def test_supervisor_can_return_bounded_stdout_without_persisting_response_text(
+    tmp_path: Path,
+) -> None:
+    payload = b"{\"answer\":\"green\"}"
+    argv = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write(b'{\\\"answer\\\":\\\"green\\\"}')",
+    ]
+    authority = _TestAuthority("att_bounded_stdout")
+    result = ProcessSupervisor(
+        authority,
+        expected_argv=argv,
+        expected_environment={},
+        drain_timeout_seconds=0.2,
+    ).run_capturing_stdout(
+        argv,
+        env={},
+        cwd=tmp_path,
+        max_stdout_bytes=8,
+    )
+
+    assert result.stdout_prefix == payload[:8]
+    assert result.observation.stdout_bytes == len(payload)
+    assert result.observation.stdout_sha256 == hashlib.sha256(payload).hexdigest()
+    assert authority.observations == [result.observation]
+    assert "stdout_prefix" not in result.observation.to_mapping()
+
+
 def test_supervisor_returns_despite_surviving_grandchild(tmp_path: Path) -> None:
     bundle = build_bundle(tmp_path)
     adapter = _adapter(bundle, tmp_path / "images")

@@ -22,6 +22,19 @@ a replacement build before dispatching it, and check its linked runtime. Upstrea
 source inspection does not qualify a locally built binary or GPU workload.
 [SD-C++ image CLI at b13a482](https://github.com/leejet/stable-diffusion.cpp/blob/b13a482/examples/cli/main.cpp#L815-L868)
 
+Text and vision requests use the llama.cpp MTMD CLI at source revision
+`1a03cf47f67be591699d1f0f7ca28e1ed6eb8c7e`. Its experimental build includes
+the one-line single-turn change in
+[`mtmd-cli.cpp`](https://github.com/ggml-org/llama.cpp/blob/1a03cf47f67be591699d1f0f7ca28e1ed6eb8c7e/tools/mtmd/mtmd-cli.cpp#L301).
+The worker passes `--offline` and `--ctx-size 4096`, caps generated output at
+512 tokens, and captures at most 1 MiB of stdout. Each request has an absolute
+deadline of at most 300 seconds from enqueue. Vision input is limited to
+8,388,608 pixels. Smaller output and deadline limits are allowed. Dispatch
+requires separate evidence for the exact build, one-JSON-document stdout
+behavior, compatible hardware, matching execution bounds, and measured resource
+demand. The upstream CLI does not expose its response termination reason, so
+the application records it as unknown.
+
 The worker owns process supervision and publication. After reaping the child,
 the supervisor checks the original process group and records the result on
 the exact SQLite attempt. An absent group and settled output streams permit
@@ -43,5 +56,7 @@ the narrower trust model to remove those costs. A global interruption
 operation would affect unrelated work. Reusing a PID after worker loss
 could signal a different process. Neither belongs in the supported lifecycle.
 
-The replacement uses schema 10 with no migration from pre-release state.
+The shared lifecycle uses schema 11 with no migration from earlier state.
+Inference attempts use the common launch and termination records while
+keeping their response data separate from image-generation result records.
 Keep earlier state with its matching release for rollback.

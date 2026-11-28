@@ -734,7 +734,7 @@ def test_v2_and_v3_records_share_current_schema_and_survive_restart(tmp_path: Pa
             "SELECT resolved_json FROM backend_executions WHERE attempt_id = ?",
             (v2_claim.attempt_id,),
         ).fetchone()[0]
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
 
     restarted = GenerationService(tmp_path / "studio.sqlite3", tmp_path / "images")
     v2 = restarted.get_execution(v2_job)
@@ -839,7 +839,7 @@ def test_v2_v3_v4_records_share_current_schema_and_survive_restart(
 
     for root in (v2_root, legacy_root, current_root):
         with sqlite3.connect(root / "studio.sqlite3") as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 10
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 11
 
     restarted = GenerationService(
         v2_root / "studio.sqlite3", v2_root / "images"

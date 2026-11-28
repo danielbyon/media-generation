@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import http.client
 import os
+import re
 import secrets
 import stat
 import sys
@@ -245,7 +246,7 @@ class _TransferDeadline:
         return remaining
 
 
-def _url_origin(value: str) -> str:
+def _url_origin(value: str, *, allow_query: bool = False) -> str:
     try:
         parsed = urlsplit(value)
     except ValueError as error:
@@ -254,7 +255,7 @@ def _url_origin(value: str) -> str:
         raise CandidateAcquisitionError("acquisition URL is not an HTTPS URL")
     if parsed.username is not None or parsed.password is not None:
         raise CandidateAcquisitionError("acquisition URL contains user information")
-    if parsed.query or parsed.fragment:
+    if (parsed.query and not allow_query) or parsed.fragment:
         raise CandidateAcquisitionError(
             "acquisition URLs must not contain query strings or fragments"
         )
@@ -1318,7 +1319,7 @@ def _safe_acquisition_message(
     error: BaseException,
     config: AcquisitionConfig,
 ) -> str:
-    """Return a bounded error message with every configured secret removed."""
+    """Return a bounded error message without credentials or URL query values."""
     message = str(error)
     secrets_to_remove = sorted(
         {
@@ -1334,6 +1335,12 @@ def _safe_acquisition_message(
     )
     for secret_value in secrets_to_remove:
         message = message.replace(secret_value, "[redacted]")
+    message = re.sub(
+        r"((?:https?)://[^\s?#]+)\?[^\r\n]*",
+        r"\1?[redacted]",
+        message,
+        flags=re.IGNORECASE,
+    )
     return message[:512] or "acquisition operation failed"
 _AT_FDCWD = -100
 _AT_SYMLINK_FOLLOW = 0x400
@@ -1480,7 +1487,7 @@ def _download_to_staging(
         current_url = source.url
         redirects = 0
         while True:
-            origin = _url_origin(current_url)
+            origin = _url_origin(current_url, allow_query=redirects > 0)
             if origin not in config.allowed_origins:
                 raise CandidateAcquisitionError(
                     "acquisition origin is not explicitly allowed"

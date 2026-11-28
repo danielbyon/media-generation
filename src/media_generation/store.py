@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import json
+import fcntl
+import hashlib
+import os
 import sqlite3
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -25,6 +28,7 @@ from .backend_provenance import (
     configuration_requires_process_tree_resource_release,
 )
 from .admission_store import (
+    AdmissionEvidenceMismatchError,
     AdmissionInspection,
     AdmissionPersistence,
     PendingAdmission,
@@ -48,6 +52,7 @@ from .errors import (
 )
 from .privacy import (
     COMFYUI_ADAPTER_ID,
+    LLAMA_CPP_ADAPTER_ID,
     NATIVE_IMAGE_ADAPTER_ID,
     is_privacy_compliance_record,
 )
@@ -60,6 +65,53 @@ _PRIVACY_CLAIM_EVIDENCE_REQUIRED = (
 _PRIVACY_CLAIM_CONFIGURATION_REQUIRED = (
     "protected execution claim requires exact adapter-configuration evidence"
 )
+_PUBLIC_INFERENCE_SECRET_KEYS = frozenset(
+    {
+        "prompt",
+        "prompt_text",
+        "image_path",
+        "image_identity",
+        "request_json",
+        "stdout",
+        "stdout_prefix",
+        "response_bytes",
+        "argv",
+        "path",
+        "value",
+    }
+)
+_MAX_INFERENCE_RESPONSE_BYTES = 1024 * 1024
+_REPAIRABLE_INFERENCE_CATEGORIES = frozenset(
+    {
+        "incomplete_json_at_eof",
+        "malformed_json_unknown_termination",
+        "schema_rejection",
+        "semantic_rejection",
+        "generation_truncated",
+    }
+)
+
+
+def _public_inference_provenance(value: object) -> object:
+    """Remove private prompt, response, and local path data from provenance."""
+    if isinstance(value, Mapping):
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                continue
+            normalized = key.lower()
+            if (
+                normalized in _PUBLIC_INFERENCE_SECRET_KEYS
+                or normalized.endswith("_path")
+            ):
+                continue
+            result[key] = _public_inference_provenance(item)
+        return result
+    if isinstance(value, (list, tuple)):
+        return [_public_inference_provenance(item) for item in value]
+    if value is None or isinstance(value, (int, float, bool, str)):
+        return value
+    return None
 
 
 def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
@@ -81,13 +133,15 @@ def _persisted_workflow_approval(value: object) -> Mapping[str, object]:
     return configuration["workflow_approval"]
 _WRITER_EPOCH = 9
 _WRITER_EPOCH_FUNCTION = "media_generation_writer_epoch"
-_CURRENT_SCHEMA_VERSION = 10
+_CURRENT_SCHEMA_VERSION = 11
 _WRITER_GUARDS = (
     ("generation_requests", "INSERT"),
     ("generation_jobs", "INSERT"),
     ("generation_jobs", "UPDATE"),
     ("generation_attempts", "INSERT"),
     ("generation_attempts", "UPDATE"),
+    ("inference_requests", "INSERT"),
+    ("inference_attempt_results", "INSERT"),
     ("generation_artifacts", "INSERT"),
     ("artifact_edges", "INSERT"),
     ("artifact_publications", "INSERT"),
@@ -108,23 +162,23 @@ _WRITER_GUARDS = (
 
 
 _EXECUTION_JOBS_DDL = """CREATE TABLE execution_jobs (
-    job_id TEXT PRIMARY KEY REFERENCES generation_jobs(job_id),
+    job_id TEXT PRIMARY KEY,
+    workload_kind TEXT NOT NULL CHECK (workload_kind IN ('generation','inference')),
     status TEXT NOT NULL CHECK (status IN (
         'queued','running','succeeded','failed','canceled','ambiguous')),
     max_attempts INTEGER NOT NULL CHECK (max_attempts >= 1),
     containment_contract TEXT,
     privacy_compliance_json TEXT NOT NULL,
     fence_epoch INTEGER NOT NULL DEFAULT 0 CHECK (fence_epoch >= 0),
-    current_attempt_id TEXT REFERENCES generation_attempts(attempt_id),
+    current_attempt_id TEXT REFERENCES execution_attempts(attempt_id),
     retry_eligible INTEGER NOT NULL DEFAULT 0 CHECK (retry_eligible IN (0,1)),
     failure_message TEXT,
-    resolved_plan_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )"""
 
 _EXECUTION_ATTEMPTS_DDL = """CREATE TABLE execution_attempts (
-    attempt_id TEXT PRIMARY KEY REFERENCES generation_attempts(attempt_id),
+    attempt_id TEXT PRIMARY KEY,
     job_id TEXT NOT NULL REFERENCES execution_jobs(job_id),
     attempt_number INTEGER NOT NULL CHECK (attempt_number >= 1),
     status TEXT NOT NULL CHECK (status IN (
@@ -140,9 +194,16 @@ _EXECUTION_ATTEMPTS_DDL = """CREATE TABLE execution_attempts (
         'retryable','terminal','canceled','ambiguous','crash')),
     termination_proven INTEGER NOT NULL DEFAULT 0
         CHECK (termination_proven IN (0,1)),
-    plan_json TEXT,
+    launch_evidence_json TEXT,
+    launch_evidence_at TEXT,
+    observation_evidence_json TEXT,
+    observation_evidence_at TEXT,
     completed_at TEXT,
-    UNIQUE (job_id, attempt_number)
+    CHECK ((launch_evidence_json IS NULL) = (launch_evidence_at IS NULL)),
+    CHECK ((observation_evidence_json IS NULL) = (observation_evidence_at IS NULL)),
+    CHECK (observation_evidence_json IS NULL OR launch_evidence_json IS NOT NULL),
+    UNIQUE (job_id, attempt_number),
+    UNIQUE (job_id, attempt_id)
 )"""
 
 _BACKEND_EXECUTIONS_DDL = """CREATE TABLE backend_executions (
@@ -259,7 +320,7 @@ _GENERATION_REQUESTS_DDL = """CREATE TABLE generation_requests (
 )"""
 
 _GENERATION_JOBS_DDL = """CREATE TABLE generation_jobs (
-    job_id TEXT PRIMARY KEY,
+    job_id TEXT PRIMARY KEY REFERENCES execution_jobs(job_id),
     request_id TEXT NOT NULL UNIQUE REFERENCES generation_requests(request_id),
     idempotency_key TEXT NOT NULL UNIQUE,
     request_digest TEXT NOT NULL,
@@ -272,6 +333,7 @@ _GENERATION_JOBS_DDL = """CREATE TABLE generation_jobs (
     output_slot TEXT NOT NULL,
     output_slot_id TEXT NOT NULL UNIQUE,
     effective_parameters_json TEXT NOT NULL,
+    resolved_plan_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 )"""
@@ -286,7 +348,43 @@ _GENERATION_ATTEMPTS_DDL = """CREATE TABLE generation_attempts (
     finished_at TEXT,
     error_message TEXT,
     UNIQUE (job_id, attempt_number),
-    UNIQUE (job_id, attempt_id)
+    UNIQUE (job_id, attempt_id),
+    FOREIGN KEY (job_id, attempt_id)
+        REFERENCES execution_attempts(job_id, attempt_id)
+)"""
+
+_INFERENCE_REQUESTS_DDL = """CREATE TABLE inference_requests (
+    job_id TEXT PRIMARY KEY REFERENCES execution_jobs(job_id),
+    idempotency_key TEXT NOT NULL UNIQUE,
+    adapter_id TEXT NOT NULL,
+    adapter_configuration_json TEXT NOT NULL,
+    resolved_working_directory TEXT NOT NULL,
+    request_json TEXT NOT NULL,
+    request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+    deadline_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)"""
+
+_INFERENCE_ATTEMPT_RESULTS_DDL = """CREATE TABLE inference_attempt_results (
+    attempt_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES inference_requests(job_id),
+    outcome TEXT NOT NULL CHECK (outcome IN (
+        'succeeded','refused','invalid_output','repair_exhausted','response_cap_exceeded',
+        'runtime_failure','timeout','canceled')),
+    completion_reason TEXT NOT NULL CHECK (completion_reason IN (
+        'end_of_sequence','stop_sequence','token_limit','unknown')),
+    response_bytes BLOB NOT NULL,
+    response_size INTEGER NOT NULL CHECK (response_size >= length(response_bytes)),
+    response_sha256 TEXT NOT NULL CHECK (length(response_sha256) = 64),
+    validation_json TEXT NOT NULL,
+    result_json TEXT,
+    repair_eligible INTEGER NOT NULL CHECK (repair_eligible IN (0,1)),
+    created_at TEXT NOT NULL,
+    CHECK ((outcome IN ('succeeded','refused') AND result_json IS NOT NULL
+            AND repair_eligible = 0)
+        OR (outcome NOT IN ('succeeded','refused') AND result_json IS NULL)),
+    FOREIGN KEY (job_id, attempt_id)
+        REFERENCES execution_attempts(job_id, attempt_id)
 )"""
 
 _GENERATION_ARTIFACTS_DDL = """CREATE TABLE generation_artifacts (
@@ -457,6 +555,30 @@ BEGIN
     SELECT RAISE(ABORT, 'generation requests are immutable');
 END"""
 
+_INFERENCE_REQUESTS_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER inference_requests_immutable_update
+BEFORE UPDATE ON inference_requests
+BEGIN
+    SELECT RAISE(ABORT, 'inference requests are immutable');
+END"""
+
+_INFERENCE_REQUESTS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER inference_requests_immutable_delete
+BEFORE DELETE ON inference_requests
+BEGIN
+    SELECT RAISE(ABORT, 'inference requests are immutable');
+END"""
+
+_INFERENCE_RESULTS_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER inference_attempt_results_immutable_update
+BEFORE UPDATE ON inference_attempt_results
+BEGIN
+    SELECT RAISE(ABORT, 'inference attempt results are immutable');
+END"""
+
+_INFERENCE_RESULTS_IMMUTABLE_DELETE_DDL = """CREATE TRIGGER inference_attempt_results_immutable_delete
+BEFORE DELETE ON inference_attempt_results
+BEGIN
+    SELECT RAISE(ABORT, 'inference attempt results are immutable');
+END"""
+
 _GENERATION_ARTIFACTS_IMMUTABLE_UPDATE_DDL = """CREATE TRIGGER generation_artifacts_immutable_update
 BEFORE UPDATE ON generation_artifacts
 BEGIN
@@ -560,6 +682,8 @@ _CURRENT_TABLE_DDL: dict[str, str] = {
     "generation_requests": _GENERATION_REQUESTS_DDL,
     "generation_jobs": _GENERATION_JOBS_DDL,
     "generation_attempts": _GENERATION_ATTEMPTS_DDL,
+    "inference_requests": _INFERENCE_REQUESTS_DDL,
+    "inference_attempt_results": _INFERENCE_ATTEMPT_RESULTS_DDL,
     "generation_artifacts": _GENERATION_ARTIFACTS_DDL,
     "artifact_edges": _ARTIFACT_EDGES_DDL,
     "artifact_publications": _ARTIFACT_PUBLICATIONS_DDL,
@@ -586,6 +710,18 @@ _STATIC_TRIGGER_DDL: dict[str, str] = {
     ),
     "generation_requests_immutable_delete": (
         _GENERATION_REQUESTS_IMMUTABLE_DELETE_DDL
+    ),
+    "inference_requests_immutable_update": (
+        _INFERENCE_REQUESTS_IMMUTABLE_UPDATE_DDL
+    ),
+    "inference_requests_immutable_delete": (
+        _INFERENCE_REQUESTS_IMMUTABLE_DELETE_DDL
+    ),
+    "inference_attempt_results_immutable_update": (
+        _INFERENCE_RESULTS_IMMUTABLE_UPDATE_DDL
+    ),
+    "inference_attempt_results_immutable_delete": (
+        _INFERENCE_RESULTS_IMMUTABLE_DELETE_DDL
     ),
     "generation_artifacts_immutable_update": (
         _GENERATION_ARTIFACTS_IMMUTABLE_UPDATE_DDL
@@ -667,6 +803,53 @@ class ExecutionClaim:
     lease_expires_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class InferenceExecutionClaim:
+    """Private worker capability for one text or vision inference attempt."""
+
+    job_id: str
+    attempt_id: str
+    attempt_number: int
+    owner_id: str
+    claim_epoch: int
+    max_attempts: int
+    request_json: str
+    deadline_at: str
+    adapter_id: str
+    adapter_configuration_json: str
+    resolved_working_directory: str
+    process_contained: bool
+    containment_contract: str
+    lease_expires_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class QueuedInference:
+    """Identity and status returned after inference admission is committed."""
+
+    created: bool
+    job_id: str
+    status: str
+    max_attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceRequestPeek:
+    """Expose queued request data before a worker claims shared capacity."""
+
+    job_id: str
+    request_json: str
+    deadline_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceRepairContext:
+    """Supply the first invalid response to one bounded repair attempt."""
+
+    category: str
+    response_bytes: bytes
+
+
 class SQLiteStore:
     """Store generation records in a local SQLite database.
 
@@ -688,6 +871,23 @@ class SQLiteStore:
                 self._validate_existing_database()
             else:
                 self._initialize()
+
+    @contextmanager
+    def resource_lock(self) -> Iterator[bool]:
+        """Acquire the one non-blocking heavyweight-resource lock for this database."""
+        lock_path = self.database_path.with_name(
+            self.database_path.name + ".resource.lock"
+        )
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            os.close(descriptor)
 
     @contextmanager
     def _connection(
@@ -985,6 +1185,29 @@ class SQLiteStore:
                 f"{missing_execution['job_id']}"
             )
 
+        mismatched_workload = connection.execute(
+            """SELECT execution.job_id, execution.workload_kind
+               FROM execution_jobs AS execution
+               LEFT JOIN generation_jobs AS generation
+                 ON generation.job_id = execution.job_id
+               LEFT JOIN inference_requests AS inference
+                 ON inference.job_id = execution.job_id
+               WHERE (execution.workload_kind = 'generation'
+                      AND (generation.job_id IS NULL OR inference.job_id IS NOT NULL))
+                  OR (execution.workload_kind = 'inference'
+                      AND (generation.job_id IS NOT NULL OR inference.job_id IS NULL))
+               LIMIT 1"""
+        ).fetchone()
+        if mismatched_workload is not None:
+            job_id = str(mismatched_workload["job_id"])
+            if mismatched_workload["workload_kind"] == "inference":
+                raise SQLiteStore._incomplete_schema(
+                    f"inference job lacks its inference request: {job_id}"
+                )
+            raise SQLiteStore._incomplete_schema(
+                f"generation job lacks its generation payload: {job_id}"
+            )
+
         missing_admission = connection.execute(
             """SELECT execution.job_id
                FROM execution_jobs AS execution
@@ -1044,10 +1267,8 @@ END"""
     ) -> tuple[ResolvedReference, ...]:
         """Reconstruct the ordered reference identities frozen on a job."""
         row = connection.execute(
-            """SELECT jobs.validated_reference_ids_json, execution.resolved_plan_json
-               FROM generation_jobs AS jobs
-               JOIN execution_jobs AS execution ON execution.job_id = jobs.job_id
-               WHERE jobs.job_id = ?""",
+            """SELECT validated_reference_ids_json, resolved_plan_json
+               FROM generation_jobs WHERE job_id = ?""",
             (job_id,),
         ).fetchone()
         if row is None:
@@ -1076,7 +1297,7 @@ END"""
 
     @staticmethod
     def _resolved_plan_json(
-        row: sqlite3.Row,
+        row: dict[str, object],
         references: tuple[ResolvedReference, ...],
     ) -> str:
         """Serialize every run input that must remain frozen before claim."""
@@ -1535,13 +1756,38 @@ END"""
                 "(request_id, canonical_json, request_digest, created_at) VALUES (?, ?, ?, ?)",
                 (request_id, request.canonical_json(), request_digest, timestamp),
             )
+            plan_json = self._resolved_plan_json(
+                {
+                    "effective_parameters_json": frozen_parameters_json,
+                    "resolved_prompt": request.prompt,
+                    "resolved_seed": resolved_seed,
+                    "output_slot": request.output_slot,
+                    "output_slot_id": output_slot_id,
+                },
+                references,
+            )
+            connection.execute(
+                """INSERT INTO execution_jobs
+                    (job_id,workload_kind,status,max_attempts,containment_contract,
+                     privacy_compliance_json,fence_epoch,current_attempt_id,
+                     retry_eligible,failure_message,created_at,updated_at)
+                   VALUES (?,'generation','queued',?,?,?,0,NULL,0,NULL,?,?)""",
+                (
+                    job_id,
+                    effective_max_attempts,
+                    containment_contract,
+                    privacy_compliance_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
             connection.execute(
                 """INSERT INTO generation_jobs (
                     job_id, request_id, idempotency_key, request_digest, status,
                     adapter_id, adapter_configuration_json, resolved_prompt, resolved_seed,
                     validated_reference_ids_json, output_slot, output_slot_id,
-                    effective_parameters_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    effective_parameters_json, resolved_plan_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     job_id,
                     request_id,
@@ -1555,26 +1801,7 @@ END"""
                     request.output_slot,
                     output_slot_id,
                     frozen_parameters_json,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            job_row = connection.execute(
-                "SELECT * FROM generation_jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
-            assert job_row is not None
-            connection.execute(
-                """INSERT INTO execution_jobs
-                    (job_id,status,max_attempts,containment_contract,privacy_compliance_json,
-                    fence_epoch,current_attempt_id,
-                    retry_eligible,failure_message,resolved_plan_json,created_at,updated_at)
-                   VALUES (?,'queued',?,?,?,0,NULL,0,NULL,?,?,?)""",
-                (
-                    job_id,
-                    effective_max_attempts,
-                    containment_contract,
-                    privacy_compliance_json,
-                    self._resolved_plan_json(job_row, references),
+                    plan_json,
                     timestamp,
                     timestamp,
                 ),
@@ -1594,6 +1821,154 @@ END"""
                 effective_max_attempts,
                 references,
             )
+
+    def create_queued_inference(
+        self,
+        *,
+        request_json: str,
+        request_digest: str,
+        idempotency_key: str,
+        job_id: str,
+        adapter_id: str,
+        adapter_configuration_json: str,
+        resolved_working_directory: str,
+        privacy_compliance_json: str,
+        containment_contract: str,
+        deadline_at: str,
+        timestamp: str,
+        admission: PendingAdmission,
+    ) -> QueuedInference:
+        """Persist one immutable inference request and its shared execution root."""
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key.encode("utf-8")) > 255
+        ):
+            raise ValueError("idempotency key must contain 1-255 UTF-8 bytes")
+        if (
+            not isinstance(request_digest, str)
+            or len(request_digest) != 64
+            or any(character not in "0123456789abcdef" for character in request_digest)
+        ):
+            raise ValueError("request digest must be a lowercase SHA-256 value")
+        request_value = json.loads(request_json)
+        configuration_value = json.loads(adapter_configuration_json)
+        if not isinstance(request_value, dict) or not isinstance(configuration_value, dict):
+            raise ValueError("inference request and adapter configuration must be objects")
+        requested_privacy = json.loads(privacy_compliance_json)
+        if (
+            not is_privacy_compliance_record(requested_privacy)
+            or requested_privacy.get("adapter_id") != adapter_id
+        ):
+            raise ValueError("privacy compliance evidence is malformed")
+        if not isinstance(admission, PendingAdmission):
+            raise ValueError("admission evidence must be a PendingAdmission")
+        AdmissionPersistence.validate_new(
+            admission, adapter_id, allow_not_required=False
+        )
+        if admission.decision in {"blocked", "denied"} and (
+            admission.profile is None or admission.demand is None
+        ):
+            raise ValueError(
+                "blocked inference admission requires explicit profile and demand evidence"
+            )
+        working_directory = str(
+            Path(resolved_working_directory).expanduser().resolve()
+        )
+        with self._connection(transaction=True) as connection:
+            existing = connection.execute(
+                """SELECT requests.*, execution.status AS execution_status,
+                          execution.max_attempts AS execution_max_attempts,
+                          execution.privacy_compliance_json
+                   FROM inference_requests AS requests
+                   JOIN execution_jobs AS execution ON execution.job_id = requests.job_id
+                   WHERE requests.idempotency_key = ?""",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                if existing["request_digest"] != request_digest:
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different inference intent"
+                    )
+                if (
+                    existing["adapter_id"] != adapter_id
+                    or str(existing["adapter_configuration_json"])
+                    != adapter_configuration_json
+                    or str(existing["resolved_working_directory"])
+                    != working_directory
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different runtime configuration"
+                    )
+                stored_privacy = _decode_stored_privacy_compliance(
+                    existing["privacy_compliance_json"], adapter_id
+                )
+                if stored_privacy != requested_privacy:
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different privacy evidence"
+                    )
+                pinned_admission = AdmissionPersistence.snapshot(
+                    connection, str(existing["job_id"])
+                )
+                proposed_demand = (
+                    None if admission.demand is None else admission.demand.to_dict()
+                )
+                if (
+                    pinned_admission is None
+                    or pinned_admission.profile_fingerprint
+                    != admission.profile_fingerprint
+                    or _json(pinned_admission.demand) != _json(proposed_demand)
+                    or pinned_admission.required_bytes != admission.required_bytes
+                    or pinned_admission.unknown_reasons != admission.unknown_reasons
+                ):
+                    raise IdempotencyConflictError(
+                        "idempotency key already bound to different admission evidence"
+                    )
+                return QueuedInference(
+                    False,
+                    str(existing["job_id"]),
+                    str(existing["execution_status"]),
+                    int(existing["execution_max_attempts"]),
+                )
+
+            connection.execute(
+                """INSERT INTO execution_jobs
+                   (job_id,workload_kind,status,max_attempts,containment_contract,
+                    privacy_compliance_json,fence_epoch,current_attempt_id,
+                    retry_eligible,failure_message,created_at,updated_at)
+                   VALUES (?,'inference','queued',2,?,?,0,NULL,0,NULL,?,?)""",
+                (
+                    job_id,
+                    containment_contract,
+                    privacy_compliance_json,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO inference_requests
+                   (job_id,idempotency_key,adapter_id,adapter_configuration_json,
+                    resolved_working_directory,request_json,request_digest,deadline_at,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    job_id,
+                    idempotency_key,
+                    adapter_id,
+                    adapter_configuration_json,
+                    working_directory,
+                    request_json,
+                    request_digest,
+                    deadline_at,
+                    timestamp,
+                ),
+            )
+            AdmissionPersistence.insert(
+                connection,
+                job_id=job_id,
+                admission=admission,
+                timestamp=timestamp,
+            )
+            return QueuedInference(True, job_id, "queued", 2)
 
     @staticmethod
     def _resolve_references(
@@ -1688,7 +2063,6 @@ END"""
             query = """SELECT jobs.*, execution.status AS execution_status,
                 execution.max_attempts, execution.fence_epoch,
                 execution.containment_contract,
-                execution.resolved_plan_json,
                 execution.privacy_compliance_json,
                 admission.decision AS admission_decision,
                 admission.decision_reason AS admission_reason,
@@ -1702,6 +2076,7 @@ END"""
                 JOIN execution_admissions AS admission
                   ON admission.job_id = execution.job_id
                 WHERE execution.status = 'queued'
+                  AND execution.workload_kind = 'generation'
                   AND jobs.adapter_id = ?
                   AND execution.containment_contract IS ?
         AND (
@@ -1766,7 +2141,7 @@ END"""
                 return None
 
             last_number = connection.execute(
-                "SELECT max(attempt_number) FROM generation_attempts WHERE job_id = ?",
+                "SELECT max(attempt_number) FROM execution_attempts WHERE job_id = ?",
                 (candidate["job_id"],),
             ).fetchone()[0] or 0
             attempt_number = int(last_number) + 1
@@ -1783,25 +2158,11 @@ END"""
                 (timestamp, candidate["job_id"]),
             )
             connection.execute(
-                """INSERT INTO generation_attempts
-                   (attempt_id,job_id,attempt_number,status,adapter_id,
-                    started_at,finished_at,error_message)
-                   VALUES (?,?,?,'running',?,?,NULL,NULL)""",
-                (
-                    attempt_id,
-                    candidate["job_id"],
-                    attempt_number,
-                    candidate["adapter_id"],
-                    timestamp,
-                ),
-            )
-            plan_json = str(candidate["resolved_plan_json"])
-            connection.execute(
                 """INSERT INTO execution_attempts
                    (attempt_id,job_id,attempt_number,status,owner_id,claim_epoch,
                     heartbeat_at,lease_expires_at,process_contained,containment_contract,failure_class,
-                    termination_proven,plan_json,completed_at)
-                   VALUES (?,?,?,'running',?,?,?,?,?,?,NULL,0,?,NULL)""",
+                    termination_proven,completed_at)
+                   VALUES (?,?,?,'running',?,?,?,?,?,?,NULL,0,NULL)""",
                 (
                     attempt_id,
                     candidate["job_id"],
@@ -1812,7 +2173,19 @@ END"""
                     lease_expires_at,
                     int(process_contained),
                     containment_contract,
-                    plan_json,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO generation_attempts
+                   (attempt_id,job_id,attempt_number,status,adapter_id,
+                    started_at,finished_at,error_message)
+                   VALUES (?,?,?,'running',?,?,NULL,NULL)""",
+                (
+                    attempt_id,
+                    candidate["job_id"],
+                    attempt_number,
+                    candidate["adapter_id"],
+                    timestamp,
                 ),
             )
             connection.execute(
@@ -1835,7 +2208,7 @@ END"""
                 required_bytes_json=str(candidate["admission_required_bytes_json"]),
             ):
                 raise RuntimeError("admission reservation transition was rejected")
-            plan = json.loads(plan_json)
+            plan = json.loads(str(candidate["resolved_plan_json"]))
             references = tuple(
                 ResolvedReference(
                     artifact_id=str(item["artifact_id"]),
@@ -1863,6 +2236,282 @@ END"""
                 adapter_configuration_json=str(candidate["adapter_configuration_json"]),
                 resolved_output_directory=str(plan["resolved_output_directory"]),
                 process_contained=process_contained,
+                containment_contract=containment_contract,
+                lease_expires_at=lease_expires_at,
+            )
+
+    @staticmethod
+    def _finish_unclaimable_inference_jobs(
+        connection: sqlite3.Connection, timestamp: str
+    ) -> None:
+        """Release admission for expired or exhausted queued inference."""
+        expired = connection.execute(
+            """SELECT requests.job_id FROM inference_requests AS requests
+               JOIN execution_jobs AS execution ON execution.job_id = requests.job_id
+               WHERE execution.status = 'queued' AND requests.deadline_at <= ?""",
+            (timestamp,),
+        ).fetchall()
+        for row in expired:
+            job_id = str(row["job_id"])
+            connection.execute(
+                """UPDATE execution_jobs
+                   SET status = 'failed', retry_eligible = 0,
+                       failure_message = 'inference deadline expired before dispatch',
+                       updated_at = ? WHERE job_id = ? AND status = 'queued'""",
+                (timestamp, job_id),
+            )
+            if not AdmissionPersistence.finish(
+                connection,
+                job_id,
+                decision="released",
+                reason="inference deadline expired before dispatch",
+                timestamp=timestamp,
+            ):
+                raise RuntimeError("expired inference admission could not be released")
+
+        exhausted = connection.execute(
+            """SELECT execution.job_id FROM execution_jobs AS execution
+               WHERE execution.workload_kind = 'inference'
+                 AND execution.status = 'queued'
+                 AND (SELECT count(*) FROM execution_attempts AS attempts
+                      WHERE attempts.job_id = execution.job_id)
+                     >= execution.max_attempts"""
+        ).fetchall()
+        for row in exhausted:
+            job_id = str(row["job_id"])
+            connection.execute(
+                """UPDATE execution_jobs
+                   SET status = 'failed', retry_eligible = 0,
+                       failure_message = 'inference attempt budget exhausted',
+                       updated_at = ? WHERE job_id = ? AND status = 'queued'""",
+                (timestamp, job_id),
+            )
+            if not AdmissionPersistence.finish(
+                connection,
+                job_id,
+                decision="released",
+                reason="inference attempt budget exhausted",
+                timestamp=timestamp,
+            ):
+                raise RuntimeError("exhausted inference admission could not be released")
+
+    def peek_next_inference_request(
+        self,
+        *,
+        adapter_id: str,
+        containment_contract: str,
+        timestamp: str,
+        job_id: str | None = None,
+    ) -> InferenceRequestPeek | None:
+        """Return the next compatible request without reserving capacity."""
+        with self._connection(transaction=True) as connection:
+            self._finish_unclaimable_inference_jobs(connection, timestamp)
+            query = """SELECT execution.job_id, requests.request_json,
+                              requests.deadline_at
+                       FROM inference_requests AS requests
+                       JOIN execution_jobs AS execution
+                         ON execution.job_id = requests.job_id
+                       JOIN execution_admissions AS admission
+                         ON admission.job_id = execution.job_id
+                       WHERE execution.workload_kind = 'inference'
+                         AND execution.status = 'queued'
+                         AND execution.containment_contract = ?
+                         AND requests.adapter_id = ?
+                         AND admission.decision = 'queued'
+                         AND requests.deadline_at > ?
+                         AND (SELECT count(*) FROM execution_attempts AS attempts
+                              WHERE attempts.job_id = execution.job_id)
+                             < execution.max_attempts"""
+            parameters: list[object] = [
+                containment_contract,
+                adapter_id,
+                timestamp,
+            ]
+            if job_id is not None:
+                query += " AND execution.job_id = ?"
+                parameters.append(job_id)
+            query += " ORDER BY execution.created_at, execution.job_id LIMIT 1"
+            row = connection.execute(query, tuple(parameters)).fetchone()
+            if row is None:
+                return None
+            return InferenceRequestPeek(
+                job_id=str(row["job_id"]),
+                request_json=str(row["request_json"]),
+                deadline_at=str(row["deadline_at"]),
+            )
+
+    def claim_next_inference_execution(
+        self,
+        *,
+        attempt_id: str,
+        owner_id: str,
+        adapter_id: str,
+        adapter_configuration_json: str,
+        resolved_working_directory: str,
+        privacy_compliance_json: str,
+        containment_contract: str,
+        timestamp: str,
+        lease_expires_at: str,
+        expected_admission: PendingAdmission,
+        job_id: str | None = None,
+    ) -> InferenceExecutionClaim | None:
+        """Claim admitted inference work under the same execution resource row."""
+        if not isinstance(expected_admission, PendingAdmission):
+            raise TypeError("expected_admission must be a PendingAdmission")
+        requested_directory = str(
+            Path(resolved_working_directory).expanduser().resolve()
+        )
+        requested_configuration = json.loads(adapter_configuration_json)
+        requested_privacy = json.loads(privacy_compliance_json)
+        if (
+            not isinstance(requested_configuration, dict)
+            or not is_privacy_compliance_record(requested_privacy)
+            or requested_privacy.get("adapter_id") != adapter_id
+        ):
+            raise ValueError("inference runtime or privacy evidence is malformed")
+        with self._connection(transaction=True) as connection:
+            self._finish_unclaimable_inference_jobs(connection, timestamp)
+            resource = connection.execute(
+                "SELECT state FROM execution_resource WHERE id = 1"
+            ).fetchone()
+            if resource is None or resource["state"] != "available":
+                return None
+
+            query = """SELECT execution.job_id, execution.max_attempts,
+                       execution.fence_epoch, execution.containment_contract,
+                       execution.privacy_compliance_json,
+                       requests.adapter_id, requests.adapter_configuration_json,
+                       requests.resolved_working_directory, requests.request_json,
+                       requests.deadline_at,
+                       admission.decision AS admission_decision,
+                       admission.admission_profile_json,
+                       admission.workload_demand_json,
+                       admission.profile_fingerprint,
+                       admission.required_bytes_json
+                FROM inference_requests AS requests
+                JOIN execution_jobs AS execution ON execution.job_id = requests.job_id
+                JOIN execution_admissions AS admission
+                  ON admission.job_id = execution.job_id
+                WHERE execution.workload_kind = 'inference'
+                  AND execution.status = 'queued'
+                  AND execution.containment_contract = ?
+                  AND requests.adapter_id = ?
+                  AND admission.decision = 'queued'
+                  AND requests.deadline_at > ?
+                  AND (SELECT count(*) FROM execution_attempts AS attempts
+                       WHERE attempts.job_id = execution.job_id) < execution.max_attempts"""
+            parameters: list[object] = [
+                containment_contract,
+                adapter_id,
+                timestamp,
+            ]
+            if job_id is not None:
+                query += " AND execution.job_id = ?"
+                parameters.append(job_id)
+            query += " ORDER BY execution.created_at, execution.job_id"
+            candidate = None
+            privacy_rejection_job_id: str | None = None
+            for row in connection.execute(query, tuple(parameters)).fetchall():
+                try:
+                    AdmissionPersistence.validate_claim_evidence(
+                        row["admission_profile_json"],
+                        row["workload_demand_json"],
+                        row["profile_fingerprint"],
+                        row["required_bytes_json"],
+                        row["job_id"],
+                        expected=expected_admission,
+                    )
+                except AdmissionEvidenceMismatchError:
+                    raise
+                except ValueError as error:
+                    raise RuntimeError(str(error)) from error
+                if (
+                    str(row["adapter_configuration_json"])
+                    != adapter_configuration_json
+                    or str(row["resolved_working_directory"])
+                    != requested_directory
+                ):
+                    raise GenerationError(
+                        f"{_PRIVACY_CLAIM_CONFIGURATION_REQUIRED}: {row['job_id']}"
+                    )
+                stored_privacy_json = row["privacy_compliance_json"]
+                _decode_stored_privacy_compliance(stored_privacy_json, adapter_id)
+                if stored_privacy_json != privacy_compliance_json:
+                    privacy_rejection_job_id = str(row["job_id"])
+                    continue
+                candidate = row
+                break
+            if candidate is None:
+                if privacy_rejection_job_id is not None:
+                    raise GenerationError(
+                        f"{_PRIVACY_CLAIM_EVIDENCE_REQUIRED}: "
+                        f"{privacy_rejection_job_id}"
+                    )
+                return None
+
+            attempt_number = int(
+                connection.execute(
+                    "SELECT count(*) FROM execution_attempts WHERE job_id = ?",
+                    (candidate["job_id"],),
+                ).fetchone()[0]
+            ) + 1
+            claim_epoch = int(candidate["fence_epoch"]) + 1
+            connection.execute(
+                """INSERT INTO execution_attempts
+                   (attempt_id,job_id,attempt_number,status,owner_id,claim_epoch,
+                    heartbeat_at,lease_expires_at,process_contained,
+                    containment_contract,failure_class,termination_proven,completed_at)
+                   VALUES (?,?,?,'running',?,?,?,?,?,?,NULL,0,NULL)""",
+                (
+                    attempt_id,
+                    candidate["job_id"],
+                    attempt_number,
+                    owner_id,
+                    claim_epoch,
+                    timestamp,
+                    lease_expires_at,
+                    0,
+                    containment_contract,
+                ),
+            )
+            connection.execute(
+                """UPDATE execution_jobs
+                   SET status = 'running', fence_epoch = ?, current_attempt_id = ?,
+                       retry_eligible = 0, failure_message = NULL, updated_at = ?
+                   WHERE job_id = ? AND status = 'queued'""",
+                (claim_epoch, attempt_id, timestamp, candidate["job_id"]),
+            )
+            connection.execute(
+                """UPDATE execution_resource
+                   SET state = 'claimed', job_id = ?, attempt_id = ?, owner_id = ?,
+                       reason = NULL, updated_at = ? WHERE id = 1""",
+                (candidate["job_id"], attempt_id, owner_id, timestamp),
+            )
+            if not AdmissionPersistence.reserve(
+                connection,
+                str(candidate["job_id"]),
+                source_decision=str(candidate["admission_decision"]),
+                timestamp=timestamp,
+                required_bytes_json=str(candidate["required_bytes_json"]),
+            ):
+                raise RuntimeError("inference admission reservation was rejected")
+            return InferenceExecutionClaim(
+                job_id=str(candidate["job_id"]),
+                attempt_id=attempt_id,
+                attempt_number=attempt_number,
+                owner_id=owner_id,
+                claim_epoch=claim_epoch,
+                max_attempts=int(candidate["max_attempts"]),
+                request_json=str(candidate["request_json"]),
+                deadline_at=str(candidate["deadline_at"]),
+                adapter_id=adapter_id,
+                adapter_configuration_json=str(
+                    candidate["adapter_configuration_json"]
+                ),
+                resolved_working_directory=str(
+                    candidate["resolved_working_directory"]
+                ),
+                process_contained=False,
                 containment_contract=containment_contract,
                 lease_expires_at=lease_expires_at,
             )
@@ -2180,14 +2829,42 @@ END"""
     @staticmethod
     def _uses_native_group(connection: sqlite3.Connection, job_id: str) -> bool:
         row = connection.execute(
-            "SELECT adapter_id FROM generation_jobs WHERE job_id = ?", (job_id,)
+            """SELECT COALESCE(generation.adapter_id, inference.adapter_id)
+               FROM execution_jobs AS execution
+               LEFT JOIN generation_jobs AS generation
+                 ON generation.job_id = execution.job_id
+               LEFT JOIN inference_requests AS inference
+                 ON inference.job_id = execution.job_id
+               WHERE execution.job_id = ?""",
+            (job_id,),
         ).fetchone()
-        return row is not None and row[0] == NATIVE_IMAGE_ADAPTER_ID
+        return row is not None and row[0] in {
+            NATIVE_IMAGE_ADAPTER_ID,
+            LLAMA_CPP_ADAPTER_ID,
+        }
 
     @staticmethod
     def _native_group_empty(
         connection: sqlite3.Connection, job_id: str, attempt_id: str
     ) -> bool:
+        inference = connection.execute(
+            """SELECT attempts.observation_evidence_json
+               FROM execution_jobs AS jobs
+               JOIN execution_attempts AS attempts
+                 ON attempts.attempt_id = ? AND attempts.job_id = jobs.job_id
+               WHERE jobs.job_id = ? AND jobs.workload_kind = 'inference'""",
+            (attempt_id, job_id),
+        ).fetchone()
+        if inference is not None:
+            if inference["observation_evidence_json"] is None:
+                return False
+            observed = json.loads(str(inference["observation_evidence_json"]))
+            validate_observed_record(observed)
+            return (
+                observed["attempt_id"] == attempt_id
+                and observation_proves_reaped_child(observed)
+                and observed.get("process_group_terminated") is True
+            )
         row = connection.execute(
             "SELECT observed_json FROM backend_executions "
             "WHERE job_id = ? AND attempt_id = ? AND state = 'observed'",
@@ -2249,6 +2926,25 @@ END"""
         attempt_id: str,
     ) -> bool:
         """Return whether durable evidence records a process launch."""
+        inference = connection.execute(
+            """SELECT attempts.launch_evidence_json
+               FROM execution_jobs AS jobs
+               JOIN execution_attempts AS attempts
+                 ON attempts.attempt_id = ? AND attempts.job_id = jobs.job_id
+               WHERE jobs.job_id = ? AND jobs.workload_kind = 'inference'""",
+            (attempt_id, job_id),
+        ).fetchone()
+        if inference is not None:
+            launch_json = inference["launch_evidence_json"]
+            if launch_json is None:
+                return False
+            launch = json.loads(str(launch_json))
+            validate_launch_record(launch)
+            if launch.get("attempt_id") != attempt_id:
+                raise BackendEvidenceError(
+                    "inference launch evidence identifies a different attempt"
+                )
+            return True
         row = connection.execute(
             "SELECT state FROM backend_executions "
             "WHERE job_id = ? AND attempt_id = ?",
@@ -2272,12 +2968,35 @@ END"""
         Missing or pre-observation rows are not proof. Malformed persisted
         evidence raises so finalization cannot convert it into a release.
         """
+        inference = connection.execute(
+            """SELECT attempts.observation_evidence_json
+               FROM execution_jobs AS jobs
+               JOIN execution_attempts AS attempts
+                 ON attempts.attempt_id = ? AND attempts.job_id = jobs.job_id
+               WHERE jobs.job_id = ? AND jobs.workload_kind = 'inference'""",
+            (attempt_id, job_id),
+        ).fetchone()
+        if inference is not None:
+            observation_json = inference["observation_evidence_json"]
+            if observation_json is None:
+                return False
+            observed = json.loads(str(observation_json))
+            validate_observed_record(observed)
+            if observed.get("attempt_id") != attempt_id:
+                raise BackendEvidenceError(
+                    "inference observation identifies a different attempt"
+                )
+            return observation_proves_reaped_child(observed)
         row = connection.execute(
             """SELECT executions.*,
-                      admitted.adapter_configuration_json AS adapter_configuration_json
+                      COALESCE(generation.adapter_configuration_json,
+                               inference.adapter_configuration_json)
+                        AS adapter_configuration_json
                FROM backend_executions AS executions
-               JOIN generation_jobs AS admitted
-                 ON admitted.job_id = executions.job_id
+               LEFT JOIN generation_jobs AS generation
+                 ON generation.job_id = executions.job_id
+               LEFT JOIN inference_requests AS inference
+                 ON inference.job_id = executions.job_id
                WHERE executions.job_id = ? AND executions.attempt_id = ?""",
             (job_id, attempt_id),
         ).fetchone()
@@ -2619,6 +3338,91 @@ END"""
                 ) from error
         return resolved_digest
 
+    def mark_inference_execution_launched(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str | None,
+        claim_epoch: int | None,
+        record: dict[str, object],
+        timestamp: str,
+    ) -> None:
+        """Persist the direct launch fact on the shared inference attempt."""
+        validate_launch_record(record)
+        if record.get("attempt_id") != attempt_id:
+            raise BackendEvidenceError("launch evidence identifies a different attempt")
+        with self._connection(transaction=True) as connection:
+            workload = connection.execute(
+                "SELECT workload_kind FROM execution_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if workload is None or workload["workload_kind"] != "inference":
+                raise BackendEvidenceError("launch evidence requires an inference attempt")
+            self._require_backend_authority(
+                connection,
+                job_id,
+                attempt_id,
+                owner_id,
+                claim_epoch,
+                settle_cancellation=True,
+            )
+            updated = connection.execute(
+                """UPDATE execution_attempts
+                   SET launch_evidence_json = ?, launch_evidence_at = ?
+                   WHERE job_id = ? AND attempt_id = ?
+                     AND launch_evidence_json IS NULL AND status = 'running'""",
+                (backend_canonical_json(record), timestamp, job_id, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise BackendEvidenceError(
+                    "inference launch evidence was already recorded or attempt is stale"
+                )
+
+    def mark_inference_execution_observed(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        owner_id: str | None,
+        claim_epoch: int | None,
+        record: dict[str, object],
+        timestamp: str,
+    ) -> None:
+        """Persist a reaped-child observation on the shared inference attempt."""
+        validate_observed_record(record)
+        if record.get("attempt_id") != attempt_id:
+            raise BackendEvidenceError("observation evidence identifies a different attempt")
+        with self._connection(transaction=True) as connection:
+            workload = connection.execute(
+                "SELECT workload_kind FROM execution_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if workload is None or workload["workload_kind"] != "inference":
+                raise BackendEvidenceError(
+                    "observation evidence requires an inference attempt"
+                )
+            self._require_backend_authority(
+                connection,
+                job_id,
+                attempt_id,
+                owner_id,
+                claim_epoch,
+                settle_cancellation=True,
+            )
+            updated = connection.execute(
+                """UPDATE execution_attempts
+                   SET observation_evidence_json = ?, observation_evidence_at = ?
+                   WHERE job_id = ? AND attempt_id = ?
+                     AND launch_evidence_json IS NOT NULL
+                     AND observation_evidence_json IS NULL AND status = 'running'""",
+                (backend_canonical_json(record), timestamp, job_id, attempt_id),
+            )
+            if updated.rowcount != 1:
+                raise BackendEvidenceError(
+                    "inference launch was not recorded or observation is stale"
+                )
+
     def mark_execution_launched(
         self,
         *,
@@ -2856,6 +3660,376 @@ END"""
             )
             if not admission_finished:
                 raise RuntimeError("admission completion transition was rejected")
+
+    def finalize_inference_attempt(
+        self,
+        *,
+        job_id: str,
+        attempt_id: str,
+        outcome: str,
+        completion_reason: str,
+        response_bytes: bytes,
+        response_size: int,
+        response_sha256: str,
+        validation_json: str,
+        result_json: str | None,
+        timestamp: str,
+        attempt_owner_id: str,
+        claim_epoch: int,
+        termination_proven: bool,
+        failure_class: str | None = None,
+        prelaunch_refusal: bool = False,
+    ) -> bool:
+        """Persist one inference outcome and atomically settle T06 ownership.
+
+        A repair is scheduled only for the fixed invalid-output categories,
+        only after the first attempt, and only when the supervised process
+        group is proven empty before the persisted request deadline.
+        A second repairable invalid response is recorded as repair-exhausted.
+        Successful values are committed only when the shared resource can be
+        released with validated termination evidence.
+        """
+        allowed_outcomes = {
+            "succeeded",
+            "refused",
+            "invalid_output",
+            "repair_exhausted",
+            "response_cap_exceeded",
+            "runtime_failure",
+            "timeout",
+            "canceled",
+        }
+        if outcome not in allowed_outcomes:
+            raise ValueError("unsupported inference outcome")
+        if completion_reason not in {
+            "end_of_sequence",
+            "stop_sequence",
+            "token_limit",
+            "unknown",
+        }:
+            raise ValueError("unsupported inference completion reason")
+        if not isinstance(response_bytes, bytes) or len(response_bytes) > _MAX_INFERENCE_RESPONSE_BYTES:
+            raise ValueError("inference response prefix exceeds the capture bound")
+        if (
+            isinstance(response_size, bool)
+            or not isinstance(response_size, int)
+            or response_size < len(response_bytes)
+        ):
+            raise ValueError("inference response size is invalid")
+        if (
+            not isinstance(response_sha256, str)
+            or len(response_sha256) != 64
+            or any(character not in "0123456789abcdef" for character in response_sha256)
+        ):
+            raise ValueError("inference response digest is invalid")
+        if len(validation_json.encode("utf-8")) > 8192:
+            raise ValueError("inference validation record exceeds its size bound")
+        validation = json.loads(validation_json)
+        if not isinstance(validation, dict) or not isinstance(
+            validation.get("category"), str
+        ):
+            raise ValueError("inference validation record is malformed")
+        category = str(validation["category"])
+        if completion_reason == "token_limit" and category != "generation_truncated":
+            raise ValueError("token-limit completion must be classified as truncation")
+        expected_categories = {
+            "succeeded": "valid_output",
+            "refused": "refusal",
+            "response_cap_exceeded": "response_capture_overflow",
+            "runtime_failure": "runtime_failure",
+            "timeout": "timeout",
+            "canceled": "cancelled",
+        }
+        if outcome in expected_categories and category != expected_categories[outcome]:
+            raise ValueError("inference outcome and validation category disagree")
+        if outcome == "invalid_output" and category not in (
+            _REPAIRABLE_INFERENCE_CATEGORIES | {"malformed_json_unknown_termination"}
+        ):
+            raise ValueError("invalid-output category is not recognized")
+        if outcome == "repair_exhausted" and category not in _REPAIRABLE_INFERENCE_CATEGORIES:
+            raise ValueError("repair-exhausted category is not recognized")
+        if outcome in {"succeeded", "refused"}:
+            if result_json is None:
+                raise ValueError("successful and refused outcomes require a result")
+            result_value = json.loads(result_json)
+            if not isinstance(result_value, dict):
+                raise ValueError("inference result must be a JSON object")
+            expected_status = "ok" if outcome == "succeeded" else "refused"
+            if result_value.get("status") != expected_status:
+                raise ValueError("inference result status does not match its outcome")
+        elif result_json is not None:
+            raise ValueError("non-success outcomes cannot publish a result")
+
+        with self._connection(transaction=True) as connection:
+            execution = connection.execute(
+                """SELECT status, workload_kind, max_attempts, current_attempt_id,
+                          fence_epoch, containment_contract
+                   FROM execution_jobs WHERE job_id = ?""",
+                (job_id,),
+            ).fetchone()
+            if execution is None or execution["workload_kind"] != "inference":
+                raise RecordNotFoundError(f"inference job not found: {job_id}")
+            if execution["current_attempt_id"] != attempt_id:
+                return False
+            authorized = self._attempt_authorized(
+                connection, job_id, attempt_id, attempt_owner_id, claim_epoch
+            )
+            canceled_claim = (
+                failure_class == "canceled"
+                and connection.execute(
+                    """SELECT 1 FROM execution_jobs AS jobs
+                       JOIN execution_attempts AS attempts
+                         ON attempts.attempt_id = jobs.current_attempt_id
+                       JOIN execution_resource AS resource ON resource.id = 1
+                       WHERE jobs.job_id = ? AND jobs.status = 'canceled'
+                         AND jobs.fence_epoch = ? + 1 AND attempts.attempt_id = ?
+                         AND attempts.owner_id = ? AND attempts.claim_epoch = ?
+                         AND attempts.status = 'running'
+                         AND resource.job_id = jobs.job_id
+                         AND resource.attempt_id = attempts.attempt_id
+                         AND resource.owner_id = attempts.owner_id
+                         AND resource.state = 'claimed'""",
+                    (job_id, claim_epoch, attempt_id, attempt_owner_id, claim_epoch),
+                ).fetchone()
+                is not None
+            )
+            if not authorized and not canceled_claim:
+                return False
+            attempt = connection.execute(
+                """SELECT status, attempt_number, containment_contract, owner_id
+                   FROM execution_attempts
+                   WHERE job_id = ? AND attempt_id = ?""",
+                (job_id, attempt_id),
+            ).fetchone()
+            if attempt is None or attempt["status"] != "running":
+                return False
+            request = connection.execute(
+                "SELECT deadline_at FROM inference_requests WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if request is None:
+                raise RuntimeError("inference execution has no immutable request")
+
+            direct_child_proven = self._attempt_termination_evidence(
+                connection, job_id, attempt_id
+            )
+            process_tree_required = self._attempt_requires_process_tree_resource_release(
+                connection, job_id, attempt_id
+            )
+            prelaunch_proven = (
+                prelaunch_refusal
+                and termination_proven
+                and not self._attempt_has_launch_evidence(connection, job_id, attempt_id)
+            )
+            validated_termination = self._attempt_termination_proven(
+                connection, job_id, attempt_id
+            )
+            if prelaunch_proven:
+                effective_termination = True
+            elif not termination_proven:
+                effective_termination = False
+            elif process_tree_required:
+                effective_termination = direct_child_proven
+            else:
+                effective_termination = validated_termination
+            resource_release_proven = self._resource_release_proven(
+                connection,
+                job_id,
+                attempt_id,
+                containment_contract=attempt["containment_contract"],
+                effective_termination_proven=effective_termination,
+                direct_child_termination_proven=direct_child_proven,
+                prelaunch_refusal=prelaunch_refusal,
+            )
+            if outcome in {"succeeded", "refused"} and not resource_release_proven:
+                validation["validated_response_category"] = category
+                validation["category"] = "runtime_failure"
+                validation_json = _json(validation)
+                category = "runtime_failure"
+                outcome = "runtime_failure"
+                result_json = None
+                failure_class = "ambiguous"
+            attempt_number = int(attempt["attempt_number"])
+            prior_repair = connection.execute(
+                """SELECT 1 FROM execution_attempts AS attempts
+                   JOIN inference_attempt_results AS results
+                     ON results.attempt_id = attempts.attempt_id
+                    AND results.job_id = attempts.job_id
+                   WHERE attempts.job_id = ? AND attempts.attempt_number = 1
+                     AND results.outcome = 'invalid_output'
+                     AND results.repair_eligible = 1""",
+                (job_id,),
+            ).fetchone() is not None
+            if outcome == "repair_exhausted":
+                if attempt_number != 2 or not prior_repair:
+                    raise ValueError(
+                        "repair exhaustion requires the persisted bounded repair attempt"
+                    )
+            elif (
+                outcome == "invalid_output"
+                and category in _REPAIRABLE_INFERENCE_CATEGORIES
+                and attempt_number == 2
+                and int(execution["max_attempts"]) == 2
+                and prior_repair
+            ):
+                outcome = "repair_exhausted"
+            repair = (
+                outcome == "invalid_output"
+                and category in _REPAIRABLE_INFERENCE_CATEGORIES
+                and attempt_number == 1
+                and int(execution["max_attempts"]) == 2
+                and execution["status"] == "running"
+                and timestamp < str(request["deadline_at"])
+                and resource_release_proven
+            )
+            if outcome == "succeeded" or outcome == "refused":
+                failure_class = None
+                attempt_status = "succeeded"
+            elif outcome == "canceled":
+                failure_class = "canceled"
+                attempt_status = "canceled"
+            elif repair:
+                failure_class = "retryable"
+                attempt_status = "failed"
+            else:
+                failure_class = failure_class or (
+                    "terminal" if outcome != "canceled" else "canceled"
+                )
+                if failure_class not in {
+                    "retryable",
+                    "terminal",
+                    "canceled",
+                    "ambiguous",
+                    "crash",
+                }:
+                    raise ValueError("unsupported inference failure class")
+                attempt_status = "failed"
+            execution_status = (
+                "canceled"
+                if failure_class == "canceled"
+                else "ambiguous"
+                if failure_class == "ambiguous" or not effective_termination
+                else "queued"
+                if repair
+                else "succeeded"
+                if outcome in {"succeeded", "refused"}
+                else "failed"
+            )
+            if outcome == "succeeded":
+                result_value = json.loads(str(result_json))
+                if result_value.get("status") != "ok":
+                    raise ValueError("successful result must have status ok")
+            cursor = connection.execute(
+                """INSERT INTO inference_attempt_results
+                   (attempt_id,job_id,outcome,completion_reason,response_bytes,
+                    response_size,response_sha256,validation_json,result_json,
+                    repair_eligible,created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    attempt_id,
+                    job_id,
+                    outcome,
+                    completion_reason,
+                    response_bytes,
+                    response_size,
+                    response_sha256,
+                    validation_json,
+                    result_json,
+                    int(repair),
+                    timestamp,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("inference outcome was not persisted")
+            updated_attempt = connection.execute(
+                """UPDATE execution_attempts
+                   SET status = ?, failure_class = ?, termination_proven = ?,
+                       completed_at = ?
+                   WHERE job_id = ? AND attempt_id = ? AND status = 'running'""",
+                (
+                    attempt_status,
+                    failure_class,
+                    int(resource_release_proven),
+                    timestamp,
+                    job_id,
+                    attempt_id,
+                ),
+            )
+            if updated_attempt.rowcount != 1:
+                raise RuntimeError("inference attempt finalization lost its row")
+            reason = (
+                "attempt lacks process-group termination evidence"
+                if not resource_release_proven
+                else None
+            )
+            if resource_release_proven:
+                resource_update = connection.execute(
+                    """UPDATE execution_resource
+                       SET state = 'available', job_id = NULL, attempt_id = NULL,
+                           owner_id = NULL, reason = NULL, updated_at = ?
+                       WHERE id = 1 AND job_id = ? AND attempt_id = ?
+                         AND owner_id = ? AND state = 'claimed'""",
+                    (timestamp, job_id, attempt_id, attempt_owner_id),
+                )
+            else:
+                resource_update = connection.execute(
+                    """UPDATE execution_resource
+                       SET state = 'quarantined', job_id = ?, attempt_id = ?,
+                           owner_id = ?, reason = ?, updated_at = ?
+                       WHERE id = 1 AND job_id = ? AND attempt_id = ?
+                         AND owner_id = ? AND state = 'claimed'""",
+                    (
+                        job_id,
+                        attempt_id,
+                        attempt_owner_id,
+                        reason,
+                        timestamp,
+                        job_id,
+                        attempt_id,
+                        attempt_owner_id,
+                    ),
+                )
+            if resource_update.rowcount != 1:
+                raise RuntimeError("inference resource ownership changed before finalization")
+            failure_message = (
+                None
+                if outcome in {"succeeded", "refused"}
+                else "repair attempt queued after invalid structured output"
+                if repair
+                else reason or f"inference outcome: {outcome}"
+            )
+            updated_job = connection.execute(
+                """UPDATE execution_jobs
+                   SET status = ?, retry_eligible = 0, failure_message = ?,
+                       updated_at = ?
+                   WHERE job_id = ? AND current_attempt_id = ?""",
+                (execution_status, failure_message, timestamp, job_id, attempt_id),
+            )
+            if updated_job.rowcount != 1:
+                raise RuntimeError("inference job finalization lost its row")
+            if failure_class == "canceled" and resource_release_proven:
+                connection.execute(
+                    """UPDATE execution_cancellations
+                       SET state = 'acknowledged', acknowledged_at = ?
+                       WHERE job_id = ? AND attempt_id = ? AND claim_epoch = ?
+                         AND state = 'requested'""",
+                    (timestamp, job_id, attempt_id, claim_epoch),
+                )
+            if not resource_release_proven:
+                admission_decision = "quarantined"
+            elif repair:
+                admission_decision = "queued"
+            else:
+                admission_decision = "released"
+            if not AdmissionPersistence.finish(
+                connection,
+                job_id,
+                decision=admission_decision,
+            reason=reason or failure_message or f"inference outcome: {outcome}",
+                timestamp=timestamp,
+            ):
+                raise RuntimeError("inference admission finalization was rejected")
+            return True
 
     @staticmethod
     def _commit_publication_row(
@@ -3186,6 +4360,34 @@ END"""
             "crash",
         }:
             raise ValueError(f"unsupported failure class: {failure_class}")
+        with self._connection() as connection:
+            workload = connection.execute(
+                "SELECT workload_kind FROM execution_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if workload is None:
+            raise RecordNotFoundError(f"job not found: {job_id}")
+        if workload["workload_kind"] == "inference":
+            category = "cancelled" if failure_class == "canceled" else "runtime_failure"
+            validation_json = _json({"category": category})
+            empty_digest = hashlib.sha256(b"").hexdigest()
+            return self.finalize_inference_attempt(
+                job_id=job_id,
+                attempt_id=attempt_id,
+                outcome="canceled" if failure_class == "canceled" else "runtime_failure",
+                completion_reason="unknown",
+                response_bytes=b"",
+                response_size=0,
+                response_sha256=empty_digest,
+                validation_json=validation_json,
+                result_json=None,
+                timestamp=timestamp,
+                attempt_owner_id=attempt_owner_id or "",
+                claim_epoch=claim_epoch if claim_epoch is not None else -1,
+                termination_proven=termination_proven,
+                failure_class=failure_class,
+                prelaunch_refusal=prelaunch_refusal,
+            )
         with self._connection(transaction=True) as connection:
             current = self._attempt_authorized(
                 connection, job_id, attempt_id, attempt_owner_id, claim_epoch
@@ -3473,7 +4675,14 @@ END"""
         return self._artifact_from_row(row)
 
     def get_provenance(self, job_id: str) -> dict[str, object]:
-        """Return request, job, attempt history, artifact, and execution state."""
+        """Return job provenance with inference records reduced to public fields."""
+        with self._connection() as connection:
+            workload = connection.execute(
+                "SELECT workload_kind FROM execution_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        if workload is not None and workload["workload_kind"] == "inference":
+            return self.get_public_inference_provenance(job_id)
         with self._connection() as connection:
             job_row = connection.execute(
                 """SELECT jobs.*, artifacts.artifact_id,
@@ -3590,6 +4799,172 @@ resource.reason AS resource_reason
                     "resource_attempt_id": job_row["resource_attempt_id"],
                     "resource_owner_id": job_row["resource_owner_id"],
  "resource_reason": job_row["resource_reason"],
+                },
+            }
+
+    def get_inference_repair_context(
+        self, job_id: str
+    ) -> InferenceRepairContext | None:
+        """Return verified attempt-one output for the bounded repair prompt."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT results.response_bytes, results.response_size,
+                          results.response_sha256, results.validation_json
+                   FROM execution_jobs AS jobs
+                   JOIN execution_attempts AS attempts
+                     ON attempts.attempt_id = jobs.current_attempt_id
+                   JOIN inference_attempt_results AS results
+                     ON results.attempt_id = attempts.attempt_id
+                    AND results.job_id = jobs.job_id
+                   WHERE jobs.job_id = ? AND jobs.workload_kind = 'inference'
+                     AND jobs.status = 'queued'
+                     AND attempts.attempt_number = 1
+                     AND results.repair_eligible = 1""",
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        response_bytes = bytes(row["response_bytes"])
+        response_size = int(row["response_size"])
+        response_sha256 = str(row["response_sha256"])
+        validation = json.loads(str(row["validation_json"]))
+        category = validation.get("category") if isinstance(validation, dict) else None
+        if (
+            not isinstance(category, str)
+            or category not in _REPAIRABLE_INFERENCE_CATEGORIES
+            or response_size != len(response_bytes)
+            or hashlib.sha256(response_bytes).hexdigest() != response_sha256
+        ):
+            raise RuntimeError("stored inference repair response failed integrity checks")
+        return InferenceRepairContext(category, response_bytes)
+
+    def get_public_inference_provenance(self, job_id: str) -> dict[str, object]:
+        """Return inference provenance without prompts, responses, or local paths."""
+        result = _public_inference_provenance(
+            self.get_inference_provenance(job_id)
+        )
+        return result if isinstance(result, dict) else {"job_id": job_id}
+
+    def get_inference_provenance(self, job_id: str) -> dict[str, object]:
+        """Return internal inference provenance, including validated response values."""
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT execution.*, requests.request_json,
+                          requests.request_digest, requests.deadline_at,
+                          requests.adapter_id,
+                          requests.adapter_configuration_json,
+                          resource.state AS resource_state,
+                          resource.job_id AS resource_job_id,
+                          resource.attempt_id AS resource_attempt_id,
+                          resource.owner_id AS resource_owner_id,
+                          resource.reason AS resource_reason
+                   FROM execution_jobs AS execution
+                   JOIN inference_requests AS requests
+                     ON requests.job_id = execution.job_id
+                   LEFT JOIN execution_resource AS resource ON resource.id = 1
+                   WHERE execution.job_id = ?
+                     AND execution.workload_kind = 'inference'""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise RecordNotFoundError(f"inference job not found: {job_id}")
+            request = json.loads(str(row["request_json"]))
+            prompt_value = request.get("prompt", "")
+            prompt_digest = hashlib.sha256(
+                prompt_value.encode("utf-8") if isinstance(prompt_value, str) else b""
+            ).hexdigest()
+            image = request.get("image")
+            image_digest = (
+                image.get("sha256")
+                if isinstance(image, dict) and isinstance(image.get("sha256"), str)
+                else None
+            )
+            admission = AdmissionPersistence.snapshot(connection, job_id)
+            attempt_rows = connection.execute(
+                """SELECT attempts.*, executions.heartbeat_at,
+                          executions.lease_expires_at,
+                          results.outcome, results.completion_reason,
+                          results.response_size, results.response_sha256,
+                          results.validation_json, results.result_json,
+                          results.repair_eligible, results.created_at AS result_created_at
+                   FROM execution_attempts AS attempts
+                   LEFT JOIN execution_attempts AS executions
+                     ON executions.attempt_id = attempts.attempt_id
+                   LEFT JOIN inference_attempt_results AS results
+                     ON results.attempt_id = attempts.attempt_id
+                   WHERE attempts.job_id = ? ORDER BY attempts.attempt_number""",
+                (job_id,),
+            ).fetchall()
+            attempts: list[dict[str, object]] = []
+            for item in attempt_rows:
+                result = None
+                if item["outcome"] is not None:
+                    result = {
+                        "outcome": str(item["outcome"]),
+                        "completion_reason": str(item["completion_reason"]),
+                        "response_size": int(item["response_size"]),
+                        "response_sha256": str(item["response_sha256"]),
+                        "validation": json.loads(str(item["validation_json"])),
+                        "value": (
+                            None
+                            if item["result_json"] is None
+                            else json.loads(str(item["result_json"]))
+                        ),
+                        "repair_eligible": bool(item["repair_eligible"]),
+                        "created_at": str(item["result_created_at"]),
+                    }
+                attempts.append(
+                    {
+                        "attempt_id": str(item["attempt_id"]),
+                        "attempt_number": int(item["attempt_number"]),
+                        "status": str(item["status"]),
+                        "owner_id": item["owner_id"],
+                        "claim_epoch": int(item["claim_epoch"]),
+                        "heartbeat_at": item["heartbeat_at"],
+                        "lease_expires_at": item["lease_expires_at"],
+                        "failure_class": item["failure_class"],
+                        "termination_proven": bool(item["termination_proven"]),
+                        "completed_at": item["completed_at"],
+                        "result": result,
+                    }
+                )
+            privacy = _decode_stored_privacy_compliance(
+                row["privacy_compliance_json"], str(row["adapter_id"])
+            )
+            return {
+                "job_id": job_id,
+                "workload_kind": "inference",
+                "status": str(row["status"]),
+                "request": {
+                    "kind": request.get("kind"),
+                    "prompt_sha256": prompt_digest,
+                    "image_sha256": image_digest,
+                    "request_digest": str(row["request_digest"]),
+                    "deadline_at": str(row["deadline_at"]),
+                    "response_contract": request.get("response_contract"),
+                },
+                "adapter_id": str(row["adapter_id"]),
+                "adapter_configuration": json.loads(
+                    str(row["adapter_configuration_json"])
+                ),
+                "privacy_compliance": privacy,
+                "attempt": None if not attempts else attempts[-1],
+                "attempts": attempts,
+                "admission": (
+                    None if admission is None else admission.to_dict()
+                ),
+                "execution": {
+                    "status": str(row["status"]),
+                    "max_attempts": int(row["max_attempts"]),
+                    "fence_epoch": int(row["fence_epoch"]),
+                    "retry_eligible": bool(row["retry_eligible"]),
+                    "failure_message": row["failure_message"],
+                    "containment_contract": row["containment_contract"],
+                    "resource_state": str(row["resource_state"] or "available"),
+                    "resource_job_id": row["resource_job_id"],
+                    "resource_attempt_id": row["resource_attempt_id"],
+                    "resource_owner_id": row["resource_owner_id"],
+                    "resource_reason": row["resource_reason"],
                 },
             }
 

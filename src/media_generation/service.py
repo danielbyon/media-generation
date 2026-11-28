@@ -1518,22 +1518,9 @@ class GenerationService:
                 "backend execution did not persist a reaped-child observation"
             )
 
-    @contextmanager
     def _resource_lock(self) -> Iterator[bool]:
-        """Hold the permanent per-database heavyweight resource lock."""
-        lock_path = self._store.database_path.with_name(
-            self._store.database_path.name + ".resource.lock"
-        )
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                yield False
-                return
-            yield True
-        finally:
-            os.close(descriptor)
+        """Return the store-owned lock shared by every heavyweight worker."""
+        return self._store.resource_lock()
 
     def _validate_reference_artifacts(self, references: tuple[ResolvedReference, ...]) -> None:
         """Require current authoritative bytes to match the immutable artifact."""

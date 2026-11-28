@@ -1,4 +1,4 @@
-"""Command-line interface for submitting and inspecting local generations."""
+"""Command-line interface for local media generation and inference."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from .candidate import (
     CandidateAcquisitionError,
     CandidateOutputError,
     CandidateValidationError,
+    LLAMA_CPP_BACKEND_KIND,
     candidate_exit_code,
     inspect_candidate,
     parse_trusted_evidence,
@@ -62,6 +63,21 @@ from .inventory import (
     collect_inventory,
     write_inventory,
 )
+from .inference import InferenceKind
+from .llama_cpp import (
+    HardwareCompatibilityEvidence,
+    LlamaCppComponent,
+    LlamaCppConfiguration,
+    LlamaCppRequest,
+    ResourceDemandEvidence,
+    ResponseStreamVerification,
+    RuntimeBuildEvidence,
+    RuntimeQualification,
+)
+
+
+MAX_INFERENCE_REQUEST_FILE_BYTES = 128 * 1024
+_MAX_INFERENCE_JSON_BYTES = 256 * 1024
 
 
 class _JsonArgumentParser(argparse.ArgumentParser):
@@ -241,7 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the documented local-only command surface."""
     parser = _JsonArgumentParser(
         prog="media-generation",
-        description="Submit and inspect synchronous local image generations.",
+        description="Submit and inspect local image, text, and vision work.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -276,6 +292,57 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--output-dir", required=True, type=Path)
     worker.add_argument("--limit", type=int, default=1)
     _add_engine_arguments(worker)
+
+    inference = commands.add_parser(
+        "inference", help="queue and supervise local text or vision inference"
+    )
+    inference_commands = inference.add_subparsers(
+        dest="inference_command", required=True
+    )
+
+    inference_enqueue = inference_commands.add_parser(
+        "enqueue", help="persist one text or vision inference request"
+    )
+    inference_enqueue.add_argument("--db", required=True, type=Path)
+    inference_enqueue.add_argument("--idempotency-key", required=True)
+    inference_enqueue.add_argument("--request-file", required=True, type=Path)
+    inference_enqueue.add_argument("--deadline-seconds", type=float, default=300.0)
+    inference_enqueue.add_argument("--runtime-config", required=True, type=Path)
+    inference_enqueue.add_argument("--inventory-report", required=True, type=Path)
+    inference_enqueue.add_argument("--admission-policy", required=True, type=Path)
+    inference_enqueue.add_argument("--workload-demands", required=True, type=Path)
+
+    inference_worker = inference_commands.add_parser(
+        "worker", help="run qualified requests using the local llama.cpp CLI"
+    )
+    inference_worker.add_argument("--db", required=True, type=Path)
+    inference_worker.add_argument("--output-dir", required=True, type=Path)
+    inference_worker.add_argument("--limit", type=int, default=1)
+    inference_worker.add_argument("--runtime-config", required=True, type=Path)
+    inference_worker.add_argument("--runtime-qualification", required=True, type=Path)
+    inference_worker.add_argument("--candidate", required=True, type=Path)
+    inference_worker.add_argument("--trusted-evidence", required=True, type=Path)
+    inference_worker.add_argument("--inventory-report", required=True, type=Path)
+    inference_worker.add_argument("--admission-policy", required=True, type=Path)
+    inference_worker.add_argument("--workload-demands", required=True, type=Path)
+
+    inference_cancel = inference_commands.add_parser(
+        "cancel", help="fence a queued or active inference request"
+    )
+    inference_cancel.add_argument("--db", required=True, type=Path)
+    inference_cancel.add_argument("--job-id", required=True)
+
+    inference_recover = inference_commands.add_parser(
+        "recover", help="reconcile interrupted inference execution"
+    )
+    inference_recover.add_argument("--db", required=True, type=Path)
+    inference_recover.add_argument("--output-dir", required=True, type=Path)
+
+    inference_provenance = inference_commands.add_parser(
+        "provenance", help="inspect one inference request and its attempts"
+    )
+    inference_provenance.add_argument("--db", required=True, type=Path)
+    inference_provenance.add_argument("--job-id", required=True)
 
     cancel = commands.add_parser("cancel", help="fence a queued or active job")
     cancel.add_argument("--db", required=True, type=Path)
@@ -457,9 +524,9 @@ def build_parser() -> argparse.ArgumentParser:
         )
         command.add_argument(
             "--engine-backend",
-            choices=("stable-diffusion-cpp", "comfyui"),
+            choices=("stable-diffusion-cpp", "comfyui", "llama-cpp"),
             default="stable-diffusion-cpp",
-            help="engine-specific invocation contract for candidate evaluation",
+            help="engine-specific candidate compatibility rules",
         )
         if name == "prepare":
             command.add_argument(
@@ -491,6 +558,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser = build_parser()
     options = parser.parse_args(arguments)
     try:
+        if options.command == "inference":
+            return _run_inference(options)
         if options.command == "candidate":
             return _run_candidate(options)
         if options.command == "inventory":
@@ -716,6 +785,70 @@ def main(arguments: Sequence[str] | None = None) -> int:
         return _write_error("validation_error", f"invalid request JSON: {error}", 2)
 
 
+def _run_inference(options: argparse.Namespace) -> int:
+    """Run one local inference queue operation and write its safe report."""
+    from .inference_service import InferenceService
+
+    command = options.inference_command
+    output_directory = getattr(options, "output_dir", Path.cwd())
+    service_arguments: dict[str, object] = {}
+    if command in {"enqueue", "worker"}:
+        profile = load_admission_profile(
+            options.inventory_report, options.admission_policy
+        )
+        service_arguments = {
+            "configuration": _load_llama_cpp_configuration(options.runtime_config),
+            "admission_profile": profile,
+            "workload_demand": _load_inference_workload_demands(
+                options.workload_demands
+            ),
+        }
+        if command == "worker":
+            service_arguments.update(
+                runtime_qualification=_load_runtime_qualifications(
+                    options.runtime_qualification
+                ),
+                candidate_declaration_path=options.candidate,
+                candidate_trusted_evidence=parse_trusted_evidence(
+                    options.trusted_evidence
+                ),
+            )
+    service = InferenceService(
+        database_path=options.db,
+        output_directory=output_directory,
+        **service_arguments,
+    )
+
+    if command == "enqueue":
+        request = _parse_inference_request_file(options.request_file)
+        response = service.enqueue(
+            options.idempotency_key,
+            request,
+            deadline_seconds=options.deadline_seconds,
+        )
+    elif command == "worker":
+        response = service.work(limit=options.limit)
+    elif command == "cancel":
+        response = service.cancel(options.job_id)
+    elif command == "recover":
+        response = service.recover()
+    else:
+        response = service.provenance(options.job_id)
+
+    _write_json(response, sys.stdout)
+    status = response.get("status") if isinstance(response, dict) else None
+    if command == "worker":
+        blocked = response.get("preflight_blocked", [])
+        return 0 if status in {"complete", "idle"} and not blocked else 1
+    if command == "recover":
+        return 0 if status == "complete" else 1
+    if command == "enqueue":
+        return 0 if status == "queued" else 1
+    if command in {"cancel", "provenance"} and status == "not_found":
+        return 4
+    return 0
+
+
 def _run_inventory(options: argparse.Namespace) -> int:
     """Collect and write one inventory report, preserving status exit codes."""
     try:
@@ -735,6 +868,8 @@ def _run_inventory(options: argparse.Namespace) -> int:
         return _write_error("inventory_output_error", str(error), 3)
     _write_json({**published.summary, **(published.publication or {})}, sys.stdout)
     return published.exit_code
+
+
 
 
 def _run_screen(options: argparse.Namespace) -> int:
@@ -883,6 +1018,8 @@ def _run_candidate(options: argparse.Namespace) -> int:
     selected_backend_kind = (
         COMFYUI_BACKEND_KIND
         if options.engine_backend == "comfyui"
+        else LLAMA_CPP_BACKEND_KIND
+        if options.engine_backend == "llama-cpp"
         else None
     )
     if options.candidate_command == "inspect":
@@ -935,6 +1072,214 @@ def _parse_request(source: str) -> GenerationRequest:
         return GenerationRequest(**payload)
     except TypeError as error:
         raise InputValidationError(f"invalid request fields: {error}") from error
+
+
+def _parse_inference_request_file(source: Path) -> LlamaCppRequest:
+    """Read a bounded inference request file without placing its prompt in argv."""
+    try:
+        with source.open("rb") as stream:
+            raw = stream.read(MAX_INFERENCE_REQUEST_FILE_BYTES + 1)
+    except OSError as error:
+        raise InputValidationError("cannot read inference request file") from error
+    if len(raw) > MAX_INFERENCE_REQUEST_FILE_BYTES:
+        raise InputValidationError("inference request file exceeds the size limit")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"), object_pairs_hook=_unique_object_pairs
+        )
+    except (json.JSONDecodeError, UnicodeError) as error:
+        raise InputValidationError("invalid inference request JSON") from error
+    if not isinstance(payload, dict) or set(payload) - {
+        "kind", "prompt", "image_path"
+    }:
+        raise InputValidationError("inference request must contain only kind, prompt, and image_path")
+    try:
+        kind = InferenceKind(payload.get("kind"))
+    except (TypeError, ValueError) as error:
+        raise InputValidationError("inference request kind must be text or vision") from error
+    prompt = payload.get("prompt")
+    image_value = payload.get("image_path")
+    if not isinstance(prompt, str):
+        raise InputValidationError("inference request prompt must be text")
+    if image_value is not None and not isinstance(image_value, str):
+        raise InputValidationError("inference request image_path must be a string")
+    image_path = None if image_value is None else Path(image_value).expanduser()
+    if image_path is not None and not image_path.is_absolute():
+        image_path = source.expanduser().resolve().parent / image_path
+    try:
+        return LlamaCppRequest(kind=kind, prompt=prompt, image_path=image_path)
+    except (TypeError, ValueError) as error:
+        raise InputValidationError(f"invalid inference request: {error}") from error
+
+
+def _load_llama_cpp_configuration(source: Path) -> LlamaCppConfiguration:
+    """Load the exact local runtime and component paths from one JSON file."""
+    payload = _load_inference_json_object(source, "runtime configuration")
+    required = {"executable_path", "model_component", "projector_component"}
+    optional = {"max_tokens", "hardware_fingerprint_sha256"}
+    if not required <= set(payload) or set(payload) - required - optional:
+        raise InputValidationError("runtime configuration has an invalid shape")
+    base = source.expanduser().resolve().parent
+    try:
+        return LlamaCppConfiguration(
+            executable_path=_relative_path(payload["executable_path"], base),
+            model_component=_parse_llama_cpp_component(
+                payload["model_component"], base, "model_component"
+            ),
+            projector_component=_parse_llama_cpp_component(
+                payload["projector_component"], base, "projector_component"
+            ),
+            **{
+                name: payload[name]
+                for name in optional
+                if name in payload
+            },
+        )
+    except (TypeError, ValueError) as error:
+        raise InputValidationError(f"invalid runtime configuration: {error}") from error
+
+
+def _load_runtime_qualifications(
+    source: Path,
+) -> dict[InferenceKind, RuntimeQualification]:
+    """Load kind-specific build, stream, hardware, and resource evidence."""
+    payload = _load_inference_json_object(source, "runtime qualification")
+    if not payload or set(payload) - {kind.value for kind in InferenceKind}:
+        raise InputValidationError("runtime qualification keys must be text or vision")
+    base = source.expanduser().resolve().parent
+    qualifications: dict[InferenceKind, RuntimeQualification] = {}
+    for name, raw in payload.items():
+        kind = InferenceKind(name)
+        record = _require_inference_object(
+            raw,
+            {"build", "response_stream", "hardware", "resources"},
+            label=f"{name} qualification",
+        )
+        build_raw = _require_inference_object(
+            record["build"],
+            {
+                "executable_path", "source_version", "binary_sha256", "build_id",
+                "evidence_sha256",
+            },
+            label=f"{name} build evidence",
+        )
+        stream_raw = _require_inference_object(
+            record["response_stream"],
+            {
+                "executable_sha256", "source_version", "model_sha256",
+                "projector_sha256", "inference_kind", "schema_sha256",
+                "stdout_contract", "stderr_contract", "evidence_sha256",
+            },
+            label=f"{name} response-stream evidence",
+        )
+        hardware_raw = _require_inference_object(
+            record["hardware"],
+            {
+                "executable_sha256", "model_sha256", "projector_sha256",
+                "hardware_fingerprint_sha256", "assessment", "evidence_sha256",
+            },
+            label=f"{name} hardware evidence",
+        )
+        resources_raw = _require_inference_object(
+            record["resources"],
+            {
+                "executable_sha256", "model_sha256", "projector_sha256",
+                "hardware_fingerprint_sha256", "max_tokens", "measured_peak_bytes",
+            "available_memory_bytes", "context_tokens", "max_image_pixels",
+            "evidence_sha256",
+            },
+            label=f"{name} resource evidence",
+        )
+        try:
+            stream_raw["inference_kind"] = InferenceKind(
+                stream_raw["inference_kind"]
+            )
+            if stream_raw["inference_kind"] is not kind:
+                raise ValueError("response stream kind does not match its key")
+            qualifications[kind] = RuntimeQualification(
+                build=RuntimeBuildEvidence(
+                    executable_path=_relative_path(
+                        build_raw["executable_path"], base
+                    ),
+                    **{
+                        key: value
+                        for key, value in build_raw.items()
+                        if key != "executable_path"
+                    },
+                ),
+                response_stream=ResponseStreamVerification(**stream_raw),
+                hardware=HardwareCompatibilityEvidence(**hardware_raw),
+                resources=ResourceDemandEvidence(**resources_raw),
+            )
+        except (TypeError, ValueError) as error:
+            raise InputValidationError(
+                f"invalid {name} runtime qualification: {error}"
+            ) from error
+    return qualifications
+
+
+def _load_inference_json_object(source: Path, label: str) -> dict[str, object]:
+    try:
+        with source.open("rb") as stream:
+            raw = stream.read(_MAX_INFERENCE_JSON_BYTES + 1)
+    except OSError as error:
+        raise InputValidationError(f"cannot read {label}") from error
+    if len(raw) > _MAX_INFERENCE_JSON_BYTES:
+        raise InputValidationError(f"{label} exceeds the size limit")
+    try:
+        payload = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_object_pairs)
+    except (json.JSONDecodeError, UnicodeError, ValueError) as error:
+        raise InputValidationError(f"invalid {label} JSON") from error
+    if not isinstance(payload, dict):
+        raise InputValidationError(f"{label} must be a JSON object")
+    return payload
+
+
+def _load_inference_workload_demands(
+    source: Path,
+) -> dict[InferenceKind, WorkloadDemand]:
+    """Load a strict map of independent text and vision resource demands."""
+    payload = _load_inference_json_object(source, "workload demands")
+    if not payload or set(payload) - {kind.value for kind in InferenceKind}:
+        raise InputValidationError("workload demand keys must be text or vision")
+    demands: dict[InferenceKind, WorkloadDemand] = {}
+    for name, value in payload.items():
+        try:
+            demand = parse_workload_demand(value)
+        except (TypeError, ValueError, InventoryValidationError) as error:
+            raise InputValidationError(f"invalid {name} workload demand") from error
+        if demand.kind != name:
+            raise InputValidationError(f"{name} workload demand has a mismatched kind")
+        demands[InferenceKind(name)] = demand
+    return demands
+
+
+def _require_inference_object(
+    value: object, keys: set[str], *, label: str
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise InputValidationError(f"{label} has an invalid shape")
+    return value
+
+
+def _relative_path(value: object, base: Path) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError("file path must be a non-empty string")
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else base / path
+
+
+def _parse_llama_cpp_component(
+    value: object, base: Path, label: str
+) -> LlamaCppComponent:
+    component = _require_inference_object(
+        value, {"role", "path", "sha256"}, label=label
+    )
+    return LlamaCppComponent(
+        role=component["role"],
+        path=_relative_path(component["path"], base),
+        sha256=component["sha256"],
+    )
 
 
 def _parse_batch_requests(source: str) -> tuple[GenerationRequest, ...]:

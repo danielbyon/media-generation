@@ -1078,6 +1078,12 @@ LOCAL_INFERENCE_CONFIGURATION_VERSION = "sd-cpp-local/v1"
 # Historical SD-C++ profile label. Keep it stable for stored privacy evidence.
 LOCAL_INFERENCE_ENGINE_VERSION = "master-975-95b3090-2-gb13a482"
 NATIVE_IMAGE_ADAPTER_ID = "stable-diffusion-cpp-local-v1"
+LLAMA_CPP_ADAPTER_ID = "llama-cpp-mtmd-local-v1"
+LLAMA_CPP_TOOL_ID = "llama.cpp"
+LLAMA_CPP_SOURCE_VERSION = (
+    "1a03cf47f67be591699d1f0f7ca28e1ed6eb8c7e+single-turn-v1"
+)
+LLAMA_CPP_CONFIGURATION_VERSION = "llama-mtmd-local/v1"
 COMFYUI_ADAPTER_ID = "comfyui-local-v1"
 COMFYUI_CONFIGURATION_VERSION = "comfyui-local/v2"
 COMFYUI_TOOL_ID = "comfyui"
@@ -1197,8 +1203,41 @@ _INVOCATION_CONTROL_TOKENS: dict[PrivacyControl, frozenset[str]] = {
 }
 
 _PROMPT_FLAGS = frozenset({"-p", "--prompt"})
+_INVOCATION_VALUE_FLAGS = _PROMPT_FLAGS | frozenset(
+    {
+        "-f",
+        "--file",
+        "-m",
+        "--model",
+        "--mmproj",
+        "--ctx-size",
+        "--image",
+        "--json-schema-file",
+        "-n",
+        "--predict",
+        "--n-predict",
+        "-lv",
+        "--verbosity",
+        "--log-verbosity",
+    }
+)
 _SAFE_INVOCATION_FLAGS = frozenset(
     {
+        "-m",
+        "--model",
+        "--mmproj",
+        "--image",
+        "-f",
+        "--file",
+        "--json-schema-file",
+        "-n",
+        "--predict",
+        "--n-predict",
+        "--offline",
+        "--no-perf",
+        "-lv",
+        "--verbosity",
+        "--log-verbosity",
         "--diffusion-model",
         "--vae",
         "--llm",
@@ -1227,6 +1266,9 @@ _SAFE_ENVIRONMENT_NAMES = frozenset(
         "HIP_VISIBLE_DEVICES",
         "HSA_OVERRIDE_GFX_VERSION",
         "PYTHONHASHSEED",
+        "LLAMA_OFFLINE",
+        "LLAMA_LOG_VERBOSITY",
+        "LC_ALL",
     }
 )
 _REMOTE_URL = re.compile(r"[a-z][a-z0-9+.-]*://", re.IGNORECASE)
@@ -1276,7 +1318,10 @@ def invocation_privacy_settings(
         token = tokens[index]
         if not isinstance(token, str):
             raise ValueError("argv entries must be strings")
-        if token in _PROMPT_FLAGS:
+        if token in _INVOCATION_VALUE_FLAGS:
+            if index + 1 >= len(tokens):
+                unknown = True
+                break
             index += 2
             continue
         if token == "--model-args":
@@ -1964,6 +2009,37 @@ def local_inference_privacy_profile(
     )
 
 
+def llama_cpp_local_privacy_profile(
+    *,
+    adapter_id: str = LLAMA_CPP_ADAPTER_ID,
+    tool_version: str = LLAMA_CPP_SOURCE_VERSION,
+    configuration_version: object = LLAMA_CPP_CONFIGURATION_VERSION,
+) -> PrivacyProfile:
+    """Return the application-owned local-only profile for the direct CLI."""
+    if not isinstance(tool_version, str) or not tool_version.strip():
+        raise ValueError("tool_version must be a non-empty string")
+    requirements = tuple(
+        PrivacySettingRule(
+            control=control,
+            path=("privacy", control.value),
+            expected=False,
+            prohibited=(True,),
+        )
+        for control in PrivacyControl
+    )
+    return PrivacyProfile(
+        schema_version=PRIVACY_PROFILE_SCHEMA_VERSION,
+        profile_id="llama-cpp-local",
+        profile_version=1,
+        adapter_id=adapter_id,
+        tool_id=LLAMA_CPP_TOOL_ID,
+        tool_version=tool_version,
+        configuration_version=configuration_version,
+        requirements=requirements,
+        supports_configuration_compliance=True,
+    )
+
+
 def comfyui_local_privacy_profile(
     *,
     adapter_id: str = COMFYUI_ADAPTER_ID,
@@ -2045,6 +2121,12 @@ class LocalInferencePrivacyRegistration:
                 tool_version=self.tool_version,
                 configuration_version=self.configuration_version,
             )
+        if self.tool_id == LLAMA_CPP_TOOL_ID:
+            return llama_cpp_local_privacy_profile(
+                adapter_id=self.adapter_id,
+                tool_version=self.tool_version,
+                configuration_version=self.configuration_version,
+            )
         return local_inference_privacy_profile(
             adapter_id=self.adapter_id,
             tool_version=self.tool_version,
@@ -2057,6 +2139,12 @@ APPLICATION_PRIVACY_REGISTRATIONS = (
         tool_id="stable-diffusion.cpp",
         tool_version=LOCAL_INFERENCE_ENGINE_VERSION,
         configuration_version=LOCAL_INFERENCE_CONFIGURATION_VERSION,
+    ),
+    LocalInferencePrivacyRegistration(
+        adapter_id=LLAMA_CPP_ADAPTER_ID,
+        tool_id=LLAMA_CPP_TOOL_ID,
+        tool_version=LLAMA_CPP_SOURCE_VERSION,
+        configuration_version=LLAMA_CPP_CONFIGURATION_VERSION,
     ),
 )
 """Application-owned registrations that may evaluate as local inference.
@@ -2138,7 +2226,7 @@ def application_privacy_profile(
                 "backend execution engine version does not match "
                 "application-owned registration"
             )
-    else:
+    elif registration.tool_id == "stable-diffusion.cpp":
         from .engine import BACKEND_KIND, CLI_CONTRACTS, INVOCATION_CONTRACT
 
         cli_contract = configuration.get("cli_contract")
@@ -2149,6 +2237,17 @@ def application_privacy_profile(
             or cli_contract not in CLI_CONTRACTS
         ):
             raise ValueError("SD-C++ privacy profile requires a supported invocation contract")
+    else:
+        if (
+            registration.tool_id != LLAMA_CPP_TOOL_ID
+            or tool_version != registration.tool_version
+            or configuration.get("backend_kind") != "local-inference"
+            or configuration.get("invocation_contract")
+            != "llama-cpp-mtmd-exec-v1"
+            or configuration.get("cli_contract")
+            != "mtmd-cli-single-turn/v1"
+        ):
+            raise ValueError("llama.cpp privacy profile requires the supported local CLI contract")
     if not _same_json_scalar(
         configuration.get("configuration_version"),
         registration.configuration_version,
